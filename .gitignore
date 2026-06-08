@@ -1,4 +1,6 @@
 
+# Claude's working sandbox
+claude_folder/
 *.tmp
 *.log
 *output*
