@@ -1,0 +1,66 @@
+"""
+PMGen-v2 distillation training entrypoint (thin CLI; heavy lifting in utils.py).
+
+Trains ONLY the small encoder; the AF2 structure module + pLDDT/PAE heads stay
+frozen. Loss = λ_fape·FAPE + λ_plddt·CE(pLDDT) + λ_pae·CE(PAE).
+
+Examples
+--------
+  # local smoke / overfit on the 15-example dummy set
+  ~/miniforge3/envs/pmgen2/bin/python src/model/train.py \\
+      --dummy --variant 7 --epochs 20 --bs 3 --lr 3e-3
+
+  # real run (needs teacher PMGen outputs under --af-root, one dir per anchor id)
+  ... train.py --scheme two_axis --fold 1 --variant 7 --af-root <dir> --epochs 50
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import utils as U  # noqa: E402
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--variant", type=int, default=7, choices=range(1, 8))
+    p.add_argument("--scheme", default="two_axis", choices=["two_axis", "hla_only"])
+    p.add_argument("--fold", type=int, default=1, choices=range(1, 6))
+    p.add_argument("--dummy", action="store_true",
+                   help="train on data/test/ (15 class-I examples) for local runs")
+    p.add_argument("--af-root", default=None,
+                   help="real mode (on-the-fly PDB read): dir with one PMGen "
+                        "teacher output sub-dir per anchor id")
+    p.add_argument("--h5-dir", default=None,
+                   help="preprocessed HDF5 store dir (fastest; from preprocess.py)")
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--bs", type=int, default=2)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lambdas", type=float, nargs=3, default=(1.0, 0.1, 0.1),
+                   metavar=("FAPE", "PLDDT", "PAE"))
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None)
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    U.run_training(
+        variant=args.variant, scheme=args.scheme, fold=args.fold,
+        dummy=args.dummy, af_root=args.af_root, h5_dir=args.h5_dir,
+        epochs=args.epochs, bs=args.bs, lr=args.lr, lambdas=tuple(args.lambdas),
+        weight_decay=args.weight_decay, grad_clip=args.grad_clip, amp=args.amp,
+        num_workers=args.num_workers, seed=args.seed, device=args.device,
+    )
+
+
+if __name__ == "__main__":
+    main()

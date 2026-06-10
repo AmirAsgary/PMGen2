@@ -1,0 +1,17 @@
+# Conda spec for the PMGen-v2 distillation env (training + HDF5 preprocessing).
+# CUDA PyTorch is installed by installation.sh (pip, official index) so the CUDA
+# tag can match the cluster driver. Create with:  bash installation.sh
+name: pmgen2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=2.0,<2.4
+  - scipy>=1.13
+  - pandas>=2.0
+  - h5py>=3.10
+  - biopython>=1.80
+  - pip:
+      - ml-collections>=1.0
+      - einops>=0.8

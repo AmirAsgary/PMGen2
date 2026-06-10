@@ -1,0 +1,1237 @@
+{
+  "seed": 42,
+  "mode": "hla_only",
+  "split_axis": "hla",
+  "n_total_pairs": 267551,
+  "fractions": {
+    "test_hla_frac": 0.1,
+    "cv_folds": 5
+  },
+  "test": {
+    "hla_clusters": [
+      "BOLA-1007010101",
+      "BOLA-307301",
+      "DLA-8803401",
+      "HLA-A01130",
+      "HLA-A01131",
+      "HLA-A01139",
+      "HLA-A01216",
+      "HLA-A01220",
+      "HLA-A01257",
+      "HLA-A01263",
+      "HLA-A01348",
+      "HLA-A01402",
+      "HLA-A0141",
+      "HLA-A01417",
+      "HLA-A01429",
+      "HLA-A016701",
+      "HLA-A0175",
+      "HLA-A32133",
+      "HLA-C04130",
+      "Mamu-A5300101",
+      "Mamu-B013010101",
+      "Mamu-B02101",
+      "Mamu-B031030101",
+      "Mamu-B034010101",
+      "Mamu-B051010101",
+      "SLA-12501",
+      "mice-H-2Kd"
+    ],
+    "n_rows": 26978
+  },
+  "cv_folds_detail": [
+    {
+      "fold": 1,
+      "hla_clusters": [
+        "BOLA-205401",
+        "BOLA-206001",
+        "BOLA-301701",
+        "HLA-A01090101",
+        "HLA-A01104",
+        "HLA-A01112",
+        "HLA-A01113",
+        "HLA-A01128",
+        "HLA-A0114002",
+        "HLA-A01156",
+        "HLA-A0117",
+        "HLA-A01213",
+        "HLA-A01245",
+        "HLA-A0125",
+        "HLA-A01329",
+        "HLA-A01337",
+        "HLA-A0136",
+        "HLA-A01362",
+        "HLA-A01374",
+        "HLA-A01395",
+        "HLA-A01432",
+        "HLA-A01438",
+        "HLA-A01448",
+        "HLA-A01459",
+        "HLA-A0158",
+        "HLA-A0174",
+        "HLA-A0178",
+        "HLA-A0186",
+        "HLA-A0190",
+        "HLA-A02250",
+        "HLA-A24514",
+        "HLA-B35170101",
+        "HLA-B5402",
+        "HLA-B5554",
+        "HLA-C01222",
+        "HLA-C04175",
+        "HLA-C04216",
+        "HLA-C0444",
+        "HLA-C04517",
+        "HLA-C04526",
+        "HLA-C0463",
+        "HLA-C0469",
+        "HLA-C0476",
+        "HLA-C049801",
+        "HLA-C1685",
+        "Mamu-A60101",
+        "Mamu-B046030101",
+        "Mamu-B09803",
+        "SLA-5010102"
+      ],
+      "n_val_rows": 48681
+    },
+    {
+      "fold": 2,
+      "hla_clusters": [
+        "BOLA-409401",
+        "BOLA-601301",
+        "HLA-A0108",
+        "HLA-A01117",
+        "HLA-A01165",
+        "HLA-A01189",
+        "HLA-A01260",
+        "HLA-A0135",
+        "HLA-A01359",
+        "HLA-A01363",
+        "HLA-A0150",
+        "HLA-A0163",
+        "HLA-A0164",
+        "HLA-A24429",
+        "HLA-A2551",
+        "HLA-A33176",
+        "HLA-B07237",
+        "HLA-B0808",
+        "HLA-B15306",
+        "HLA-B44366",
+        "HLA-B5437",
+        "HLA-C04131",
+        "HLA-C04136",
+        "HLA-C04143",
+        "HLA-C04245",
+        "HLA-C04254",
+        "HLA-C04315",
+        "HLA-C04359",
+        "HLA-C0466",
+        "HLA-C0473",
+        "Mamu-A101202",
+        "Mamu-B001010101",
+        "Mamu-B006010101",
+        "Mamu-B011020101",
+        "Mamu-B039010101",
+        "Mamu-B054120101",
+        "Mamu-B061010101",
+        "Mamu-B124010101",
+        "Mamu-B14601",
+        "Mamu-B162010101",
+        "Mamu-B180030101",
+        "Patr-B24010101",
+        "Patr-B29010101",
+        "SLA-110201",
+        "SLA-21501",
+        "SLA-21601",
+        "SLA-30102",
+        "SLA-70301",
+        "mice-H-2Q10"
+      ],
+      "n_val_rows": 48696
+    },
+    {
+      "fold": 3,
+      "hla_clusters": [
+        "BOLA-500301",
+        "BOLA-609202",
+        "HLA-A010104",
+        "HLA-A01100",
+        "HLA-A01118",
+        "HLA-A012301",
+        "HLA-A0123202",
+        "HLA-A01235",
+        "HLA-A01265",
+        "HLA-A01268",
+        "HLA-A01271",
+        "HLA-A01272",
+        "HLA-A0128",
+        "HLA-A01311",
+        "HLA-A0133",
+        "HLA-A01334",
+        "HLA-A01344",
+        "HLA-A01447",
+        "HLA-A01469",
+        "HLA-A01470",
+        "HLA-A0148",
+        "HLA-A0160",
+        "HLA-A0171",
+        "HLA-A0177",
+        "HLA-A02010101",
+        "HLA-A24636",
+        "HLA-B07386",
+        "HLA-B0746",
+        "HLA-B15375",
+        "HLA-B2766",
+        "HLA-B35145",
+        "HLA-B5405",
+        "HLA-C04186",
+        "HLA-C04272",
+        "HLA-C04283",
+        "HLA-C04369",
+        "HLA-C045010101",
+        "HLA-F01010101",
+        "HLA-G0150",
+        "Mamu-B003010101",
+        "Mamu-B005020101",
+        "Mamu-B049010101",
+        "Mamu-B056010101",
+        "Patr-A08010101",
+        "SLA-20613",
+        "SLA-21802",
+        "SLA-30302",
+        "mice-H-2Dq"
+      ],
+      "n_val_rows": 47772
+    },
+    {
+      "fold": 4,
+      "hla_clusters": [
+        "HLA-A01010102",
+        "HLA-A01030101",
+        "HLA-A01116",
+        "HLA-A01119",
+        "HLA-A01151",
+        "HLA-A01170",
+        "HLA-A01182",
+        "HLA-A01201",
+        "HLA-A01221",
+        "HLA-A01228",
+        "HLA-A01270",
+        "HLA-A01293",
+        "HLA-A01330",
+        "HLA-A01341",
+        "HLA-A0139",
+        "HLA-A01416",
+        "HLA-A01425",
+        "HLA-A01428",
+        "HLA-A01475",
+        "HLA-A0199",
+        "HLA-A021062",
+        "HLA-A31149",
+        "HLA-B5665",
+        "HLA-B5677",
+        "HLA-C03514",
+        "HLA-C04040101",
+        "HLA-C04151",
+        "HLA-C04198",
+        "HLA-C04218",
+        "HLA-C04462",
+        "HLA-C0449",
+        "HLA-C0480",
+        "Mamu-A2051301",
+        "Mamu-B002010101",
+        "Mamu-B024010102",
+        "Mamu-B0250102",
+        "Mamu-B086010101",
+        "Mamu-B109060101",
+        "Mamu-B114010101",
+        "Mamu-B178020201",
+        "Patr-B38020101",
+        "Patr-E01010102",
+        "SLA-10816",
+        "SLA-11109",
+        "SLA-21803",
+        "SLA-30801",
+        "SLA-60101",
+        "mice-H-2Q9"
+      ],
+      "n_val_rows": 47736
+    },
+    {
+      "fold": 5,
+      "hla_clusters": [
+        "BOLA-106701",
+        "BOLA-4024010101",
+        "BOLA-604001",
+        "BOLA-NC900401",
+        "HLA-A01020101",
+        "HLA-A01122",
+        "HLA-A01143",
+        "HLA-A01148",
+        "HLA-A01172",
+        "HLA-A01174",
+        "HLA-A01180",
+        "HLA-A01197",
+        "HLA-A01208",
+        "HLA-A01218",
+        "HLA-A01241",
+        "HLA-A01314",
+        "HLA-A01418",
+        "HLA-A01435",
+        "HLA-A0147",
+        "HLA-A0149",
+        "HLA-A0159",
+        "HLA-A0165",
+        "HLA-A0180",
+        "HLA-A11326",
+        "HLA-A29126",
+        "HLA-B18138",
+        "HLA-B27254",
+        "HLA-B35499",
+        "HLA-B5570",
+        "HLA-B5691",
+        "HLA-B5872",
+        "HLA-B8204",
+        "HLA-C04149",
+        "HLA-C04158",
+        "HLA-C04240",
+        "HLA-C04260",
+        "HLA-C04285",
+        "HLA-C04319",
+        "HLA-C0434",
+        "HLA-C04382",
+        "HLA-C0496",
+        "Mamu-A1001010101",
+        "Mamu-B01602",
+        "Mamu-B070130101",
+        "Patr-H01",
+        "SLA-10403",
+        "SLA-120101",
+        "mice-H-2Dk"
+      ],
+      "n_val_rows": 47688
+    }
+  ],
+  "borrowed_assignments": {
+    "BOLA-205401": {
+      "donor": "BOLA-307301",
+      "identity": 0.8415
+    },
+    "BOLA-206001": {
+      "donor": "BOLA-409401",
+      "identity": 0.847
+    },
+    "BOLA-500301": {
+      "donor": "BOLA-NC900401",
+      "identity": 0.8033
+    },
+    "BOLA-609202": {
+      "donor": "BOLA-301701",
+      "identity": 0.8415
+    },
+    "HLA-A01010102": {
+      "donor": "HLA-A01030101",
+      "identity": 0.7285
+    },
+    "HLA-A010104": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9945
+    },
+    "HLA-A0108": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01090101": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01100": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01104": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01112": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01113": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01116": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01117": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01118": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01119": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01122": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01128": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01130": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9834
+    },
+    "HLA-A01131": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01139": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0114002": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01143": {
+      "donor": "HLA-A01020101",
+      "identity": 0.989
+    },
+    "HLA-A01148": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01151": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01156": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01165": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0117": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01170": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01172": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01174": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01180": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01182": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01189": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01197": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01201": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01208": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01213": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01216": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01218": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01220": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01221": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01228": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9945
+    },
+    "HLA-A012301": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0123202": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01235": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01241": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01245": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01257": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01260": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01263": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01265": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01268": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01270": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01271": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01272": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0128": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9834
+    },
+    "HLA-A01293": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9379
+    },
+    "HLA-A01311": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01314": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01329": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0133": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01330": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01334": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01337": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01341": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01348": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0135": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01359": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0136": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01362": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01363": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01374": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0139": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01395": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01402": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0141": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01416": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01417": {
+      "donor": "HLA-A01344",
+      "identity": 0.8727
+    },
+    "HLA-A01418": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9297
+    },
+    "HLA-A01425": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01428": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01429": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01432": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01435": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01438": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01447": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01448": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01459": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01469": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0147": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A01470": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A01475": {
+      "donor": "HLA-A01030101",
+      "identity": 0.9892
+    },
+    "HLA-A0148": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0149": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0150": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0158": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0159": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0160": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0163": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0164": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0165": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A016701": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0171": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0174": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0175": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0177": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0178": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0180": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0186": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0190": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A0199": {
+      "donor": "HLA-A01030101",
+      "identity": 0.989
+    },
+    "HLA-A021062": {
+      "donor": "HLA-A02010101",
+      "identity": 0.7314
+    },
+    "HLA-A02250": {
+      "donor": "HLA-A02010101",
+      "identity": 0.5868
+    },
+    "HLA-A11326": {
+      "donor": "HLA-A01020101",
+      "identity": 0.9622
+    },
+    "HLA-A24429": {
+      "donor": "HLA-A32133",
+      "identity": 0.6391
+    },
+    "HLA-A24514": {
+      "donor": "HLA-A32133",
+      "identity": 0.8453
+    },
+    "HLA-A24636": {
+      "donor": "HLA-A32133",
+      "identity": 0.733
+    },
+    "HLA-A2551": {
+      "donor": "HLA-A01344",
+      "identity": 0.8865
+    },
+    "HLA-A31149": {
+      "donor": "HLA-A29126",
+      "identity": 0.6494
+    },
+    "HLA-A33176": {
+      "donor": "HLA-A29126",
+      "identity": 0.7943
+    },
+    "HLA-B07237": {
+      "donor": "Patr-B38020101",
+      "identity": 0.9116
+    },
+    "HLA-B07386": {
+      "donor": "Patr-B38020101",
+      "identity": 0.7459
+    },
+    "HLA-B0746": {
+      "donor": "Patr-B38020101",
+      "identity": 0.895
+    },
+    "HLA-B0808": {
+      "donor": "HLA-C01222",
+      "identity": 0.7386
+    },
+    "HLA-B15306": {
+      "donor": "Patr-B38020101",
+      "identity": 0.9337
+    },
+    "HLA-B15375": {
+      "donor": "Patr-B38020101",
+      "identity": 0.7939
+    },
+    "HLA-B18138": {
+      "donor": "Patr-B38020101",
+      "identity": 0.7558
+    },
+    "HLA-B27254": {
+      "donor": "Patr-B24010101",
+      "identity": 0.6145
+    },
+    "HLA-B2766": {
+      "donor": "HLA-C01222",
+      "identity": 0.8343
+    },
+    "HLA-B35145": {
+      "donor": "Patr-B38020101",
+      "identity": 0.7901
+    },
+    "HLA-B35170101": {
+      "donor": "Patr-B38020101",
+      "identity": 0.9171
+    },
+    "HLA-B35499": {
+      "donor": "Patr-B38020101",
+      "identity": 0.9171
+    },
+    "HLA-B44366": {
+      "donor": "HLA-C1685",
+      "identity": 0.7605
+    },
+    "HLA-B5402": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9116
+    },
+    "HLA-B5405": {
+      "donor": "Patr-B29010101",
+      "identity": 0.931
+    },
+    "HLA-B5437": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9227
+    },
+    "HLA-B5554": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9227
+    },
+    "HLA-B5570": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9282
+    },
+    "HLA-B5665": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9006
+    },
+    "HLA-B5677": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9212
+    },
+    "HLA-B5691": {
+      "donor": "Patr-B29010101",
+      "identity": 0.9227
+    },
+    "HLA-B5872": {
+      "donor": "HLA-C1685",
+      "identity": 0.7791
+    },
+    "HLA-B8204": {
+      "donor": "Patr-B38020101",
+      "identity": 0.9227
+    },
+    "HLA-C04040101": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04130": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04131": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04136": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04143": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04149": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04151": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04158": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04175": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04186": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04198": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04216": {
+      "donor": "HLA-C0480",
+      "identity": 0.9448
+    },
+    "HLA-C04218": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04240": {
+      "donor": "HLA-C0480",
+      "identity": 0.9448
+    },
+    "HLA-C04245": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04254": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04260": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04272": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04283": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04285": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04315": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04319": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0434": {
+      "donor": "HLA-C0480",
+      "identity": 0.9282
+    },
+    "HLA-C04359": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04369": {
+      "donor": "HLA-C0480",
+      "identity": 0.8703
+    },
+    "HLA-C04382": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0444": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C04462": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C0449": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C045010101": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04517": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C04526": {
+      "donor": "HLA-C0480",
+      "identity": 0.9438
+    },
+    "HLA-C0463": {
+      "donor": "HLA-C0480",
+      "identity": 0.9405
+    },
+    "HLA-C0466": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0469": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0473": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0476": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C0496": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-C049801": {
+      "donor": "HLA-C0480",
+      "identity": 0.9392
+    },
+    "HLA-F01010101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.7802
+    },
+    "Mamu-A2051301": {
+      "donor": "Mamu-A101202",
+      "identity": 0.8516
+    },
+    "Mamu-A60101": {
+      "donor": "Mamu-A101202",
+      "identity": 0.8352
+    },
+    "Mamu-B006010101": {
+      "donor": "Mamu-B034010101",
+      "identity": 0.8571
+    },
+    "Mamu-B011020101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8462
+    },
+    "Mamu-B01602": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8516
+    },
+    "Mamu-B02101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8462
+    },
+    "Mamu-B024010102": {
+      "donor": "Mamu-B002010101",
+      "identity": 0.8516
+    },
+    "Mamu-B0250102": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8352
+    },
+    "Mamu-B031030101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8242
+    },
+    "Mamu-B046030101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8462
+    },
+    "Mamu-B049010101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8462
+    },
+    "Mamu-B051010101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8736
+    },
+    "Mamu-B054120101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8398
+    },
+    "Mamu-B056010101": {
+      "donor": "Mamu-B039010101",
+      "identity": 0.8352
+    },
+    "Mamu-B061010101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8297
+    },
+    "Mamu-B070130101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.628
+    },
+    "Mamu-B086010101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8516
+    },
+    "Mamu-B09803": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8462
+    },
+    "Mamu-B109060101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8846
+    },
+    "Mamu-B114010101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8659
+    },
+    "Mamu-B124010101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8571
+    },
+    "Mamu-B14601": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8846
+    },
+    "Mamu-B162010101": {
+      "donor": "Mamu-B003010101",
+      "identity": 0.8462
+    },
+    "Mamu-B178020201": {
+      "donor": "Mamu-A101202",
+      "identity": 0.3082
+    },
+    "Mamu-B180030101": {
+      "donor": "Mamu-B013010101",
+      "identity": 0.8297
+    },
+    "Patr-A08010101": {
+      "donor": "HLA-A29126",
+      "identity": 0.9066
+    },
+    "Patr-H01": {
+      "donor": "HLA-C1685",
+      "identity": 0.8242
+    },
+    "SLA-10403": {
+      "donor": "SLA-21601",
+      "identity": 0.8564
+    },
+    "SLA-10816": {
+      "donor": "SLA-21601",
+      "identity": 0.8564
+    },
+    "SLA-110201": {
+      "donor": "BOLA-409401",
+      "identity": 0.452
+    },
+    "SLA-11109": {
+      "donor": "SLA-21501",
+      "identity": 0.8398
+    },
+    "SLA-120101": {
+      "donor": "SLA-21501",
+      "identity": 0.8343
+    },
+    "SLA-20613": {
+      "donor": "SLA-21601",
+      "identity": 0.8398
+    },
+    "SLA-21802": {
+      "donor": "SLA-21501",
+      "identity": 0.8287
+    },
+    "SLA-30102": {
+      "donor": "SLA-21501",
+      "identity": 0.8654
+    },
+    "SLA-30302": {
+      "donor": "SLA-21601",
+      "identity": 0.8177
+    },
+    "SLA-30801": {
+      "donor": "SLA-21501",
+      "identity": 0.8287
+    },
+    "SLA-5010102": {
+      "donor": "SLA-21501",
+      "identity": 0.7956
+    },
+    "SLA-60101": {
+      "donor": "HLA-C0480",
+      "identity": 0.6354
+    },
+    "SLA-70301": {
+      "donor": "BOLA-307301",
+      "identity": 0.7017
+    },
+    "mice-H-2Q10": {
+      "donor": "mice-H-2Kd",
+      "identity": 0.8187
+    },
+    "mice-H-2Q9": {
+      "donor": "mice-H-2Kd",
+      "identity": 0.8045
+    }
+  },
+  "excluded_isolated_clusters": [
+    "BOLA-NC1000101",
+    "BOLA-NC10010101",
+    "BOLA-NC200101",
+    "BOLA-NC300101",
+    "BOLA-NC400101",
+    "BOLA-NC500101",
+    "BOLA-NC600401",
+    "HLA-HFE",
+    "HLA-MICA",
+    "HLA-MICB",
+    "SLA-MIC20101",
+    "SLA-TAP10101",
+    "SLA-TAP20101"
+  ]
+}

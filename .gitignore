@@ -1,34 +1,67 @@
+# ============================================================================
+# PMGen2 .gitignore
+# Push code + the small artifacts needed to run training on the cluster;
+# exclude large/regenerable data and the Claude sandbox.
+# NOTE: git ignores do NOT support trailing inline comments — keep comments on
+# their own lines.
+# ============================================================================
 
-# Claude's working sandbox
+# --- Claude's working sandbox (incl. the de-nested openfold/.git backup) ---
 claude_folder/
-*.tmp
-*.log
-*output*
-*analysis*
-*data*
+
+# --- Python / build ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.mypy_cache/
+.pytest_cache/
 .DS_Store
 Thumbs.db
 *~
 *.swp
 *.swo
-.vscode/
-.idea/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-venv/
-.venv/
-env/
-.env
-*.ipynb
-.ipynb_checkpoints/
-.mypy_cache/
-.pytest_cache/
-.tox/
-coverage.*
-htmlcov/
-*.egg-info/
-dist/
-build/
+
+# --- Logs / run outputs ---
+*.log
+*.tmp
+runs/
+
+# --- Large binary formats anywhere ---
+*.parquet
+*.h5
+*.hdf5
+# params_model_2_ptm.npz (356 MB): rebuild via src/afbuild/build.py
+*.npz
+
+# --- Large / regenerable data (NOT needed to run training) ---
+# raw inputs: parquet + clusters.tsv (GBs)
+data/raw/
+# 63 MB base-pairs table
+data/processed/full_dataset.csv
+# 70 MB full pmgen-input (we push the slim base_ids_ordered.csv instead)
+data/processed/full_dataset_pmgeninput.csv
+# preprocessed HDF5 store (built on the cluster)
+data/processed/h5_store/
+# Multiple_Anchors_input*.tsv (GBs) + pmgen outputs
+outputs/
+# exploration plots/csvs
+analysis/
+
+# --- Explicitly KEEP small required artifacts (belt-and-suspenders) ---
+!data/processed/base_ids_ordered.csv
+!data/processed/two_axis/
+!data/processed/hla_only/
+!data/test/
+!params/alphafold/*.pt
