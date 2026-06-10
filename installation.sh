@@ -32,7 +32,7 @@ else
 fi
 
 # resolve the env's python by absolute path (robust on non-interactive shells)
-CONDA_BASE="$(conda info --base)"
+CONDA_BASE="$($CONDA info --base | awk '{print $NF}')"
 
 ENV_PY="$CONDA_BASE/envs/$ENV_NAME/bin/python"
 [ -x "$ENV_PY" ] || { echo "[install] ERROR: $ENV_PY not found"; exit 1; }
