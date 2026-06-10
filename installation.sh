@@ -32,10 +32,10 @@ else
 fi
 
 # resolve the env's python by absolute path (robust on non-interactive shells)
-CONDA_BASE="$($CONDA info --base | awk '{print $NF}')"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$ENV_NAME"
+ENV_PY="$(command -v python)"
 
-ENV_PY="$CONDA_BASE/envs/$ENV_NAME/bin/python"
-[ -x "$ENV_PY" ] || { echo "[install] ERROR: $ENV_PY not found"; exit 1; }
 echo "[install] env python: $ENV_PY"
 
 # 2) CUDA PyTorch from the official index (bundles its own CUDA runtime)
