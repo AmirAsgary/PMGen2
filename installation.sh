@@ -17,7 +17,7 @@ set -euo pipefail
 
 ENV_NAME="${1:-pmgen2}"
 CUDA_TAG="${2:-cu121}"
-TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
+TORCH_VERSION="${TORCH_VERSION:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if command -v mamba >/dev/null 2>&1; then CONDA=mamba; else CONDA=conda; fi
