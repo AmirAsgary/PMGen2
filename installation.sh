@@ -17,7 +17,7 @@ set -euo pipefail
 
 ENV_NAME="${1:-pmgen2}"
 CUDA_TAG="${2:-cu121}"
-TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
+TORCH_VERSION="${TORCH_VERSION:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if command -v mamba >/dev/null 2>&1; then CONDA=mamba; else CONDA=conda; fi
@@ -39,8 +39,16 @@ echo "[install] env python: $ENV_PY"
 
 # 2) CUDA PyTorch from the official index (bundles its own CUDA runtime)
 "$ENV_PY" -m pip install --upgrade pip
-"$ENV_PY" -m pip install "torch==${TORCH_VERSION}" \
-    --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+
+if [ -z "$TORCH_VERSION" ]; then
+    echo "[install] Installing latest PyTorch for $CUDA_TAG"
+    "$ENV_PY" -m pip install "torch" \
+        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+else
+    echo "[install] Installing specifically PyTorch == $TORCH_VERSION for $CUDA_TAG"
+    "$ENV_PY" -m pip install "torch==${TORCH_VERSION}" \
+        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
+fi
 
 # 3) verify
 "$ENV_PY" - <<'PYEOF'
