@@ -53,6 +53,7 @@ fi
 # Install missing packages:
 pip install dm-tree
 pip install modelcif
+pip install tqdm
 
 # 3) verify
 "$ENV_PY" - <<'PYEOF'

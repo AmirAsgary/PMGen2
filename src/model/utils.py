@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
-
+from tqdm.auto import tqdm
 import h5py
 import numpy as np
 import torch
@@ -912,23 +912,34 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
     chunk is independent -> safe to run in parallel jobs (pass disjoint
     --chunks); ``merge`` concatenates per-chunk indices into index.parquet."""
     import pandas as pd
+    from tqdm.auto import tqdm
+
     chunks_dir, out_dir = Path(chunks_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     all_dirs = [d for d in chunks_dir.iterdir()
                 if d.is_dir() and (d / "chunk.tsv").exists()]
     if chunks:
         want = set(chunks)
         all_dirs = [d for d in all_dirs if d.name in want]
     all_dirs.sort(key=lambda d: _chunk_sort_key(d.name))
+
     log(f"[preprocess] {len(all_dirs)} chunk(s) -> {out_dir}")
-    for cdir in all_dirs:
+
+    pbar = tqdm(all_dirs, desc="Preprocessing chunks", unit="chunk")
+
+    for cdir in pbar:
+        pbar.set_postfix_str(cdir.name)
         shard = out_dir / f"{cdir.name}.h5"
         idx = out_dir / f"{cdir.name}.index.csv"
+
         if shard.exists() and idx.exists() and not overwrite:
-            log(f"  {cdir.name}: shard exists, skipping")
+            tqdm.write(f"  {cdir.name}: shard exists, skipping")
             continue
+
         preprocess_chunk(cdir, shard, idx, alphafold_subdir, output_link,
                          compression, clevel, log=log)
+
     if merge:
         parts = sorted(out_dir.glob("*.index.csv"))
         if parts:
