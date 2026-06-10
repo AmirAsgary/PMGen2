@@ -855,46 +855,64 @@ def preprocess_chunk(chunk_dir: Path, shard_path: Path, index_path: Path,
     """Process one chunk dir (with chunk.tsv + output/<alphafold_subdir>/<id>/)
     into one HDF5 shard + a per-chunk index parquet. Missing/failed ids are
     skipped (counted). Returns counts."""
+    import sys
     import pandas as pd
+    from tqdm.auto import tqdm
     rows = pd.read_csv(chunk_dir / "chunk.tsv", sep="\t").to_dict("records")
     af_base = chunk_dir / output_link / alphafold_subdir
     if not af_base.exists():
-        af_base = chunk_dir / alphafold_subdir          # fallback (no symlink)
+        af_base = chunk_dir / alphafold_subdir
     recs: List[dict] = []
     n_ok = n_missing = n_fail = 0
     comp = dict(compression=compression, compression_opts=clevel, shuffle=True) \
         if compression else {}
     with h5py.File(shard_path, "w") as h5:
-        for r in rows:
-            aid = str(r["id"])
-            af_dir = af_base / aid
-            if not af_dir.is_dir():
-                n_missing += 1
-                continue
-            try:
-                pdb, plddt_npy, pae_npy = find_teacher_files(af_dir)
-                arrays, meta = extract_example_arrays(
-                    pdb, plddt_npy, pae_npy, r["peptide"], r["mhc_seq"],
-                    r["anchors"], r["mhc_type"])
-            except (FileNotFoundError, ValueError) as exc:
-                n_fail += 1
-                log(f"    [skip] {aid}: {str(exc)[:80]}")
-                continue
-            g = h5.create_group(aid)
-            for k in _H5_DSETS:
-                g.create_dataset(k, data=arrays[k], **comp)
-            for k, v in meta.items():
-                g.attrs[k] = v
-            base = base_id(aid)
-            g.attrs["base_id"] = base
-            for opt in ("hla_cluster_id", "peptide_cluster_id"):
-                g.attrs[opt] = str(r.get(opt, ""))
-            recs.append({"id": aid, "base_id": base, "shard": shard_path.name,
-                         "n_mhc": meta["n_mhc"], "n_pep": meta["n_pep"],
-                         "mhc_type": meta["mhc_type"],
-                         "hla_cluster_id": str(r.get("hla_cluster_id", "")),
-                         "peptide_cluster_id": str(r.get("peptide_cluster_id", ""))})
-            n_ok += 1
+        with tqdm(
+            rows,
+            total=len(rows),
+            desc=chunk_dir.name,
+            unit="example",
+            disable=not sys.stderr.isatty(),
+            leave=True
+        ) as pbar:
+            for r in pbar:
+                aid = str(r["id"])
+                af_dir = af_base / aid
+                if not af_dir.is_dir():
+                    n_missing += 1
+                    pbar.set_postfix(ok=n_ok, missing=n_missing, failed=n_fail)
+                    continue
+                try:
+                    pdb, plddt_npy, pae_npy = find_teacher_files(af_dir)
+                    arrays, meta = extract_example_arrays(
+                        pdb, plddt_npy, pae_npy, r["peptide"], r["mhc_seq"],
+                        r["anchors"], r["mhc_type"])
+                except (FileNotFoundError, ValueError) as exc:
+                    n_fail += 1
+                    pbar.set_postfix(ok=n_ok, missing=n_missing, failed=n_fail)
+                    tqdm.write(f"    [skip] {aid}: {str(exc)[:80]}")
+                    continue
+                g = h5.create_group(aid)
+                for k in _H5_DSETS:
+                    g.create_dataset(k, data=arrays[k], **comp)
+                for k, v in meta.items():
+                    g.attrs[k] = v
+                base = base_id(aid)
+                g.attrs["base_id"] = base
+                for opt in ("hla_cluster_id", "peptide_cluster_id"):
+                    g.attrs[opt] = str(r.get(opt, ""))
+                recs.append({
+                    "id": aid,
+                    "base_id": base,
+                    "shard": shard_path.name,
+                    "n_mhc": meta["n_mhc"],
+                    "n_pep": meta["n_pep"],
+                    "mhc_type": meta["mhc_type"],
+                    "hla_cluster_id": str(r.get("hla_cluster_id", "")),
+                    "peptide_cluster_id": str(r.get("peptide_cluster_id", ""))
+                })
+                n_ok += 1
+                pbar.set_postfix(ok=n_ok, missing=n_missing, failed=n_fail)
     pd.DataFrame(recs).to_csv(index_path, index=False)
     log(f"  {chunk_dir.name}: {n_ok} ok, {n_missing} missing, {n_fail} failed "
         f"-> {shard_path.name}")
@@ -912,34 +930,24 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
     chunk is independent -> safe to run in parallel jobs (pass disjoint
     --chunks); ``merge`` concatenates per-chunk indices into index.parquet."""
     import pandas as pd
-    from tqdm.auto import tqdm
-
     chunks_dir, out_dir = Path(chunks_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     all_dirs = [d for d in chunks_dir.iterdir()
                 if d.is_dir() and (d / "chunk.tsv").exists()]
     if chunks:
         want = set(chunks)
         all_dirs = [d for d in all_dirs if d.name in want]
     all_dirs.sort(key=lambda d: _chunk_sort_key(d.name))
-
     log(f"[preprocess] {len(all_dirs)} chunk(s) -> {out_dir}")
-
     pbar = tqdm(all_dirs, desc="Preprocessing chunks", unit="chunk")
-
-    for cdir in pbar:
-        pbar.set_postfix_str(cdir.name)
+    for cdir in all_dirs:
         shard = out_dir / f"{cdir.name}.h5"
         idx = out_dir / f"{cdir.name}.index.csv"
-
         if shard.exists() and idx.exists() and not overwrite:
-            tqdm.write(f"  {cdir.name}: shard exists, skipping")
+            log(f"  {cdir.name}: shard exists, skipping")
             continue
-
         preprocess_chunk(cdir, shard, idx, alphafold_subdir, output_link,
                          compression, clevel, log=log)
-
     if merge:
         parts = sorted(out_dir.glob("*.index.csv"))
         if parts:
