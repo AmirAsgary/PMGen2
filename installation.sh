@@ -50,6 +50,9 @@ else
         --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
 fi
 
+# Install missing packages:
+pip install dm-tree
+
 # 3) verify
 "$ENV_PY" - <<'PYEOF'
 import torch, numpy, scipy, pandas, h5py, Bio, ml_collections, einops
