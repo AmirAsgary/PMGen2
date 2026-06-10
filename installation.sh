@@ -52,6 +52,7 @@ fi
 
 # Install missing packages:
 pip install dm-tree
+pip install modelcif
 
 # 3) verify
 "$ENV_PY" - <<'PYEOF'
