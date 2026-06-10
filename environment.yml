@@ -12,6 +12,7 @@ dependencies:
   - pandas>=2.0
   - h5py>=3.10
   - biopython>=1.80
+  - tqdm>=4.6
   - pip:
       - ml-collections>=1.0
       - einops>=0.8

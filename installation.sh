@@ -50,10 +50,10 @@ else
         --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
 fi
 
-# Install missing packages:
-pip install dm-tree
-pip install modelcif
-pip install tqdm
+# Install extra packages into the env (route via the env's python, not the
+# active shell's `pip`). tqdm is also in environment.yml; dm-tree/modelcif are
+# optional OpenFold extras not required by the distillation path.
+"$ENV_PY" -m pip install dm-tree modelcif tqdm
 
 # 3) verify
 "$ENV_PY" - <<'PYEOF'
