@@ -949,13 +949,26 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
         preprocess_chunk(cdir, shard, idx, alphafold_subdir, output_link,
                          compression, clevel, log=log)
     if merge:
-        parts = sorted(out_dir.glob("*.index.csv"))
-        if parts:
-            full = pd.concat([pd.read_csv(p, dtype=str) for p in parts],
-                             ignore_index=True)
-            full.to_csv(out_dir / "index.csv", index=False)
-            log(f"[preprocess] merged index: {len(full):,} examples across "
-                f"{full['shard'].nunique()} shards -> {out_dir / 'index.csv'}")
+        merge_indices(out_dir, log=log)
+
+
+def merge_indices(out_dir: Path, log=print) -> Optional[Path]:
+    """Concatenate the per-chunk ``*.index.csv`` files in ``out_dir`` into a
+    single ``index.csv`` (the training store index). Idempotent — the merged
+    ``index.csv`` does not match the ``*.index.csv`` glob, so re-running is safe.
+    Use after a parallel array preprocessing run. Needs only ``out_dir``."""
+    import pandas as pd
+    out_dir = Path(out_dir)
+    parts = sorted(out_dir.glob("*.index.csv"))
+    if not parts:
+        log(f"[merge] no per-chunk *.index.csv files in {out_dir}")
+        return None
+    full = pd.concat([pd.read_csv(p, dtype=str) for p in parts], ignore_index=True)
+    dest = out_dir / "index.csv"
+    full.to_csv(dest, index=False)
+    log(f"[merge] {len(full):,} examples across {full['shard'].nunique()} "
+        f"shards from {len(parts)} index files -> {dest}")
+    return dest
 
 
 # --- HDF5-backed dataset (the streamable training path) -------------------- #

@@ -53,9 +53,8 @@ $PY src/model/preprocess.py \
     --chunks "chunk_${SLURM_ARRAY_TASK_ID}" \
     --no-merge                        # merge once at the end (next line)
 
-# after the array finishes, merge per-chunk indices into index.csv:
-# $PY -c "import sys; sys.path.insert(0,'src/model'); import utils,pathlib; \
-#   utils.preprocess_chunks(pathlib.Path('x'), pathlib.Path('data/processed/h5_store'), chunks=[], merge=True)"
+# after the array finishes, merge the per-chunk *.index.csv into index.csv:
+#   $PY src/model/preprocess.py --merge-only --out-dir data/processed/h5_store
 ```
 (The shard for each `chunk_N` reads its outputs via `chunk_N/output/alphafold/<id>/`.
 Missing/failed predictions are skipped and counted in the log.)
