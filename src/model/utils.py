@@ -913,7 +913,11 @@ def preprocess_chunk(chunk_dir: Path, shard_path: Path, index_path: Path,
                 })
                 n_ok += 1
                 pbar.set_postfix(ok=n_ok, missing=n_missing, failed=n_fail)
-    pd.DataFrame(recs).to_csv(index_path, index=False)
+    # write with an explicit header even when recs is empty (a chunk with no
+    # successful example) so merge_indices never hits a header-less file
+    index_cols = ["id", "base_id", "shard", "n_mhc", "n_pep", "mhc_type",
+                  "hla_cluster_id", "peptide_cluster_id"]
+    pd.DataFrame(recs, columns=index_cols).to_csv(index_path, index=False)
     log(f"  {chunk_dir.name}: {n_ok} ok, {n_missing} missing, {n_fail} failed "
         f"-> {shard_path.name}")
     return {"ok": n_ok, "missing": n_missing, "failed": n_fail}
@@ -929,7 +933,6 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
     """Preprocess all (or selected) chunk dirs into HDF5 shards + index. Each
     chunk is independent -> safe to run in parallel jobs (pass disjoint
     --chunks); ``merge`` concatenates per-chunk indices into index.parquet."""
-    import pandas as pd
     chunks_dir, out_dir = Path(chunks_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_dirs = [d for d in chunks_dir.iterdir()
@@ -956,18 +959,31 @@ def merge_indices(out_dir: Path, log=print) -> Optional[Path]:
     """Concatenate the per-chunk ``*.index.csv`` files in ``out_dir`` into a
     single ``index.csv`` (the training store index). Idempotent — the merged
     ``index.csv`` does not match the ``*.index.csv`` glob, so re-running is safe.
-    Use after a parallel array preprocessing run. Needs only ``out_dir``."""
+    Per-chunk files that are empty (a chunk with no successful example) are
+    skipped and reported. Use after a parallel array preprocessing run; needs
+    only ``out_dir``."""
     import pandas as pd
     out_dir = Path(out_dir)
     parts = sorted(out_dir.glob("*.index.csv"))
-    if not parts:
-        log(f"[merge] no per-chunk *.index.csv files in {out_dir}")
+    frames: List = []
+    skipped: List[str] = []
+    for p in parts:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except pd.errors.EmptyDataError:
+            skipped.append(p.name)
+            continue
+        frames.append(df) if len(df) else skipped.append(p.name)
+    if not frames:
+        log(f"[merge] no non-empty *.index.csv files in {out_dir}")
         return None
-    full = pd.concat([pd.read_csv(p, dtype=str) for p in parts], ignore_index=True)
+    full = pd.concat(frames, ignore_index=True)
     dest = out_dir / "index.csv"
     full.to_csv(dest, index=False)
-    log(f"[merge] {len(full):,} examples across {full['shard'].nunique()} "
-        f"shards from {len(parts)} index files -> {dest}")
+    log(f"[merge] {len(full):,} examples across {full['shard'].nunique()} shards "
+        f"from {len(frames)} index files ({len(skipped)} empty skipped) -> {dest}")
+    if skipped:
+        log(f"[merge] empty/no-success chunks: {skipped}")
     return dest
 
 
