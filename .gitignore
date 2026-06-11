@@ -56,6 +56,7 @@ data/processed/full_dataset.csv
 data/processed/full_dataset_pmgeninput.csv
 # preprocessed HDF5 store (built on the cluster)
 data/processed/h5_store/
+data/processed/retry_inputs
 # Multiple_Anchors_input*.tsv (GBs) + pmgen outputs
 outputs/
 # exploration plots/csvs
