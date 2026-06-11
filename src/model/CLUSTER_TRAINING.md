@@ -62,6 +62,27 @@ Missing/failed predictions are skipped and counted in the log.)
 > Tip: the store is ~86 KB/example (~74 GB for 885k). For fastest training, stage
 > it to node-local NVMe (`$SLURM_TMPDIR`) and point `--h5-dir` there.
 
+### 1b. Recover failed predictions (optional)
+A few chunks may have partly-failed PMGen jobs (the prep log shows
+`X ok, Y missing, Z failed`). `missing` = the id's output dir doesn't exist;
+`failed` = it exists but the `.pdb`/`.npy` are absent or don't match the
+sequence. Build **balanced** retry inputs (failed ids spread evenly across
+≤ `--max-jobs`, each shard kept in one chunk so outputs land in its dir):
+
+```bash
+python src/model/make_retry_inputs.py \
+    --chunks-dir ~/projects/PMGen_2/data/pmgen_inputs/chunks \
+    --h5-dir     data/processed/h5_store \
+    --out-dir    data/processed/retry_inputs --max-jobs 32
+# -> writes retry_*.tsv + manifest.tsv (+ incomplete_dirs.txt); prints --array=1-N
+```
+Then set `--array=1-N` in `src/model/retry_predict.sbatch` (it reads the manifest
+per task and re-runs PMGen into each id's own chunk output dir) and submit it.
+If PMGen skips ids whose folder already exists, remove the stale dirs first:
+`xargs rm -rf < data/processed/retry_inputs/incomplete_dirs.txt`.
+Afterwards, re-preprocess just those chunks (`--chunks chunk_117,... --overwrite
+--no-merge`) and `--merge-only` again.
+
 ## 2. Train all 7 variants (one SLURM array)
 ```bash
 #!/bin/bash
