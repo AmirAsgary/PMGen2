@@ -37,6 +37,8 @@ Thumbs.db
 *.log
 *.tmp
 runs/
+log/
+logs/
 
 # --- Large binary formats anywhere ---
 *.parquet
