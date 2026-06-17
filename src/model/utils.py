@@ -341,6 +341,9 @@ POOL_CSV = PROCESSED_DIR / "full_dataset_pmgeninput.csv"
 # slim, repo-friendly ordered base-id list (just the 'id' column of POOL_CSV);
 # read_split_ids prefers it so the 70 MB pool CSV need not be pushed.
 POOL_IDS_CSV = PROCESSED_DIR / "base_ids_ordered.csv"
+# base ids with >=1 existing PMGen structure (written by the post-prediction
+# cleaning script); when present, read_split_ids intersects every split with it.
+VALID_BASE_IDS_CSV = PROCESSED_DIR / "valid_base_ids.csv"
 DUMMY_AF_DIR = DUMMY_DIR / "pdbs" / "alphafold"
 
 
@@ -449,9 +452,14 @@ def _read_row_idx(path: Path) -> List[int]:
 
 def read_split_ids(scheme: str, fold: int,
                    pool_csv: Path = POOL_CSV) -> Dict[str, List[str]]:
-    """Build {train,val,test} id lists for a scheme/fold from the processed
+    """Build {train,val,test} base-id lists for a scheme/fold from the processed
     split files. ``row_idx`` indexes into the pool CSV (same row order as
     full_dataset.csv). train = pool − this fold's val − test.
+
+    If ``valid_base_ids.csv`` exists (written by
+    src/post_structure_prediction_processing/script.py), every split is
+    intersected with it, so base ids whose PMGen structures don't exist are
+    excluded from train/val/test everywhere.
     """
     if scheme not in ("two_axis", "hla_only"):
         raise ValueError(f"scheme must be two_axis|hla_only, got {scheme!r}")
@@ -467,7 +475,11 @@ def read_split_ids(scheme: str, fold: int,
     val_ids = {ids[i] for i in val_idx}
     held = test_ids | val_ids
     train_ids = [i for i in ids if i not in held]
-    return {"train": train_ids, "val": sorted(val_ids), "test": sorted(test_ids)}
+    result = {"train": train_ids, "val": sorted(val_ids), "test": sorted(test_ids)}
+    if VALID_BASE_IDS_CSV.exists():
+        valid = set(pd.read_csv(VALID_BASE_IDS_CSV, dtype=str)["id"])
+        result = {k: [x for x in v if x in valid] for k, v in result.items()}
+    return result
 
 
 def dummy_rows() -> List[Dict[str, str]]:

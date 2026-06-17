@@ -83,6 +83,19 @@ If PMGen skips ids whose folder already exists, remove the stale dirs first:
 Afterwards, re-preprocess just those chunks (`--chunks chunk_117,... --overwrite
 --no-merge`) and `--merge-only` again.
 
+### 1c. Exclude un-predictable structures (recommended, after the final merge)
+Some structures never predict successfully. Mark them excluded everywhere
+(training already skips missing *anchor* structures via the index; this also
+drops base ids whose **every** anchor failed, from the CV/test splits):
+```bash
+python src/post_structure_prediction_processing/script.py --h5-dir data/processed/h5_store
+# optional excluded-anchor list: --anchors-tsv outputs/pmgen_input/full_dataset/Multiple_Anchors_input_reduced.tsv
+```
+It writes `data/processed/valid_base_ids.csv`; `read_split_ids` (so all of
+`build_dataset` / `build_h5_dataset` / training) intersects every split with it.
+It also writes `data/processed/post_structure_prediction/{excluded_base_ids.csv,
+excluded_anchor_ids.csv,report.csv}` (per scheme/fold survival counts).
+
 ## 2. Train all 7 variants (one SLURM array)
 ```bash
 #!/bin/bash
