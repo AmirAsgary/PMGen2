@@ -35,7 +35,7 @@ S=${SCHEMES[$(( IDX / 35 ))]}     # scheme
 RUN="${S}_fold${F}_variant${V}"
 
 # ---- hyperparameters (edit here) ----
-EPOCHS=10
+EPOCHS=3
 BS=8
 LR=1e-3
 
