@@ -60,6 +60,13 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None) -> None:
+    # Stream logs live: stdout is block-buffered when redirected to a file
+    # (e.g. SLURM --output), so flush on every newline instead.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     args = parse_args(argv)
     U.run_training(
         variant=args.variant, scheme=args.scheme, fold=args.fold,

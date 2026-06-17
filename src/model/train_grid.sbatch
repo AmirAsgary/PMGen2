@@ -35,9 +35,13 @@ S=${SCHEMES[$(( IDX / 35 ))]}     # scheme
 RUN="${S}_fold${F}_variant${V}"
 
 # ---- hyperparameters (edit here) ----
+# BS is shared by all 7 variants; size it for the heaviest (variant 7). Memory
+# scales ~ BS * N^2; class-I pMHC N is small (~190), so a 40 GB A100 has headroom.
+# Check variant-7 memory (`ssh <node> nvidia-smi`) and push BS up if it fits;
+# scale LR ~ sqrt(BS/8) when you do. Larger BS => far fewer steps/epoch.
 EPOCHS=3
-BS=8
-LR=1e-3
+BS=16
+LR=1.4e-3
 
 # ---- organized, human-readable log symlinks -> this task's slurm files ----
 mkdir -p logs/distill "checkpoints/${RUN}"
@@ -46,6 +50,7 @@ ln -sfn "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.err" "logs/distill/${RUN}.
 echo "=== task ${IDX}: scheme=${S} fold=${F} variant=${V} -> ${RUN} ==="
 nvidia-smi -L || true
 
+export PYTHONUNBUFFERED=1          # stream python stdout/stderr live to the logs
 module load apptainer gcc/13 cuda/12.6 openmpi_gpu/5.0
 PY=$(conda info --base)/envs/pmgen2/bin/python
 cd "$HOME/projects/PMGen_2/PMGen2"
