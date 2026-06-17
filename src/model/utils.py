@@ -174,10 +174,17 @@ class PairUpdate(nn.Module):
             )
 
     def forward(self, z: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
-        for op in self.ops:                    # uniform (z, mask=...) signature
-            z = z + op(z, mask=pair_mask)
-        if self.transition is not None:
-            z = z + self.transition(z)
+        # Run the pair stack in fp32. OpenFold's TriangleAttention does NOT guard
+        # autocast, so under --amp it runs in fp16 where its inf-masking (1e9)
+        # overflows -> fully-padded rows softmax to NaN. fp32 keeps -1e9 finite.
+        # (The tri-mul ops already force fp32 internally, so this is a no-op for
+        # the mul-only variants.)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            z = z.float()
+            for op in self.ops:                # uniform (z, mask=...) signature
+                z = z + op(z, mask=pair_mask)
+            if self.transition is not None:
+                z = z + self.transition(z)
         return z
 
 
