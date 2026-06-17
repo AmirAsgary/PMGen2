@@ -37,6 +37,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "teacher output sub-dir per anchor id")
     p.add_argument("--h5-dir", default=None,
                    help="preprocessed HDF5 store dir (fastest; from preprocess.py)")
+    p.add_argument("--ckpt-dir", default="checkpoints",
+                   help="dir for checkpoints (<ckpt-dir>/<run-name>/{last,best}.pt)")
+    p.add_argument("--run-name", default=None,
+                   help="checkpoint subdir (default variant{v}_{scheme}_fold{f})")
+    p.add_argument("--resume", default=None,
+                   help="path to a last.pt to resume a preempted run")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--bs", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -56,6 +62,7 @@ def main(argv=None) -> None:
     U.run_training(
         variant=args.variant, scheme=args.scheme, fold=args.fold,
         dummy=args.dummy, af_root=args.af_root, h5_dir=args.h5_dir,
+        ckpt_dir=args.ckpt_dir, run_name=args.run_name, resume=args.resume,
         epochs=args.epochs, bs=args.bs, lr=args.lr, lambdas=tuple(args.lambdas),
         weight_decay=args.weight_decay, grad_clip=args.grad_clip, amp=args.amp,
         num_workers=args.num_workers, seed=args.seed, device=args.device,

@@ -68,3 +68,6 @@ analysis/
 !data/processed/hla_only/
 !data/test/
 !params/alphafold/*.pt
+
+# --- training checkpoints ---
+checkpoints/

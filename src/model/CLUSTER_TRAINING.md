@@ -115,7 +115,12 @@ $PY src/model/train.py \
     --epochs 50 --bs 8 --lr 1e-3 --grad-clip 1.0 \
     --num-workers 8 --amp
 ```
-`--array=1-7` launches the 7 variants in parallel, one GPU each.
+`--array=1-7` launches the 7 variants in parallel, one GPU each. Each writes
+`checkpoints/variant{v}_two_axis_fold1/{last.pt,best.pt}` (isolated per variant).
+**Resume** a preempted/continued run (e.g. across the 24 h limit) by adding
+`--resume checkpoints/variant${SLURM_ARRAY_TASK_ID}_two_axis_fold1/last.pt`.
+It's a no-op if that file doesn't exist yet, so you can include it from the
+first submission and just re-`sbatch` to continue.
 
 ### Choosing the data split
 - `--scheme {two_axis,hla_only}` and `--fold {1..5}` pick which cluster-aware

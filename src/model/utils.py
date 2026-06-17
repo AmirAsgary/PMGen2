@@ -767,13 +767,21 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  seed: int = 0, device: Optional[str] = None, amp: bool = False,
                  grad_clip: Optional[float] = 1.0, weight_decay: float = 1e-4,
                  num_workers: int = 0, af_root: Optional[Path] = None,
-                 h5_dir: Optional[Path] = None,
+                 h5_dir: Optional[Path] = None, ckpt_dir: Optional[Path] = None,
+                 run_name: Optional[str] = None, resume: Optional[Path] = None,
                  eval_batches: Optional[int] = None, log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
     Data source: ``h5_dir`` (the preprocessed streamable store; fastest) else the
-    on-the-fly PDB readers (``dummy`` -> data/test/, else ``af_root``)."""
+    on-the-fly PDB readers (``dummy`` -> data/test/, else ``af_root``).
+
+    Checkpointing: if ``ckpt_dir`` is set, writes ``<ckpt_dir>/<run_name>/last.pt``
+    every epoch (encoder + optimizer + scheduler + scaler + epoch + history, so it
+    is resumable) and ``best.pt`` (encoder, lowest val Cα-RMSD). ``resume`` (a
+    last.pt) continues a preempted run. ``run_name`` defaults to
+    ``variant{v}_{scheme}_fold{fold}`` so a SLURM array over variants is isolated.
+    """
     set_seed(seed)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -797,11 +805,33 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                                                            T_max=total_steps)
     scaler = torch.amp.GradScaler(device="cuda", enabled=amp)
 
+    run_dir = None
+    if ckpt_dir is not None:
+        run_name = run_name or f"variant{variant}_{scheme}_fold{fold}"
+        run_dir = Path(ckpt_dir) / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+    config = {"variant": variant, "scheme": scheme, "fold": fold,
+              "lambdas": tuple(lambdas), "bs": bs, "lr": lr, "epochs": epochs}
+
+    history: List[dict] = []
+    start_epoch, best = 1, float("inf")
+    if resume is not None and Path(resume).exists():
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.encoder.load_state_dict(ckpt["encoder"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        history = ckpt.get("history", [])
+        best = ckpt.get("best", float("inf"))
+        start_epoch = int(ckpt["epoch"]) + 1
+        log(f"[train] resumed from {resume} at epoch {start_epoch} (best val "
+            f"Cα-RMSD {best:.3f})")
+
     log(f"[train] variant={variant} scheme={scheme} fold={fold} dummy={dummy} "
         f"device={device} | train={len(train_ds)} val={len(val_ds)} "
-        f"bs={bs} epochs={epochs} steps={total_steps} amp={amp}")
-    history = []
-    for epoch in range(1, epochs + 1):
+        f"bs={bs} epochs={epochs} steps={total_steps} amp={amp}"
+        + (f" | ckpt={run_dir}" if run_dir else ""))
+    for epoch in range(start_epoch, epochs + 1):
         tr = train_one_epoch(model, train_loader, loss_mod, optimizer,
                              scheduler, device, scaler if amp else None, grad_clip)
         ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches)
@@ -811,6 +841,17 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
             f"pae {tr['pae_ce']:.3f}) | val total {ev['total']:.3f} "
             f"Cα-RMSD {ev['ca_rmsd']:.2f} pLDDT-sp {ev['plddt_spearman']:.2f} "
             f"PAE-MAE {ev['pae_mae']:.2f}")
+        if run_dir is not None:
+            if ev["ca_rmsd"] < best:
+                best = ev["ca_rmsd"]
+                torch.save({"epoch": epoch, "encoder": model.encoder.state_dict(),
+                            "val": ev, "config": config}, run_dir / "best.pt")
+                log(f"[train]   new best val Cα-RMSD {best:.3f} -> best.pt")
+            torch.save({"epoch": epoch, "encoder": model.encoder.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict(), "history": history,
+                        "best": best, "config": config}, run_dir / "last.pt")
     return history, model
 
 
