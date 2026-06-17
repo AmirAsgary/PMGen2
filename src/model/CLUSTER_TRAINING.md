@@ -96,7 +96,20 @@ It writes `data/processed/valid_base_ids.csv`; `read_split_ids` (so all of
 It also writes `data/processed/post_structure_prediction/{excluded_base_ids.csv,
 excluded_anchor_ids.csv,report.csv}` (per scheme/fold survival counts).
 
-## 2. Train all 7 variants (one SLURM array)
+## 2. Train
+
+**Full grid (recommended):** `src/model/train_grid.sbatch` runs all
+schemes × folds × variants (70 runs), one A100 each, resumable, with a per-run
+`config.json` + `checkpoints/<scheme>_fold<f>_variant<v>/{last,best}.pt` +
+organized `logs/distill/<run>.{out,err}`:
+```bash
+mkdir -p logs/distill
+sbatch src/model/train_grid.sbatch                 # all 70; re-sbatch to continue
+sbatch --array=0-34 src/model/train_grid.sbatch    # two_axis only (35 runs)
+sbatch --array=35-69 src/model/train_grid.sbatch   # hla_only only
+```
+
+### Or a single SLURM array over the 7 variants
 ```bash
 #!/bin/bash
 #SBATCH --job-name=pmgen2_distill

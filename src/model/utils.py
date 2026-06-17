@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import glob
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -805,13 +806,25 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                                                            T_max=total_steps)
     scaler = torch.amp.GradScaler(device="cuda", enabled=amp)
 
+    import datetime
+    config = {
+        "variant": variant, "scheme": scheme, "fold": fold, "dummy": dummy,
+        "lambdas": tuple(lambdas), "bs": bs, "lr": lr, "epochs": epochs,
+        "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp,
+        "seed": seed, "num_workers": num_workers, "device": str(device),
+        "h5_dir": str(h5_dir) if h5_dir else None,
+        "af_root": str(af_root) if af_root else None,
+        "n_train": len(train_ds), "n_val": len(val_ds),
+        "encoder_params": sum(p.numel() for p in model.encoder.parameters()),
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
     run_dir = None
     if ckpt_dir is not None:
         run_name = run_name or f"variant{variant}_{scheme}_fold{fold}"
+        config["run_name"] = run_name
         run_dir = Path(ckpt_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
-    config = {"variant": variant, "scheme": scheme, "fold": fold,
-              "lambdas": tuple(lambdas), "bs": bs, "lr": lr, "epochs": epochs}
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
 
     history: List[dict] = []
     start_epoch, best = 1, float("inf")
