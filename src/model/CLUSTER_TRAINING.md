@@ -101,13 +101,16 @@ excluded_anchor_ids.csv,report.csv}` (per scheme/fold survival counts).
 #!/bin/bash
 #SBATCH --job-name=pmgen2_distill
 #SBATCH --array=1-7                   # variant = array index
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --constraint="gpu"
+#SBATCH --gres=gpu:a100:2
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/distill_v%a.out
+module load apptainer gcc/13 cuda/12.6 openmpi_gpu/5.0
 PY=$(conda info --base)/envs/pmgen2/bin/python
-cd "$HOME/PMGen2"
+cd "$HOME/projects/PMGen_2/PMGen2"
+mamba activate pmgen2
 $PY src/model/train.py \
     --h5-dir data/processed/h5_store \
     --scheme two_axis --fold 1 \
