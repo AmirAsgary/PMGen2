@@ -40,7 +40,7 @@ RUN="${S}_fold${F}_variant${V}"
 # Check variant-7 memory (`ssh <node> nvidia-smi`) and push BS up if it fits;
 # scale LR ~ sqrt(BS/8) when you do. Larger BS => far fewer steps/epoch.
 EPOCHS=3
-BS=16
+BS=10
 LR=1.4e-3
 
 # ---- organized, human-readable log symlinks -> this task's slurm files ----
