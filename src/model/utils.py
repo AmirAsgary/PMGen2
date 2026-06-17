@@ -702,16 +702,21 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
 
 def train_one_epoch(model: DistillModel, loader: DataLoader,
                     loss_mod: DistillLoss, optimizer, scheduler, device: str,
-                    scaler=None, grad_clip: Optional[float] = None
+                    scaler=None, grad_clip: Optional[float] = None,
+                    log=None, log_every: int = 0, epoch: int = 0
                     ) -> Dict[str, float]:
     """One epoch of encoder-only training; returns example-weighted mean of each
-    loss term."""
+    loss term. With ``log_every > 0`` prints a running summary every that many
+    steps (long epochs otherwise emit nothing for hours)."""
+    import time
     model.train()
     use_amp = scaler is not None and scaler.is_enabled()
     dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
     agg: Dict[str, float] = defaultdict(float)
     n = 0
-    for batch in loader:
+    nsteps = len(loader)
+    t0 = time.perf_counter()
+    for i, batch in enumerate(loader, 1):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=dev_type, enabled=use_amp):
@@ -723,19 +728,33 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(),
                                                grad_clip)
+            prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            # AMP may skip the optimizer step while calibrating the loss scale
+            # (inf grads -> scale reduced); only advance the LR schedule when the
+            # step actually happened, else PyTorch warns and skips an LR value.
+            stepped = scaler.get_scale() >= prev_scale
         else:
             total.backward()
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(),
                                                grad_clip)
             optimizer.step()
-        scheduler.step()
+            stepped = True
+        if stepped:
+            scheduler.step()
         bs = int(batch["aatype"].shape[0])
         for k, v in terms.items():
             agg[k] += float(v) * bs
         n += bs
+        if log and log_every and (i % log_every == 0 or i == nsteps):
+            rate = i / max(1e-9, time.perf_counter() - t0)
+            lr = optimizer.param_groups[0]["lr"]
+            log(f"[train]   epoch {epoch} step {i}/{nsteps} | "
+                f"total {agg['total'] / max(n, 1):.3f} "
+                f"fape {agg['fape'] / max(n, 1):.3f} | "
+                f"lr {lr:.2e} | {rate:.1f} it/s")
     return {k: v / max(n, 1) for k, v in agg.items()}
 
 
@@ -770,7 +789,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  num_workers: int = 0, af_root: Optional[Path] = None,
                  h5_dir: Optional[Path] = None, ckpt_dir: Optional[Path] = None,
                  run_name: Optional[str] = None, resume: Optional[Path] = None,
-                 eval_batches: Optional[int] = None, log=print):
+                 eval_batches: Optional[int] = None, log_every: int = 2000,
+                 log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -846,7 +866,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         + (f" | ckpt={run_dir}" if run_dir else ""))
     for epoch in range(start_epoch, epochs + 1):
         tr = train_one_epoch(model, train_loader, loss_mod, optimizer,
-                             scheduler, device, scaler if amp else None, grad_clip)
+                             scheduler, device, scaler if amp else None, grad_clip,
+                             log=log, log_every=log_every, epoch=epoch)
         ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches)
         history.append({"epoch": epoch, "train": tr, "val": ev})
         log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "
