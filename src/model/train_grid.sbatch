@@ -19,8 +19,8 @@
 #SBATCH --array=0-69%16            # %16 = max concurrent tasks; tune to GPU quota
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:1          # ONE A100 per task (training is single-GPU)
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:a100:2          # ONE A100 per task (training is single-GPU)
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=128G                 # data pipeline RSS grows over an epoch (74 GB
                                    # store + worker copies); 64 GB OOM-killed it
 #SBATCH --time=24:00:00
