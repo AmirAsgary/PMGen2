@@ -53,7 +53,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--amp", action="store_true")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100,
-                   help="print a running train summary every N steps (0=off)")
+                   help="log all loss terms + lr + it/s every N steps (0=off)")
+    p.add_argument("--ckpt-every", type=int, default=2000,
+                   help="write a resumable last.pt every N steps (0=epoch-only)")
+    p.add_argument("--no-tensorboard", action="store_true",
+                   help="disable the TensorBoard writer (metrics.csv still written)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     return p.parse_args(argv)
@@ -75,7 +79,8 @@ def main(argv=None) -> None:
         epochs=args.epochs, bs=args.bs, lr=args.lr, lambdas=tuple(args.lambdas),
         weight_decay=args.weight_decay, grad_clip=args.grad_clip, amp=args.amp,
         num_workers=args.num_workers, seed=args.seed, device=args.device,
-        log_every=args.log_every,
+        log_every=args.log_every, ckpt_every=args.ckpt_every,
+        tensorboard=not args.no_tensorboard,
     )
 
 

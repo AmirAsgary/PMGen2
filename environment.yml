@@ -16,3 +16,4 @@ dependencies:
   - pip:
       - ml-collections>=1.0
       - einops>=0.8
+      - tensorboard>=2.14

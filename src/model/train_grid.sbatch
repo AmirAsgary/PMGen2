@@ -21,7 +21,8 @@
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:1          # ONE A100 per task (training is single-GPU)
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G                 # data pipeline RSS grows over an epoch (74 GB
+                                   # store + worker copies); 64 GB OOM-killed it
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/distill/%A_%a.out
 #SBATCH --error=logs/distill/%A_%a.err
@@ -51,6 +52,11 @@ echo "=== task ${IDX}: scheme=${S} fold=${F} variant=${V} -> ${RUN} ==="
 nvidia-smi -L || true
 
 export PYTHONUNBUFFERED=1          # stream python stdout/stderr live to the logs
+# Bound DataLoader-worker RSS growth: glibc fragments badly with many arenas +
+# variable-length array reads, and never returns memory to the OS. These cap the
+# arenas and force trimming, which is what stops the slow climb to the mem limit.
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=0
 module load apptainer gcc/13 cuda/12.6 openmpi_gpu/5.0
 PY=$(conda info --base)/envs/pmgen2/bin/python
 cd "$HOME/projects/PMGen_2/PMGen2"
@@ -66,6 +72,7 @@ $PY src/model/train.py \
     --ckpt-dir checkpoints --run-name "$RUN" \
     --resume "checkpoints/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
-    --num-workers 8 --amp
+    --log-every 100 --ckpt-every 2000 \
+    --num-workers 4 --amp
 
 exit $?

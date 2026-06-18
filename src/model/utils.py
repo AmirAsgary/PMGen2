@@ -707,22 +707,94 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
             for k, v in batch.items()}
 
 
+# --- metric logging (TensorBoard if available, always a flat CSV) ---------- #
+_METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
+                "total", "fape", "plddt_ce", "pae_ce",
+                "ca_rmsd", "plddt_spearman", "pae_mae", "it_per_s"]
+
+
+class MetricLogger:
+    """Writes scalars for later plotting. Always appends to ``<run_dir>/metrics.csv``
+    (dependency-free, load with ``pandas.read_csv``); additionally streams to
+    TensorBoard at ``<run_dir>/tb`` if the ``tensorboard`` package is importable
+    (``tensorboard --logdir <ckpt_dir>``)."""
+
+    def __init__(self, run_dir: Optional[Path], enable_tb: bool = True):
+        self.run_dir = Path(run_dir) if run_dir is not None else None
+        self.csv_path = (self.run_dir / "metrics.csv") if self.run_dir else None
+        self.writer = None
+        if self.csv_path is not None and not self.csv_path.exists():
+            self.csv_path.write_text(",".join(_METRIC_COLS) + "\n")
+        if enable_tb and self.run_dir is not None:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self.writer = SummaryWriter(str(self.run_dir / "tb"))
+            except Exception:                          # tensorboard not installed
+                self.writer = None
+
+    def log(self, split: str, epoch: int, step: int, lr: Optional[float],
+            metrics: Dict[str, float], it_per_s: Optional[float] = None) -> None:
+        import time
+        row = {"wall_time": time.time(), "split": split, "epoch": epoch,
+               "global_step": step, "lr": lr, "it_per_s": it_per_s, **metrics}
+        if self.csv_path is not None:
+            line = ",".join("" if row.get(c) is None else f"{row.get(c)}"
+                            for c in _METRIC_COLS)
+            with open(self.csv_path, "a") as f:
+                f.write(line + "\n")
+        if self.writer is not None:
+            for k, v in metrics.items():
+                if v is not None:
+                    self.writer.add_scalar(f"{split}/{k}", float(v), step)
+            if lr is not None:
+                self.writer.add_scalar("train/lr", float(lr), step)
+            if it_per_s is not None:
+                self.writer.add_scalar("train/it_per_s", float(it_per_s), step)
+            self.writer.flush()
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+
+
+def make_epoch_loader(dataset, batch_size: int, num_workers: int, seed: int,
+                      epoch: int, skip_batches: int = 0) -> DataLoader:
+    """Deterministic per-epoch shuffle (so a mid-epoch resume can replay the exact
+    order). ``skip_batches`` drops the first N batches *without loading them* by
+    slicing the precomputed permutation — used to fast-forward on resume."""
+    g = torch.Generator().manual_seed((seed + 1) * 1_000_003 + epoch)
+    perm = torch.randperm(len(dataset), generator=g).tolist()
+    if skip_batches > 0:
+        perm = perm[skip_batches * batch_size:]
+    return make_dataloader(dataset, batch_size, shuffle=False,
+                           num_workers=num_workers, sampler=perm)
+
+
 def train_one_epoch(model: DistillModel, loader: DataLoader,
                     loss_mod: DistillLoss, optimizer, scheduler, device: str,
                     scaler=None, grad_clip: Optional[float] = None,
-                    log=None, log_every: int = 0, epoch: int = 0
-                    ) -> Dict[str, float]:
-    """One epoch of encoder-only training; returns example-weighted mean of each
-    loss term. With ``log_every > 0`` prints a running summary every that many
-    steps (long epochs otherwise emit nothing for hours)."""
+                    log=None, log_every: int = 0, epoch: int = 0,
+                    global_step: int = 0, mlog: Optional[MetricLogger] = None,
+                    ckpt_every: int = 0, save_fn=None
+                    ) -> Tuple[Dict[str, float], int]:
+    """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
+    updated global_step).
+
+    Every ``log_every`` steps it prints ALL loss terms (window-averaged since the
+    last log) + lr + it/s, and records them to ``mlog`` (TensorBoard + CSV). Every
+    ``ckpt_every`` steps it calls ``save_fn(global_step, epoch)`` to checkpoint, so
+    a crash mid-epoch loses at most ``ckpt_every`` steps."""
     import time
     model.train()
     use_amp = scaler is not None and scaler.is_enabled()
     dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
-    agg: Dict[str, float] = defaultdict(float)
+    agg: Dict[str, float] = defaultdict(float)        # whole-epoch (returned)
+    wagg: Dict[str, float] = defaultdict(float)       # window since last log
     n = 0
+    wn = 0
     nsteps = len(loader)
     t0 = time.perf_counter()
+    tw = t0
     for i, batch in enumerate(loader, 1):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
@@ -751,18 +823,36 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             stepped = True
         if stepped:
             scheduler.step()
+        global_step += 1
         bs = int(batch["aatype"].shape[0])
         for k, v in terms.items():
-            agg[k] += float(v) * bs
+            fv = float(v) * bs
+            agg[k] += fv
+            wagg[k] += fv
         n += bs
-        if log and log_every and (i % log_every == 0 or i == nsteps):
-            rate = i / max(1e-9, time.perf_counter() - t0)
+        wn += bs
+        if log_every and (i % log_every == 0 or i == nsteps):
+            now = time.perf_counter()
+            rate = log_every / max(1e-9, now - tw) if i % log_every == 0 \
+                else (i % log_every) / max(1e-9, now - tw)
             lr = optimizer.param_groups[0]["lr"]
-            log(f"[train]   epoch {epoch} step {i}/{nsteps} | "
-                f"total {agg['total'] / max(n, 1):.3f} "
-                f"fape {agg['fape'] / max(n, 1):.3f} | "
-                f"lr {lr:.2e} | {rate:.1f} it/s")
-    return {k: v / max(n, 1) for k, v in agg.items()}
+            means = {k: wagg[k] / max(wn, 1) for k in wagg}
+            if log:
+                log(f"[train]   epoch {epoch} step {i}/{nsteps} "
+                    f"(gstep {global_step}) | "
+                    f"total {means.get('total', 0):.3f} "
+                    f"fape {means.get('fape', 0):.3f} "
+                    f"plddt {means.get('plddt_ce', 0):.3f} "
+                    f"pae {means.get('pae_ce', 0):.3f} | "
+                    f"lr {lr:.2e} | {rate:.1f} it/s")
+            if mlog is not None:
+                mlog.log("train", epoch, global_step, lr, means, it_per_s=rate)
+            wagg.clear()
+            wn = 0
+            tw = now
+        if ckpt_every and save_fn is not None and global_step % ckpt_every == 0:
+            save_fn(global_step, epoch)
+    return {k: v / max(n, 1) for k, v in agg.items()}, global_step
 
 
 @torch.no_grad()
@@ -797,6 +887,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  h5_dir: Optional[Path] = None, ckpt_dir: Optional[Path] = None,
                  run_name: Optional[str] = None, resume: Optional[Path] = None,
                  eval_batches: Optional[int] = None, log_every: int = 2000,
+                 ckpt_every: int = 2000, tensorboard: bool = True,
                  log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
@@ -819,16 +910,17 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     else:
         train_ds = build_dataset(scheme, fold, "train", dummy=dummy, af_root=af_root)
         val_ds = build_dataset(scheme, fold, "val", dummy=dummy, af_root=af_root)
-    train_loader = make_dataloader(train_ds, bs, shuffle=True,
-                                   num_workers=num_workers)
+    # train loader is rebuilt per epoch (deterministic shuffle) so a mid-epoch
+    # resume can fast-forward to the exact batch; val loader is fixed.
     val_loader = make_dataloader(val_ds, bs, shuffle=False,
                                  num_workers=num_workers)
+    steps_per_epoch = (len(train_ds) + bs - 1) // bs
 
     model = DistillModel(variant, device=device).to(device)
     loss_mod = DistillLoss(*lambdas).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
-    total_steps = max(1, len(train_loader) * epochs)
+    total_steps = max(1, steps_per_epoch * epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                            T_max=total_steps)
     scaler = torch.amp.GradScaler(device="cuda", enabled=amp)
@@ -853,8 +945,23 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "config.json").write_text(json.dumps(config, indent=2))
 
+    mlog = MetricLogger(run_dir, enable_tb=tensorboard)
+
+    def save_ckpt(path: Path, global_step: int, epoch: int) -> None:
+        """Atomic checkpoint (tmp + rename) holding everything needed to resume."""
+        if run_dir is None:
+            return
+        tmp = Path(str(path) + ".tmp")
+        torch.save({"epoch": epoch, "global_step": global_step,
+                    "encoder": model.encoder.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(), "history": history,
+                    "best": best, "config": config}, tmp)
+        tmp.replace(path)
+
     history: List[dict] = []
-    start_epoch, best = 1, float("inf")
+    start_epoch, best, global_step, resume_skip = 1, float("inf"), 0, 0
     if resume is not None and Path(resume).exists():
         ckpt = torch.load(resume, map_location=device, weights_only=False)
         model.encoder.load_state_dict(ckpt["encoder"])
@@ -863,20 +970,35 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         scaler.load_state_dict(ckpt["scaler"])
         history = ckpt.get("history", [])
         best = ckpt.get("best", float("inf"))
-        start_epoch = int(ckpt["epoch"]) + 1
-        log(f"[train] resumed from {resume} at epoch {start_epoch} (best val "
-            f"Cα-RMSD {best:.3f})")
+        # global_step pinpoints where we stopped; derive epoch + batch to skip.
+        # (Older epoch-only checkpoints fall back to an epoch boundary.)
+        global_step = int(ckpt.get("global_step",
+                                   int(ckpt["epoch"]) * steps_per_epoch))
+        start_epoch = global_step // steps_per_epoch + 1
+        resume_skip = global_step % steps_per_epoch
+        log(f"[train] resumed from {resume} at epoch {start_epoch} "
+            f"(global_step {global_step}, skip {resume_skip} batches, "
+            f"best val Cα-RMSD {best:.3f})")
 
     log(f"[train] variant={variant} scheme={scheme} fold={fold} dummy={dummy} "
         f"device={device} | train={len(train_ds)} val={len(val_ds)} "
-        f"bs={bs} epochs={epochs} steps={total_steps} amp={amp}"
+        f"bs={bs} epochs={epochs} steps/epoch={steps_per_epoch} "
+        f"total_steps={total_steps} amp={amp} ckpt_every={ckpt_every}"
         + (f" | ckpt={run_dir}" if run_dir else ""))
     for epoch in range(start_epoch, epochs + 1):
-        tr = train_one_epoch(model, train_loader, loss_mod, optimizer,
-                             scheduler, device, scaler if amp else None, grad_clip,
-                             log=log, log_every=log_every, epoch=epoch)
+        skip = resume_skip if epoch == start_epoch else 0
+        train_loader = make_epoch_loader(train_ds, bs, num_workers, seed, epoch,
+                                         skip_batches=skip)
+        tr, global_step = train_one_epoch(
+            model, train_loader, loss_mod, optimizer, scheduler, device,
+            scaler if amp else None, grad_clip, log=log, log_every=log_every,
+            epoch=epoch, global_step=global_step, mlog=mlog,
+            ckpt_every=ckpt_every,
+            save_fn=lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep)
+            if run_dir is not None else None)
         ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches)
         history.append({"epoch": epoch, "train": tr, "val": ev})
+        mlog.log("val", epoch, global_step, None, ev)
         log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "
             f"(fape {tr['fape']:.3f} plddt {tr['plddt_ce']:.3f} "
             f"pae {tr['pae_ce']:.3f}) | val total {ev['total']:.3f} "
@@ -885,14 +1007,12 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         if run_dir is not None:
             if ev["ca_rmsd"] < best:
                 best = ev["ca_rmsd"]
-                torch.save({"epoch": epoch, "encoder": model.encoder.state_dict(),
+                torch.save({"epoch": epoch, "global_step": global_step,
+                            "encoder": model.encoder.state_dict(),
                             "val": ev, "config": config}, run_dir / "best.pt")
                 log(f"[train]   new best val Cα-RMSD {best:.3f} -> best.pt")
-            torch.save({"epoch": epoch, "encoder": model.encoder.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "scaler": scaler.state_dict(), "history": history,
-                        "best": best, "config": config}, run_dir / "last.pt")
+            save_ckpt(run_dir / "last.pt", global_step, epoch)
+    mlog.close()
     return history, model
 
 
