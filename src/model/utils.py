@@ -1059,6 +1059,15 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
             model.encoder.load_state_dict(ckpt["encoder"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
+            # If --epochs changed since the checkpoint, the loaded scheduler still
+            # carries the OLD T_max -> extending epochs would just train at lr~0
+            # past the old horizon. Re-size the cosine to the new total_steps
+            # (keeping the current step) so the schedule actually spans the run.
+            if getattr(scheduler, "T_max", total_steps) != total_steps:
+                old_tmax = scheduler.T_max
+                scheduler.T_max = total_steps
+                log(f"[train] re-sized cosine T_max {old_tmax} -> {total_steps} "
+                    f"(epochs changed; lr resumes on the new horizon)")
             scaler.load_state_dict(ckpt["scaler"])
             history = ckpt.get("history", [])
             best = ckpt.get("best", float("inf"))

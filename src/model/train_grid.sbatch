@@ -41,13 +41,6 @@ IDX=${SLURM_ARRAY_TASK_ID}
 V=$(( IDX % 7 + 1 ))              # variant 1..7
 F=$(( (IDX / 7) % 5 + 1 ))        # fold 1..5
 S=${SCHEMES[$(( IDX / 35 ))]}     # scheme
-RUN="${S}_fold${F}_variant${V}"
-
-# per-submission dated log kept INSIDE the run's checkpoint dir (one file per
-# (re)submit, so you get a history: fresh run, resume 1, resume 2, ...)
-DATE=$(date +%Y%m%d_%H%M%S)
-RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
-
 # ---- hyperparameters (edit here) ----
 # BS is shared by all 7 variants; size it for the heaviest (variant 7). Memory
 # scales ~ BS * N^2; class-I pMHC N is small (~190), so a 40 GB A100 has headroom.
@@ -59,7 +52,21 @@ LR=1.4e-3
 # Peptide loss up-weighting. 1.0 = uniform (identical to prior runs, so resuming
 # existing checkpoints is unchanged). For a FRESH grid that emphasizes the
 # peptide pose, set ~3 (peptide residues/pairs weighted 3x vs MHC).
-PEPTIDE_W=1.0
+PEPTIDE_W=5.0
+
+RUN="${S}_fold${F}_variant${V}"
+# Isolate weighted grids: a non-1.0 weight gets its OWN checkpoint dirs (e.g.
+# two_axis_fold1_variant1_pw3.0) so a fresh weighted run never resumes from /
+# collides with the w=1 baseline. w=1.0 keeps the original names so your
+# existing runs still resume.
+if [[ "${PEPTIDE_W}" != "1.0" && "${PEPTIDE_W}" != "1" ]]; then
+    RUN="${RUN}_pw${PEPTIDE_W}"
+fi
+
+# per-submission dated log kept INSIDE the run's checkpoint dir (one file per
+# (re)submit, so you get a history: fresh run, resume 1, resume 2, ...)
+DATE=$(date +%Y%m%d_%H%M%S)
+RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
 
 # ---- organized, human-readable log symlinks -> this task's slurm files ----
 mkdir -p logs/distill "checkpoints/${RUN}"
