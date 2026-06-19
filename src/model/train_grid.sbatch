@@ -4,8 +4,10 @@
 #
 #   schemes (two_axis, hla_only) x folds 1..5 x variants 1..7  = 70 runs
 #   array index -> (scheme, fold, variant); each run is isolated under
-#     checkpoints/<scheme>_fold<f>_variant<v>/{config.json,last.pt,best.pt}
-#   organized logs: logs/distill/<scheme>_fold<f>_variant<v>.{out,err}
+#     checkpoints/<scheme>_fold<f>_variant<v>/
+#       {config.json, last.pt, best.pt, metrics.csv, tb/, train_<date>.log}
+#   the dated train_<date>.log holds that submission's full output (one per
+#   (re)submit). logs/distill/<run>.{out,err} also symlink to the SLURM files.
 #
 # Before first submit:   mkdir -p logs/distill
 # Submit:                sbatch src/model/train_grid.sbatch
@@ -41,12 +43,17 @@ F=$(( (IDX / 7) % 5 + 1 ))        # fold 1..5
 S=${SCHEMES[$(( IDX / 35 ))]}     # scheme
 RUN="${S}_fold${F}_variant${V}"
 
+# per-submission dated log kept INSIDE the run's checkpoint dir (one file per
+# (re)submit, so you get a history: fresh run, resume 1, resume 2, ...)
+DATE=$(date +%Y%m%d_%H%M%S)
+RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
+
 # ---- hyperparameters (edit here) ----
 # BS is shared by all 7 variants; size it for the heaviest (variant 7). Memory
 # scales ~ BS * N^2; class-I pMHC N is small (~190), so a 40 GB A100 has headroom.
 # Check variant-7 memory (`ssh <node> nvidia-smi`) and push BS up if it fits;
 # scale LR ~ sqrt(BS/8) when you do. Larger BS => far fewer steps/epoch.
-EPOCHS=3
+EPOCHS=6
 BS=10
 LR=1.4e-3
 # Peptide loss up-weighting. 1.0 = uniform (identical to prior runs, so resuming
@@ -58,7 +65,14 @@ PEPTIDE_W=1.0
 mkdir -p logs/distill "checkpoints/${RUN}"
 ln -sfn "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out" "logs/distill/${RUN}.out"
 ln -sfn "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.err" "logs/distill/${RUN}.err"
-echo "=== task ${IDX}: scheme=${S} fold=${F} variant=${V} -> ${RUN} ==="
+
+# Mirror everything (stdout+stderr) into the dated per-run log in the ckpt dir,
+# live (so even a cancelled run keeps its partial log there). The SLURM .out/.err
+# files still receive their streams unchanged.
+exec > >(tee -a "$RUN_LOG") 2> >(tee -a "$RUN_LOG" >&2)
+
+echo "=== $(date '+%F %T') | task ${IDX}: ${RUN} | log ${RUN_LOG} ==="
+echo "=== job ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} on $(hostname) ==="
 nvidia-smi -L || true
 
 export PYTHONUNBUFFERED=1          # stream python stdout/stderr live to the logs
