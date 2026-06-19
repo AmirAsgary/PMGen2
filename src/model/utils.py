@@ -611,14 +611,14 @@ class DistillLoss(nn.Module):
                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         seq_mask = batch["seq_mask"]
         pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]
+        pep = peptide_mask_from_batch(seq_mask, batch["segment_id"])       # [B,N]
+        pep_pair = torch.maximum(pep[:, :, None], pep[:, None, :])         # i or j peptide
 
         # per-residue / per-pair weights. w == 1.0 everywhere -> identical to the
         # unweighted loss (so existing checkpoints continue unchanged).
         w = self.peptide_weight
         if w != 1.0:
-            pep = peptide_mask_from_batch(seq_mask, batch["segment_id"])   # [B,N]
             res_w = seq_mask * (1.0 + (w - 1.0) * pep)                     # [B,N]
-            pep_pair = torch.maximum(pep[:, :, None], pep[:, None, :])
             pair_w = pair_mask * (1.0 + (w - 1.0) * pep_pair)             # [B,N,N]
             fape_pair = (1.0 + (w - 1.0) * pep)[:, None, :]               # weight pos j
         else:
@@ -626,22 +626,31 @@ class DistillLoss(nn.Module):
 
         bb_tensor, bb_mask = _build_gt_backbone_frames(
             batch["aatype"], batch["teacher_bb"], seq_mask)
-        fape = backbone_loss(backbone_rigid_tensor=bb_tensor,
-                             backbone_rigid_mask=bb_mask, traj=frames,
-                             pair_mask=fape_pair,
-                             clamp_distance=self.fape_clamp,
-                             loss_unit_distance=self.fape_unit)
-        fape = fape.mean() if fape.ndim > 0 else fape
 
-        ce_plddt = _masked_ce(plddt_logits,
-                              bin_plddt(batch["teacher_plddt"], self.plddt_no_bins),
-                              res_w)
-        ce_pae = _masked_ce(pae_logits,
-                            torch.bucketize(batch["teacher_pae"], self.pae_breaks),
-                            pair_w)
+        def _fape(pmask):
+            f = backbone_loss(backbone_rigid_tensor=bb_tensor,
+                              backbone_rigid_mask=bb_mask, traj=frames,
+                              pair_mask=pmask, clamp_distance=self.fape_clamp,
+                              loss_unit_distance=self.fape_unit)
+            return f.mean() if f.ndim > 0 else f
+
+        fape = _fape(fape_pair)
+        plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
+        pae_bins = torch.bucketize(batch["teacher_pae"], self.pae_breaks)
+        ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
+        ce_pae = _masked_ce(pae_logits, pae_bins, pair_w)
         total = self.l_fape * fape + self.l_plddt * ce_plddt + self.l_pae * ce_pae
+
+        # peptide-ONLY loss values, every step (observation; not in `total`).
+        with torch.no_grad():
+            pep_fape = _fape(pep[:, None, :])                  # FAPE at peptide pos
+            pep_plddt_ce = _masked_ce(plddt_logits, plddt_bins, pep)
+            pep_pae_ce = _masked_ce(pae_logits, pae_bins, pep_pair * pair_mask)
+
         terms = {"total": total.detach(), "fape": fape.detach(),
-                 "plddt_ce": ce_plddt.detach(), "pae_ce": ce_pae.detach()}
+                 "plddt_ce": ce_plddt.detach(), "pae_ce": ce_pae.detach(),
+                 "pep_fape": pep_fape.detach(), "pep_plddt_ce": pep_plddt_ce.detach(),
+                 "pep_pae_ce": pep_pae_ce.detach()}
         return total, terms
 
 
@@ -780,6 +789,7 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
 # --- metric logging (TensorBoard if available, always a flat CSV) ---------- #
 _METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
                 "total", "fape", "plddt_ce", "pae_ce",
+                "pep_fape", "pep_plddt_ce", "pep_pae_ce",
                 "ca_rmsd", "plddt_spearman", "pae_mae",
                 "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae", "it_per_s"]
 
@@ -920,7 +930,10 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     f"total {means.get('total', 0):.3f} "
                     f"fape {means.get('fape', 0):.3f} "
                     f"plddt {means.get('plddt_ce', 0):.3f} "
-                    f"pae {means.get('pae_ce', 0):.3f} | "
+                    f"pae {means.get('pae_ce', 0):.3f} | pep: "
+                    f"fape {means.get('pep_fape', 0):.3f} "
+                    f"plddt {means.get('pep_plddt_ce', 0):.3f} "
+                    f"pae {means.get('pep_pae_ce', 0):.3f} | "
                     f"lr {lr:.2e} | {rate:.1f} it/s")
             if mlog is not None:
                 mlog.log("train", epoch, global_step, lr, means, it_per_s=rate)
@@ -1087,8 +1100,10 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         mlog.log("val", epoch, global_step, None, ev)
         log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "
             f"(fape {tr['fape']:.3f} plddt {tr['plddt_ce']:.3f} "
-            f"pae {tr['pae_ce']:.3f}) | val total {ev['total']:.3f} "
-            f"Cα-RMSD {ev['ca_rmsd']:.2f} pLDDT-sp {ev['plddt_spearman']:.2f} "
+            f"pae {tr['pae_ce']:.3f} | pep fape {tr.get('pep_fape', 0):.3f} "
+            f"plddt {tr.get('pep_plddt_ce', 0):.3f} pae {tr.get('pep_pae_ce', 0):.3f}) "
+            f"| val total {ev['total']:.3f} Cα-RMSD {ev['ca_rmsd']:.2f} "
+            f"pep-RMSD {ev['pep_ca_rmsd']:.2f} pLDDT-sp {ev['plddt_spearman']:.2f} "
             f"PAE-MAE {ev['pae_mae']:.2f}")
         if run_dir is not None:
             if ev["ca_rmsd"] < best:
