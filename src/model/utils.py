@@ -586,13 +586,18 @@ class DistillLoss(nn.Module):
 
     def __init__(self, lambda_fape: float = 1.0, lambda_plddt: float = 0.1,
                  lambda_pae: float = 0.1, model_name: str = "model_2_ptm",
-                 fape_clamp: Optional[float] = None, fape_unit: float = 10.0):
+                 fape_clamp: Optional[float] = None, fape_unit: float = 10.0,
+                 peptide_weight: float = 5.0):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
+        # peptide_weight=1.0 -> uniform (identical to the unweighted loss); >1
+        # up-weights peptide residues (and peptide-involving pairs) so the small
+        # peptide is not drowned out by the large MHC.
         super().__init__()
         self.l_fape, self.l_plddt, self.l_pae = lambda_fape, lambda_plddt, lambda_pae
         self.fape_clamp, self.fape_unit = fape_clamp, fape_unit
+        self.peptide_weight = float(peptide_weight)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -607,37 +612,82 @@ class DistillLoss(nn.Module):
         seq_mask = batch["seq_mask"]
         pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]
 
+        # per-residue / per-pair weights. w == 1.0 everywhere -> identical to the
+        # unweighted loss (so existing checkpoints continue unchanged).
+        w = self.peptide_weight
+        if w != 1.0:
+            pep = peptide_mask_from_batch(seq_mask, batch["segment_id"])   # [B,N]
+            res_w = seq_mask * (1.0 + (w - 1.0) * pep)                     # [B,N]
+            pep_pair = torch.maximum(pep[:, :, None], pep[:, None, :])
+            pair_w = pair_mask * (1.0 + (w - 1.0) * pep_pair)             # [B,N,N]
+            fape_pair = (1.0 + (w - 1.0) * pep)[:, None, :]               # weight pos j
+        else:
+            res_w, pair_w, fape_pair = seq_mask, pair_mask, None
+
         bb_tensor, bb_mask = _build_gt_backbone_frames(
             batch["aatype"], batch["teacher_bb"], seq_mask)
         fape = backbone_loss(backbone_rigid_tensor=bb_tensor,
                              backbone_rigid_mask=bb_mask, traj=frames,
+                             pair_mask=fape_pair,
                              clamp_distance=self.fape_clamp,
                              loss_unit_distance=self.fape_unit)
         fape = fape.mean() if fape.ndim > 0 else fape
 
         ce_plddt = _masked_ce(plddt_logits,
                               bin_plddt(batch["teacher_plddt"], self.plddt_no_bins),
-                              seq_mask)
+                              res_w)
         ce_pae = _masked_ce(pae_logits,
                             torch.bucketize(batch["teacher_pae"], self.pae_breaks),
-                            pair_mask)
+                            pair_w)
         total = self.l_fape * fape + self.l_plddt * ce_plddt + self.l_pae * ce_pae
         terms = {"total": total.detach(), "fape": fape.detach(),
                  "plddt_ce": ce_plddt.detach(), "pae_ce": ce_pae.detach()}
         return total, terms
 
 
+# ---- peptide / segment helpers (shared by loss + metrics) ----------------- #
+def peptide_mask_from_batch(seq_mask: torch.Tensor,
+                            segment_id: torch.Tensor) -> torch.Tensor:
+    """[B,N] float mask of peptide residues. The peptide is always the LAST
+    segment (id 1 for class I, 2 for class II), so it is the highest valid
+    segment id per example — robust to class and to ordering."""
+    m = seq_mask.bool()
+    seg_valid = segment_id.masked_fill(~m, -1)
+    pep_seg = seg_valid.max(dim=1, keepdim=True).values          # [B,1]
+    return ((segment_id == pep_seg) & m).float()
+
+
 # ---- metrics (eval-only) -------------------------------------------------- #
+def _kabsch_rot(pred0: torch.Tensor, target0: torch.Tensor) -> torch.Tensor:
+    """Optimal rotation mapping centered pred0 -> centered target0 (Kabsch)."""
+    u, _, vt = torch.linalg.svd(pred0.transpose(0, 1) @ target0)
+    d = torch.sign(torch.linalg.det(vt.transpose(0, 1) @ u.transpose(0, 1)))
+    diag = torch.diag(torch.stack([torch.ones_like(d), torch.ones_like(d), d]))
+    return vt.transpose(0, 1) @ diag @ u.transpose(0, 1)
+
+
 def _superpose_rmsd(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Kabsch-aligned Cα RMSD for one example's masked points [M,3]."""
     mu_p, mu_t = pred.mean(0), target.mean(0)
     p0, t0 = pred - mu_p, target - mu_t
-    u, _, vt = torch.linalg.svd(p0.transpose(0, 1) @ t0)
-    d = torch.sign(torch.linalg.det(vt.transpose(0, 1) @ u.transpose(0, 1)))
-    diag = torch.diag(torch.stack([torch.ones_like(d), torch.ones_like(d), d]))
-    rot = vt.transpose(0, 1) @ diag @ u.transpose(0, 1)
-    aligned = p0 @ rot.transpose(0, 1)
+    aligned = p0 @ _kabsch_rot(p0, t0).transpose(0, 1)
     return torch.sqrt(((aligned - t0) ** 2).sum(-1).mean())
+
+
+def _superpose_rmsd_on(pred: torch.Tensor, target: torch.Tensor,
+                       align: torch.Tensor, evalm: torch.Tensor
+                       ) -> Optional[torch.Tensor]:
+    """RMSD over the ``evalm`` points after superposing on the ``align`` points —
+    the pMHC binding-pose metric (align on MHC groove, measure the peptide).
+    ``align``/``evalm`` are boolean masks over the points. None if too few points."""
+    if int(align.sum()) < 3 or int(evalm.sum()) < 1:
+        return None
+    pa, ta = pred[align], target[align]
+    mu_p, mu_t = pa.mean(0), ta.mean(0)
+    rot = _kabsch_rot(pa - mu_p, ta - mu_t)
+    pe = (pred[evalm] - mu_p) @ rot.transpose(0, 1)
+    te = target[evalm] - mu_t
+    return torch.sqrt(((pe - te) ** 2).sum(-1).mean())
 
 
 def kabsch_rmsd(pred_ca: torch.Tensor, target_ca: torch.Tensor,
@@ -681,8 +731,28 @@ def eval_metrics(ca: torch.Tensor, plddt_logits: torch.Tensor,
     pae_pred = pae_from_logits(pae_logits, loss_mod.pae_breaks)
     pae_mae = ((pae_pred - batch["teacher_pae"]).abs() * pair_mask).sum() \
         / pair_mask.sum().clamp_min(1.0)
+
+    # ---- peptide-only observation metrics (the part that actually matters) ---
+    pep = peptide_mask_from_batch(seq_mask, batch["segment_id"])      # [B,N]
+    mhc = seq_mask * (1.0 - pep)
+    pep_b = pep.bool()
+    # peptide Cα-RMSD superposed on the MHC (binding pose), averaged over examples
+    pep_rmsds = []
+    for b in range(ca.shape[0]):
+        r = _superpose_rmsd_on(ca[b], batch["teacher_ca"][b],
+                               mhc[b].bool(), pep_b[b])
+        if r is not None:
+            pep_rmsds.append(r)
+    pep_ca_rmsd = float(torch.stack(pep_rmsds).mean()) if pep_rmsds else float("nan")
+    # peptide pLDDT MAE and peptide-involving PAE MAE
+    pep_plddt_mae = float(((plddt_pred - batch["teacher_plddt"]).abs() * pep).sum()
+                          / pep.sum().clamp_min(1.0))
+    pep_pair = torch.maximum(pep[:, :, None], pep[:, None, :]) * pair_mask
+    pep_pae_mae = float(((pae_pred - batch["teacher_pae"]).abs() * pep_pair).sum()
+                        / pep_pair.sum().clamp_min(1.0))
     return {"ca_rmsd": float(rmsd), "plddt_spearman": float(spearman),
-            "pae_mae": float(pae_mae)}
+            "pae_mae": float(pae_mae), "pep_ca_rmsd": pep_ca_rmsd,
+            "pep_plddt_mae": pep_plddt_mae, "pep_pae_mae": pep_pae_mae}
 
 
 # =========================================================================== #
@@ -710,7 +780,8 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
 # --- metric logging (TensorBoard if available, always a flat CSV) ---------- #
 _METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
                 "total", "fape", "plddt_ce", "pae_ce",
-                "ca_rmsd", "plddt_spearman", "pae_mae", "it_per_s"]
+                "ca_rmsd", "plddt_spearman", "pae_mae",
+                "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae", "it_per_s"]
 
 
 class MetricLogger:
@@ -723,8 +794,14 @@ class MetricLogger:
         self.run_dir = Path(run_dir) if run_dir is not None else None
         self.csv_path = (self.run_dir / "metrics.csv") if self.run_dir else None
         self.writer = None
-        if self.csv_path is not None and not self.csv_path.exists():
-            self.csv_path.write_text(",".join(_METRIC_COLS) + "\n")
+        # Use an existing file's header so a resumed run stays column-aligned;
+        # otherwise start a fresh file with the current schema.
+        if self.csv_path is not None and self.csv_path.exists():
+            self._cols = self.csv_path.read_text().splitlines()[0].split(",")
+        else:
+            self._cols = list(_METRIC_COLS)
+            if self.csv_path is not None:
+                self.csv_path.write_text(",".join(self._cols) + "\n")
         if enable_tb and self.run_dir is not None:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -739,7 +816,7 @@ class MetricLogger:
                "global_step": step, "lr": lr, "it_per_s": it_per_s, **metrics}
         if self.csv_path is not None:
             line = ",".join("" if row.get(c) is None else f"{row.get(c)}"
-                            for c in _METRIC_COLS)
+                            for c in self._cols)
             with open(self.csv_path, "a") as f:
                 f.write(line + "\n")
         if self.writer is not None:
@@ -888,7 +965,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  run_name: Optional[str] = None, resume: Optional[Path] = None,
                  eval_batches: Optional[int] = None, log_every: int = 2000,
                  ckpt_every: int = 2000, tensorboard: bool = True,
-                 log=print):
+                 peptide_weight: float = 1.0, log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -917,7 +994,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     steps_per_epoch = (len(train_ds) + bs - 1) // bs
 
     model = DistillModel(variant, device=device).to(device)
-    loss_mod = DistillLoss(*lambdas).to(device)
+    loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
     total_steps = max(1, steps_per_epoch * epochs)
@@ -928,7 +1005,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     import datetime
     config = {
         "variant": variant, "scheme": scheme, "fold": fold, "dummy": dummy,
-        "lambdas": tuple(lambdas), "bs": bs, "lr": lr, "epochs": epochs,
+        "lambdas": tuple(lambdas), "peptide_weight": peptide_weight,
+        "bs": bs, "lr": lr, "epochs": epochs,
         "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp,
         "seed": seed, "num_workers": num_workers, "device": str(device),
         "h5_dir": str(h5_dir) if h5_dir else None,

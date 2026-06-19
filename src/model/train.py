@@ -48,6 +48,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lambdas", type=float, nargs=3, default=(1.0, 0.1, 0.1),
                    metavar=("FAPE", "PLDDT", "PAE"))
+    p.add_argument("--peptide-weight", type=float, default=1.0,
+                   help="up-weight peptide residues/pairs in the loss "
+                        "(1.0=uniform/unchanged; ~3 emphasizes the peptide)")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
@@ -80,7 +83,7 @@ def main(argv=None) -> None:
         weight_decay=args.weight_decay, grad_clip=args.grad_clip, amp=args.amp,
         num_workers=args.num_workers, seed=args.seed, device=args.device,
         log_every=args.log_every, ckpt_every=args.ckpt_every,
-        tensorboard=not args.no_tensorboard,
+        tensorboard=not args.no_tensorboard, peptide_weight=args.peptide_weight,
     )
 
 

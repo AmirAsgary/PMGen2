@@ -43,6 +43,10 @@ RUN="${S}_fold${F}_variant${V}"
 EPOCHS=3
 BS=10
 LR=1.4e-3
+# Peptide loss up-weighting. 1.0 = uniform (identical to prior runs, so resuming
+# existing checkpoints is unchanged). For a FRESH grid that emphasizes the
+# peptide pose, set ~3 (peptide residues/pairs weighted 3x vs MHC).
+PEPTIDE_W=1.0
 
 # ---- organized, human-readable log symlinks -> this task's slurm files ----
 mkdir -p logs/distill "checkpoints/${RUN}"
@@ -72,6 +76,7 @@ $PY src/model/train.py \
     --ckpt-dir checkpoints --run-name "$RUN" \
     --resume "checkpoints/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
+    --peptide-weight ${PEPTIDE_W} \
     --log-every 100 --ckpt-every 2000 \
     --num-workers 4 --amp
 
