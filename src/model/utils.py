@@ -1041,22 +1041,30 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     history: List[dict] = []
     start_epoch, best, global_step, resume_skip = 1, float("inf"), 0, 0
     if resume is not None and Path(resume).exists():
-        ckpt = torch.load(resume, map_location=device, weights_only=False)
-        model.encoder.load_state_dict(ckpt["encoder"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        scaler.load_state_dict(ckpt["scaler"])
-        history = ckpt.get("history", [])
-        best = ckpt.get("best", float("inf"))
-        # global_step pinpoints where we stopped; derive epoch + batch to skip.
-        # (Older epoch-only checkpoints fall back to an epoch boundary.)
-        global_step = int(ckpt.get("global_step",
-                                   int(ckpt["epoch"]) * steps_per_epoch))
-        start_epoch = global_step // steps_per_epoch + 1
-        resume_skip = global_step % steps_per_epoch
-        log(f"[train] resumed from {resume} at epoch {start_epoch} "
-            f"(global_step {global_step}, skip {resume_skip} batches, "
-            f"best val Cα-RMSD {best:.3f})")
+        try:
+            ckpt = torch.load(resume, map_location=device, weights_only=False)
+            model.encoder.load_state_dict(ckpt["encoder"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            scaler.load_state_dict(ckpt["scaler"])
+            history = ckpt.get("history", [])
+            best = ckpt.get("best", float("inf"))
+            # global_step pinpoints where we stopped; derive epoch + batch to skip.
+            # (Older epoch-only checkpoints fall back to an epoch boundary.)
+            global_step = int(ckpt.get("global_step",
+                                       int(ckpt["epoch"]) * steps_per_epoch))
+            start_epoch = global_step // steps_per_epoch + 1
+            resume_skip = global_step % steps_per_epoch
+            log(f"[train] resumed from {resume} at epoch {start_epoch} "
+                f"(global_step {global_step}, skip {resume_skip} batches, "
+                f"best val Cα-RMSD {best:.3f})")
+        except Exception as e:
+            # corrupt/partial checkpoint (e.g. a hard kill before atomic rename
+            # on an older run): don't get stuck forever — start fresh instead.
+            log(f"[train] WARNING: could not load {resume} ({type(e).__name__}: "
+                f"{e}); starting from scratch")
+            history, start_epoch, best, global_step, resume_skip = \
+                [], 1, float("inf"), 0, 0
 
     log(f"[train] variant={variant} scheme={scheme} fold={fold} dummy={dummy} "
         f"device={device} | train={len(train_ds)} val={len(val_ds)} "

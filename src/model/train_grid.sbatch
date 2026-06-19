@@ -9,7 +9,13 @@
 #
 # Before first submit:   mkdir -p logs/distill
 # Submit:                sbatch src/model/train_grid.sbatch
-# Continue later:        just re-submit — --resume picks up each run's last.pt.
+#
+# IDEMPOTENT: re-submit the whole array any time. Per run, automatically:
+#   * never started   -> trains from scratch
+#   * cancelled mid-run-> resumes from its exact step (last.pt every 2000 steps)
+#   * finished         -> exits immediately, no GPU work (raise EPOCHS to extend)
+#   * corrupt last.pt  -> warns and restarts that one run from scratch
+# So you never need to hand-pick which tasks to rerun.
 #
 # Subsets via the array range:
 #   two_axis only : --array=0-34      hla_only only : --array=35-69
@@ -63,18 +69,29 @@ export MALLOC_ARENA_MAX=2
 export MALLOC_TRIM_THRESHOLD_=0
 module load apptainer gcc/13 cuda/12.6 openmpi_gpu/5.0
 PY=$(conda info --base)/envs/pmgen2/bin/python
-cd "$HOME/projects/PMGen_2/PMGen2"
+cd "$HOME/projects/PMGen_2/PMGen2" || { echo "FATAL: repo dir missing"; exit 1; }
 mamba activate pmgen2
 
 # (optional) stage the store to node-local NVMe for faster epochs:
 #   cp -r data/processed/h5_store "$SLURM_TMPDIR/h5_store" && H5=$SLURM_TMPDIR/h5_store
 H5=data/processed/h5_store
+[[ -f "$H5/index.csv" ]] || { echo "FATAL: H5 store '$H5/index.csv' not found"; exit 1; }
 
+# Report this run's state (purely informational; train.py decides what to do):
+CKPT="checkpoints/${RUN}/last.pt"
+if [[ -f "$CKPT" ]]; then echo "resume: found ${CKPT} (continue / skip-if-done)";
+else echo "resume: no checkpoint -> fresh start"; fi
+
+# train.py is idempotent across re-submits:
+#   * no last.pt          -> trains from scratch
+#   * last.pt mid-run     -> resumes from its exact global_step
+#   * last.pt at >=EPOCHS -> prints "nothing to do" and exits 0 (no GPU work)
+#   * corrupt last.pt     -> warns and restarts that run from scratch
 $PY src/model/train.py \
     --h5-dir "$H5" \
     --scheme "$S" --fold "$F" --variant "$V" \
     --ckpt-dir checkpoints --run-name "$RUN" \
-    --resume "checkpoints/${RUN}/last.pt" \
+    --resume "$CKPT" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
     --peptide-weight ${PEPTIDE_W} \
     --log-every 100 --ckpt-every 2000 \

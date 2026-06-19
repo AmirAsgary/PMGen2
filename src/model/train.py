@@ -75,6 +75,23 @@ def main(argv=None) -> None:
         except (AttributeError, ValueError):
             pass
     args = parse_args(argv)
+
+    # Cheap skip for already-finished runs: peek the (small) checkpoint and exit
+    # before building the dataset / loading the frozen stack. Re-runs if you later
+    # raise --epochs (then saved epoch < requested). Corrupt peek -> fall through.
+    if args.resume and Path(args.resume).exists():
+        try:
+            import torch
+            done = int(torch.load(args.resume, map_location="cpu",
+                                  weights_only=False).get("epoch", 0))
+            if done >= args.epochs:
+                print(f"[train] {args.run_name or args.resume}: already completed "
+                      f"{done}/{args.epochs} epochs — nothing to do.", flush=True)
+                return
+        except Exception as e:
+            print(f"[train] could not peek {args.resume} ({e}); continuing.",
+                  flush=True)
+
     U.run_training(
         variant=args.variant, scheme=args.scheme, fold=args.fold,
         dummy=args.dummy, af_root=args.af_root, h5_dir=args.h5_dir,
