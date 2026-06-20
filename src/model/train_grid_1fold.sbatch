@@ -1,23 +1,23 @@
 #!/bin/bash -l
 # ============================================================================
-# FAST variant comparison: FOLD 1 ONLY, all variants, both schemes = 14 runs.
-# Same code/knobs as train_grid.sbatch but a single fold, to compare variants
-# (and recycling / unfreezing / peptide-weight) quickly before committing to the
-# full 5-fold sweep. Run the 5-fold version (train_grid.sbatch) afterwards.
+# FAST variant comparison: ONE scheme, FOLD 1 ONLY, all 7 variants = 7 runs.
+# Same code/knobs as train_grid.sbatch but a single fold + single split scheme,
+# to compare variants (and recycling / unfreezing / peptide-weight) quickly
+# before committing to the full 5-fold sweep (train_grid.sbatch).
 #
-#   array index -> (scheme, variant), fold fixed to 1  (2 schemes x 7 variants)
+#   array index -> variant 1..7; scheme + fold fixed below
 #   each run is isolated under checkpoints/<run>/{config.json,last.pt,best.pt,
 #     metrics.csv, tb/, train_<date>.log}
 #
 # Before first submit:   mkdir -p logs/distill
 # Submit:                sbatch src/model/train_grid_1fold.sbatch
-# Subsets: two_axis only --array=0-6 ; hla_only only --array=7-13
+# Other scheme/fold:     edit SCHEME / F below (e.g. SCHEME=hla_only)
 #
 # IDEMPOTENT (re-submit any time): never-started -> fresh; cancelled -> resumes
 # from its exact step; finished -> exits with no GPU work; corrupt -> restarts.
 # ============================================================================
 #SBATCH --job-name=pmgen2_1fold
-#SBATCH --array=0-13%14            # 14 runs; %14 = all at once (tune to GPU quota)
+#SBATCH --array=0-6%7              # 7 variants; %7 = all at once (tune to GPU quota)
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:2          # ONE A100 per task (training is single-GPU)
@@ -27,12 +27,12 @@
 #SBATCH --output=logs/distill/%A_%a.out
 #SBATCH --error=logs/distill/%A_%a.err
 
-# ---- decode array index -> (scheme, variant); fold is fixed to 1 ----
-SCHEMES=(two_axis hla_only)
+# ---- pick the split (edit here); array index selects the variant ----
+SCHEME=two_axis                  # split scheme: two_axis (hardest) or hla_only
+F=1                              # fold 1 only
 IDX=${SLURM_ARRAY_TASK_ID}
-V=$(( IDX % 7 + 1 ))              # variant 1..7
-S=${SCHEMES[$(( IDX / 7 ))]}      # scheme (idx 0-6 two_axis, 7-13 hla_only)
-F=1                              # FOLD 1 ONLY
+V=$(( IDX + 1 ))                 # variant 1..7
+S=${SCHEME}
 
 # ---- hyperparameters (keep in sync with train_grid.sbatch) ----
 EPOCHS=6
