@@ -16,7 +16,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
-#SBATCH --time=00:50:00
+#SBATCH --time=01:30:00           # side-chain χ extraction is ~2x the backbone parse
 #SBATCH --output=logs/reproc/%A_%a.out
 #SBATCH --error=logs/reproc/%A_%a.err
 
