@@ -12,8 +12,13 @@
 # Submit:  sbatch src/model/reprocess_sidechains.sbatch   (set --array to #chunks)
 # ============================================================================
 #SBATCH --job-name=pmgen2_reproc_sc
-#SBATCH --array=1-222%32           # one task per chunk_N; tune to #chunks / quota
+#SBATCH --array=1-222%16           # one task per chunk_N; tune to #chunks / quota
 #SBATCH --nodes=1
+# Request a GPU node like the training jobs: on Raven a CPU-only job lands in a
+# small/shared QOS with a group-CPU cap (-> pending 'QOSGrpCpuLimit'). The GPU is
+# left IDLE here (the parse is CPU work) but it routes the job to your allocation.
+#SBATCH --constraint="gpu"
+#SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=01:30:00           # side-chain χ extraction is ~2x the backbone parse
