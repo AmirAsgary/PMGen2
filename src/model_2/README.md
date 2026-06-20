@@ -23,6 +23,7 @@ model_1** (targets are the PMGen/AF2 *teacher* structures). Per residue we have:
 | `aatype` `[N]` | amino-acid identity |
 | `segment_id` `[N]` | 0 = MHC, 1 = peptide (peptide = highest segment) |
 | `residue_index` `[N]` | residue numbering (carries the ~200 MHC↔peptide gap) |
+| `anchor` `[N]` | 1 at peptide anchor positions — the **conditioning** that picks which structure to generate |
 | `teacher_plddt` `[N]` | teacher per-residue confidence (pLDDT regression target) |
 | `teacher_chi` `[N,4,2]` *(side-chain store only)* | χ1–χ4 as (sin, cos) — torsion target |
 
@@ -38,7 +39,14 @@ so they're ~unit scale (matching the unit-Gaussian diffusion noise), and every g
 is **zero-centre-of-mass** (per-graph, via `scatter_mean`).
 
 **Node features** `h⁰`: aatype one-hot + segment one-hot + sinusoidal positional
-encoding of `residue_index` + the diffusion time `t/T`.
+encoding of `residue_index` + **anchor flag** + the diffusion time `t/T`.
+
+> **Anchor conditioning (important).** The same (peptide, MHC) pair can adopt
+> *different* structures depending on which peptide residues anchor in the groove —
+> that's why your data keys structures by anchor combination. The `anchor` flag is fed
+> in as a node feature, so the model is **conditioned** on it: different anchors →
+> different generated structures (verified: changing the anchors changes the predicted
+> noise on the peptide). Without it the model would average over those structures.
 
 **Edges** (directed, deduped — built in `build_message_edges`):
 1. **protein–protein** within **8 Å**, **protein–peptide** within **14 Å** (`radius_graph`);

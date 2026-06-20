@@ -183,7 +183,9 @@ class EGNNDenoiser(nn.Module):
         super().__init__()
         self.k, self.use_time = k, use_time
         self.n_aatype, self.n_segments, self.pe_dim = n_aatype, n_segments, pe_dim
-        in_dim = n_aatype + n_segments + pe_dim + (1 if use_time else 0)
+        # +1 anchor: the peptide-anchor flag is the conditioning that distinguishes
+        # the different structures a single (peptide, MHC) pair can take.
+        in_dim = n_aatype + n_segments + pe_dim + 1 + (1 if use_time else 0)
         self.embed = mlp([in_dim, h_dim, h_dim])
         self.layers = nn.ModuleList(
             [EGNNLayer(h_dim, m_dim=m_dim, use_cross=use_cross) for _ in range(n_layers)])
@@ -192,7 +194,7 @@ class EGNNDenoiser(nn.Module):
         aa = F.one_hot(data.aatype.clamp_min(0), self.n_aatype).float()
         seg = F.one_hot(data.segment_id.clamp_min(0), self.n_segments).float()
         pe = sinusoidal(data.residue_index, self.pe_dim)
-        feats = [aa, seg, pe]
+        feats = [aa, seg, pe, data.anchor[:, None].float()]   # anchor conditioning
         if self.use_time:
             feats.append(t_frac[data.batch][:, None])    # per-graph t -> per node
         return self.embed(torch.cat(feats, -1))
