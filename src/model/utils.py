@@ -509,16 +509,25 @@ def collate_with_teacher(examples: Sequence[Dict[str, torch.Tensor]]
     teacher_pae = torch.zeros(b, max_n, max_n, dtype=torch.float32)
     has_bb = "teacher_bb" in examples[0]
     teacher_bb = torch.zeros(b, max_n, 3, 3, dtype=torch.float32) if has_bb else None
+    has_chi = "teacher_chi" in examples[0]
+    teacher_chi = torch.zeros(b, max_n, 4, 2, dtype=torch.float32) if has_chi else None
+    teacher_chi_mask = torch.zeros(b, max_n, 4, dtype=torch.float32) if has_chi else None
     for i, e in enumerate(examples):
         n = int(e["aatype"].shape[0])
         teacher_plddt[i, :n] = e["teacher_plddt"]
         teacher_pae[i, :n, :n] = e["teacher_pae"]
         if has_bb:
             teacher_bb[i, :n] = e["teacher_bb"]
+        if has_chi:
+            teacher_chi[i, :n] = e["teacher_chi"]
+            teacher_chi_mask[i, :n] = e["teacher_chi_mask"]
     batch["teacher_plddt"] = teacher_plddt
     batch["teacher_pae"] = teacher_pae
     if has_bb:
         batch["teacher_bb"] = teacher_bb
+    if has_chi:
+        batch["teacher_chi"] = teacher_chi
+        batch["teacher_chi_mask"] = teacher_chi_mask
     if "id" in examples[0]:
         batch["id"] = [e["id"] for e in examples]
     return batch
@@ -1238,10 +1247,13 @@ _H5_DSETS = ("aatype", "residue_index", "anchor", "segment_id",
 
 def extract_example_arrays(pdb: Path, plddt_npy: Path, pae_npy: Path,
                            peptide: str, mhc_seq: str, anchors: str,
-                           mhc_type) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
-    """Parse one teacher example into compact numpy arrays + metadata."""
+                           mhc_type, sidechains: bool = False
+                           ) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
+    """Parse one teacher example into compact numpy arrays + metadata. With
+    ``sidechains`` also stores the side-chain torsions ``teacher_chi`` [N,4,2]
+    (sin/cos of χ1..χ4) and ``teacher_chi_mask`` [N,4] (which χ exist)."""
     ex = parse_example(pdb, peptide, mhc_seq, anchors, mhc_type,
-                       return_backbone=True)
+                       return_backbone=True, return_sidechain=sidechains)
     n = int(ex["aatype"].shape[0])
     plddt, pae = load_teacher_arrays(plddt_npy, pae_npy, n)
     arrays = {
@@ -1254,6 +1266,9 @@ def extract_example_arrays(pdb: Path, plddt_npy: Path, pae_npy: Path,
         "teacher_plddt": plddt.numpy().astype(np.float16),
         "teacher_pae": pae.numpy().astype(np.float16),
     }
+    if sidechains:
+        arrays["teacher_chi"] = ex["teacher_chi"].numpy().astype(np.float16)
+        arrays["teacher_chi_mask"] = ex["teacher_chi_mask"].numpy().astype(np.uint8)
     meta = {"n_mhc": int(ex["n_mhc"]), "n_pep": int(ex["n_pep"]),
             "mhc_type": int(mhc_type), "mhc_seq": mhc_seq, "peptide": peptide,
             "anchors": str(anchors)}
@@ -1268,7 +1283,7 @@ def _chunk_sort_key(name: str) -> Tuple[int, str]:
 def preprocess_chunk(chunk_dir: Path, shard_path: Path, index_path: Path,
                      alphafold_subdir: str = "alphafold", output_link: str = "output",
                      compression: str = "gzip", clevel: int = 4,
-                     log=print) -> Dict[str, int]:
+                     sidechains: bool = False, log=print) -> Dict[str, int]:
     """Process one chunk dir (with chunk.tsv + output/<alphafold_subdir>/<id>/)
     into one HDF5 shard + a per-chunk index parquet. Missing/failed ids are
     skipped (counted). Returns counts."""
@@ -1303,14 +1318,14 @@ def preprocess_chunk(chunk_dir: Path, shard_path: Path, index_path: Path,
                     pdb, plddt_npy, pae_npy = find_teacher_files(af_dir)
                     arrays, meta = extract_example_arrays(
                         pdb, plddt_npy, pae_npy, r["peptide"], r["mhc_seq"],
-                        r["anchors"], r["mhc_type"])
+                        r["anchors"], r["mhc_type"], sidechains=sidechains)
                 except (FileNotFoundError, ValueError) as exc:
                     n_fail += 1
                     pbar.set_postfix(ok=n_ok, missing=n_missing, failed=n_fail)
                     tqdm.write(f"    [skip] {aid}: {str(exc)[:80]}")
                     continue
                 g = h5.create_group(aid)
-                for k in _H5_DSETS:
+                for k in arrays:                 # _H5_DSETS + optional sidechains
                     g.create_dataset(k, data=arrays[k], **comp)
                 for k, v in meta.items():
                     g.attrs[k] = v
@@ -1346,10 +1361,11 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
                       alphafold_subdir: str = "alphafold",
                       output_link: str = "output",
                       compression: str = "gzip", clevel: int = 4,
-                      log=print) -> None:
+                      sidechains: bool = False, log=print) -> None:
     """Preprocess all (or selected) chunk dirs into HDF5 shards + index. Each
     chunk is independent -> safe to run in parallel jobs (pass disjoint
-    --chunks); ``merge`` concatenates per-chunk indices into index.parquet."""
+    --chunks); ``merge`` concatenates per-chunk indices into index.parquet.
+    ``sidechains`` additionally stores side-chain torsions (for model_2)."""
     chunks_dir, out_dir = Path(chunks_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_dirs = [d for d in chunks_dir.iterdir()
@@ -1367,7 +1383,7 @@ def preprocess_chunks(chunks_dir: Path, out_dir: Path,
             log(f"  {cdir.name}: shard exists, skipping")
             continue
         preprocess_chunk(cdir, shard, idx, alphafold_subdir, output_link,
-                         compression, clevel, log=log)
+                         compression, clevel, sidechains=sidechains, log=log)
     if merge:
         merge_indices(out_dir, log=log)
 
@@ -1446,6 +1462,11 @@ class H5DistillDataset(Dataset):
             "n_pep": int(g.attrs["n_pep"]),
             "id": aid,
         }
+        if "teacher_chi" in g:                   # present only in side-chain stores
+            ex["teacher_chi"] = torch.from_numpy(
+                g["teacher_chi"][()].astype(np.float32))
+            ex["teacher_chi_mask"] = torch.from_numpy(
+                g["teacher_chi_mask"][()].astype(np.float32))
         return ex
 
 

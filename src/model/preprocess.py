@@ -50,6 +50,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--no-merge", action="store_true",
                    help="skip merging per-chunk indices (do it later)")
+    p.add_argument("--sidechains", action="store_true",
+                   help="also store side-chain torsions teacher_chi[N,4,2] + mask "
+                        "(needed for model_2's torsion diffusion)")
     return p.parse_args(argv)
 
 
@@ -72,7 +75,7 @@ def main(argv=None) -> None:
         chunks=chunks, overwrite=args.overwrite, merge=not args.no_merge,
         alphafold_subdir=args.alphafold_subdir, output_link=args.output_link,
         compression=(None if args.compression == "none" else args.compression),
-        clevel=args.clevel, log=log,
+        clevel=args.clevel, sidechains=args.sidechains, log=log,
     )
 
 

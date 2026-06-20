@@ -55,13 +55,25 @@ fi
 # optional OpenFold extras not required by the distillation path.
 "$ENV_PY" -m pip install dm-tree modelcif tqdm
 
+# 2b) PyTorch Geometric (for src/model_2, the EGNN-diffusion model). torch_scatter
+# and torch_cluster are COMPILED extensions -> install from the PyG wheel index
+# matched to this exact torch + CUDA build (else they won't import).
+TVER="$("$ENV_PY" -c 'import torch; print(torch.__version__.split("+")[0])')"
+PYG_IDX="https://data.pyg.org/whl/torch-${TVER}+${CUDA_TAG}.html"
+echo "[install] PyG extensions from ${PYG_IDX}"
+"$ENV_PY" -m pip install torch_geometric
+"$ENV_PY" -m pip install torch_scatter torch_cluster -f "${PYG_IDX}"
+
 # 3) verify
 "$ENV_PY" - <<'PYEOF'
 import torch, numpy, scipy, pandas, h5py, Bio, ml_collections, einops
+import torch_geometric
+from torch_cluster import radius_graph, knn_graph   # noqa: F401
+from torch_scatter import scatter                   # noqa: F401
 print("torch", torch.__version__, "| cuda_available", torch.cuda.is_available(),
       "| cuda", torch.version.cuda)
 print("deps OK | numpy", numpy.__version__, "| h5py", h5py.__version__,
-      "| biopython", Bio.__version__)
+      "| biopython", Bio.__version__, "| pyg", torch_geometric.__version__)
 PYEOF
 
 echo

@@ -18,3 +18,7 @@ dependencies:
       - ml-collections>=1.0
       - einops>=0.8
       - tensorboard>=2.14
+      # PyTorch Geometric core (for src/model_2). The compiled extensions
+      # torch_scatter / torch_cluster are installed by installation.sh from the
+      # torch-matched PyG wheel index (they can't be pinned here).
+      - torch-geometric>=2.5

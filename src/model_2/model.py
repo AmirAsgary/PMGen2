@@ -1,0 +1,114 @@
+"""
+MHC-Diff (model_2): PyG denoiser + auxiliary pLDDT & torsion heads + objective.
+
+Trains on the same processed store as model_1 (targets = PMGen/AF2 teacher Cα,
+teacher_plddt, and — on the side-chain store — teacher_chi). Side-chain torsions
+are trained only when ``teacher_chi`` is present in the batch.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_scatter import scatter_mean
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+import pyg_data as PD                               # noqa: E402
+from diffusion import DifferentialDiffusion, center  # noqa: E402
+from egnn_pyg import EGNNDenoiser, mlp               # noqa: E402
+
+N_AATYPE, N_SEGMENTS = PD.N_AATYPE, PD.N_SEGMENTS
+COORD_SCALE = 15.0
+
+
+class MHCDiff(nn.Module):
+    def __init__(self, T=200, mhc_scale=0.1, h_dim=128, n_layers=6, k=12,
+                 use_cross=True, device="cpu"):
+        super().__init__()
+        self.diff = DifferentialDiffusion(T=T, mhc_scale=mhc_scale).to(device)
+        self.T = T
+        self.denoiser = EGNNDenoiser(N_AATYPE, N_SEGMENTS, h_dim=h_dim,
+                                     n_layers=n_layers, k=k, use_time=True,
+                                     use_cross=use_cross)
+        self.aux_net = EGNNDenoiser(N_AATYPE, N_SEGMENTS, h_dim=h_dim,
+                                    n_layers=2, k=k, use_time=False, use_cross=False)
+        self.plddt_head = mlp([h_dim, h_dim, 1])
+        self.torsion_head = mlp([h_dim, h_dim, 8])     # 4 χ × (sin,cos)
+        self.to(device)
+
+    def _aux_embed(self, x0, data):
+        h0 = self.aux_net.node_features(data, t_frac=None)
+        _, h = self.aux_net(center(x0, data.batch), h0, data)
+        return h
+
+    def compute_loss(self, data, lambdas=(1.0, 0.25, 0.5, 0.1)
+                     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        l_pep, l_mhc, l_tor, l_plddt = lambdas
+        pep, mhc, batch = data.pep, 1.0 - data.pep, data.batch
+        x0 = center(data.pos / COORD_SCALE, batch)
+        B = int(batch.max()) + 1
+        t = torch.randint(0, self.T, (B,), device=x0.device)
+
+        xt, noise = self.diff.q_sample(x0, t, batch, pep)
+        h0 = self.denoiser.node_features(data, t_frac=t.float() / self.T)
+        eps_hat, _ = self.denoiser(xt, h0, data)
+        se = ((eps_hat - noise) ** 2).sum(-1)                  # [ΣN]
+        pep_coord = (se * pep).sum() / pep.sum().clamp_min(1.0)
+        mhc_coord = (se * mhc).sum() / mhc.sum().clamp_min(1.0)
+
+        h_clean = self._aux_embed(x0, data)
+        plddt_pred = self.plddt_head(h_clean).squeeze(-1).sigmoid() * 100.0
+        plddt_loss = (((plddt_pred - data.teacher_plddt) / 100.0) ** 2).mean()
+
+        if hasattr(data, "teacher_chi"):
+            sc = self.torsion_head(h_clean).reshape(-1, 4, 2)
+            sc = sc / sc.norm(dim=-1, keepdim=True).clamp_min(1e-6)   # unit circle
+            cm = data.teacher_chi_mask                              # [N,4]
+            tor = (((sc - data.teacher_chi) ** 2).sum(-1) * cm).sum() \
+                / cm.sum().clamp_min(1.0)
+        else:
+            tor = x0.new_zeros(())
+
+        total = (l_pep * pep_coord + l_mhc * mhc_coord
+                 + l_tor * tor + l_plddt * plddt_loss)
+        terms = {"total": float(total), "pep_coord": float(pep_coord),
+                 "mhc_coord": float(mhc_coord), "torsion": float(tor),
+                 "plddt": float(plddt_loss)}
+        return total, terms
+
+    @torch.no_grad()
+    def sample(self, data, template_pool: "Optional[PD.MHCTemplatePool]" = None,
+               mhc_start_t: Optional[int] = None):
+        """Generate the complex. Peptide starts from noise; the MHC starts from a
+        same-length real template (point #2) treated as a partial-noise state
+        (``mhc_start_t``), else from noise."""
+        batch, pep = data.batch, data.pep
+        x_init = center(torch.randn_like(data.pos), batch)
+        if template_pool is not None:
+            ptr = data.ptr                                # graph node boundaries
+            for g in range(int(batch.max()) + 1):
+                n_mhc = int(data.n_mhc[g]) if torch.is_tensor(data.n_mhc) \
+                    else int(data.n_mhc)
+                tmpl = template_pool.sample_mhc(n_mhc, device=x_init.device)
+                if tmpl is not None:
+                    s = int(ptr[g])
+                    x_init[s:s + n_mhc] = tmpl / COORD_SCALE
+            x_init = center(x_init, batch)
+
+        def eps_fn(xt, t):
+            h0 = self.denoiser.node_features(data, t_frac=t.float() / self.T)
+            return self.denoiser(xt, h0, data)[0]
+
+        x = self.diff.sample(eps_fn, x_init, batch, pep,
+                             start_t=mhc_start_t)
+        return x * COORD_SCALE
+
+
+def build_loaders(*a, **k):
+    return PD.build_loaders(*a, **k)

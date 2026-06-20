@@ -57,11 +57,15 @@ _UNK: int = rc.restype_num        # aatype value for an unknown residue (20)
 # --------------------------------------------------------------------------- #
 # Low-level PDB reading
 # --------------------------------------------------------------------------- #
-def _read_chain_a_calpha(pdb_path: Union[str, Path]) -> Dict[str, np.ndarray]:
-    """Read chain 'A' Cα atoms in file order.
+def _read_chain_a_calpha(pdb_path: Union[str, Path],
+                         collect_atom37: bool = False) -> Dict[str, np.ndarray]:
+    """Read chain 'A' residues in file order.
 
     Returns dict with: ``resseq`` [M] int, ``res1`` [M] '<U1' one-letter codes,
-    ``ca`` [M,3] float32. Raises on missing chain / missing Cα / insertion codes.
+    ``ca`` [M,3], ``n`` [M,3], ``c`` [M,3] float32. With ``collect_atom37`` also
+    returns ``atom37`` [M,37,3] (all heavy atoms in OpenFold atom37 order) and
+    ``atom37_mask`` [M,37] — needed to derive side-chain torsions.
+    Raises on missing chain / missing Cα / insertion codes.
     """
     pdb_path = Path(pdb_path)
     parser = PDBParser(QUIET=True)
@@ -81,6 +85,8 @@ def _read_chain_a_calpha(pdb_path: Union[str, Path]) -> Dict[str, np.ndarray]:
     ca: List[np.ndarray] = []
     bb_n: List[np.ndarray] = []
     bb_c: List[np.ndarray] = []
+    atom37: List[np.ndarray] = []
+    atom37_mask: List[np.ndarray] = []
     for res in chain.get_residues():
         hetflag, seqid, icode = res.get_id()
         if hetflag.strip():                       # skip HETATM / waters
@@ -98,16 +104,47 @@ def _read_chain_a_calpha(pdb_path: Union[str, Path]) -> Dict[str, np.ndarray]:
                     if "N" in res else nan3)
         bb_c.append(res["C"].get_coord().astype(np.float32)
                     if "C" in res else nan3)
+        if collect_atom37:
+            pos = np.zeros((rc.atom_type_num, 3), dtype=np.float32)
+            msk = np.zeros(rc.atom_type_num, dtype=np.float32)
+            for atom in res.get_atoms():
+                idx = rc.atom_order.get(atom.get_name())   # heavy atoms only
+                if idx is not None:
+                    pos[idx] = atom.get_coord().astype(np.float32)
+                    msk[idx] = 1.0
+            atom37.append(pos)
+            atom37_mask.append(msk)
 
     if not resseq:
         raise ValueError(f"{pdb_path}: chain 'A' has no standard residues")
-    return {
+    out = {
         "resseq": np.asarray(resseq, dtype=np.int64),
         "res1": np.asarray(res1, dtype="<U1"),
         "ca": np.asarray(ca, dtype=np.float32),
         "n": np.asarray(bb_n, dtype=np.float32),
         "c": np.asarray(bb_c, dtype=np.float32),
     }
+    if collect_atom37:
+        out["atom37"] = np.asarray(atom37, dtype=np.float32)          # [M,37,3]
+        out["atom37_mask"] = np.asarray(atom37_mask, dtype=np.float32)  # [M,37]
+    return out
+
+
+def _sidechain_torsions(aatype: np.ndarray, atom37: np.ndarray,
+                        atom37_mask: np.ndarray):
+    """χ1..χ4 (sin/cos) + mask from atom37, via OpenFold (fp64 for stability).
+    Returns (chi_sin_cos [N,4,2] float32, chi_mask [N,4] float32)."""
+    from openfold.data.data_transforms import atom37_to_torsion_angles
+    protein = {
+        "aatype": torch.from_numpy(aatype).long()[None],                 # [1,N]
+        "all_atom_positions": torch.from_numpy(atom37).double()[None],   # [1,N,37,3]
+        "all_atom_mask": torch.from_numpy(atom37_mask).double()[None],   # [1,N,37]
+    }
+    out = atom37_to_torsion_angles()(protein)        # @curry1-decorated transform
+    # order: [omega, phi, psi, chi1..chi4]; keep the last 4 (side-chain χ)
+    chi = out["torsion_angles_sin_cos"][0, :, 3:, :].float().numpy()     # [N,4,2]
+    mask = out["torsion_angles_mask"][0, :, 3:].float().numpy()          # [N,4]
+    return chi, mask
 
 
 def _segment_bounds(resseq: np.ndarray, n_expected_segments: int,
@@ -167,6 +204,7 @@ def parse_example(
     anchors: Union[str, None],
     mhc_type: Union[int, str],
     return_backbone: bool = False,
+    return_sidechain: bool = False,
 ) -> Dict[str, Union[torch.Tensor, int]]:
     """Parse one teacher PDB + its sequences into distillation tensors.
 
@@ -205,7 +243,7 @@ def parse_example(
     else:
         raise ValueError(f"unsupported mhc_type {mhc_type!r} (expected 1 or 2)")
 
-    rec = _read_chain_a_calpha(pdb_path)
+    rec = _read_chain_a_calpha(pdb_path, collect_atom37=return_sidechain)
     n_segments = len(seg_seqs)
     slices = _segment_bounds(rec["resseq"], n_segments, pdb_path)
 
@@ -280,6 +318,13 @@ def parse_example(
             raise ValueError(f"{pdb_path}: missing/non-finite backbone N or C "
                              "atom(s) required for FAPE frames")
         out["teacher_bb"] = torch.from_numpy(teacher_bb)
+    if return_sidechain:
+        chi, chi_mask = _sidechain_torsions(aatype, rec["atom37"],
+                                            rec["atom37_mask"])
+        if chi.shape != (n_total, 4, 2):
+            raise ValueError(f"{pdb_path}: chi shape {chi.shape} != ({n_total},4,2)")
+        out["teacher_chi"] = torch.from_numpy(chi)               # [N,4,2] sin/cos
+        out["teacher_chi_mask"] = torch.from_numpy(chi_mask)     # [N,4]
     return out
 
 
