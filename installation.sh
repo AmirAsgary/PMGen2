@@ -17,7 +17,11 @@ set -euo pipefail
 
 ENV_NAME="${1:-pmgen2}"
 CUDA_TAG="${2:-cu121}"
-TORCH_VERSION="${TORCH_VERSION:-}"
+# Pin torch: PyTorch Geometric ships prebuilt torch_scatter/torch_cluster wheels
+# only for specific torch versions. 2.5.1+cu121 has them; "latest" (e.g. 2.12)
+# does NOT -> pip would source-build and fail. Override only if you also know a
+# matching PyG wheel index exists at https://data.pyg.org/whl/ .
+TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if command -v mamba >/dev/null 2>&1; then CONDA=mamba; else CONDA=conda; fi
