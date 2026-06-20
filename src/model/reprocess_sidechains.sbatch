@@ -14,7 +14,7 @@
 #SBATCH --job-name=pmgen2_reproc_sc
 #SBATCH --array=1-222%32           # one task per chunk_N; tune to #chunks / quota
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=01:30:00           # side-chain χ extraction is ~2x the backbone parse
 #SBATCH --output=logs/reproc/%A_%a.out
