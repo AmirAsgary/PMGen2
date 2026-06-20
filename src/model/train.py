@@ -51,6 +51,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--peptide-weight", type=float, default=1.0,
                    help="up-weight peptide residues/pairs in the loss "
                         "(1.0=uniform/unchanged; ~3 emphasizes the peptide)")
+    p.add_argument("--recycles", type=int, default=0,
+                   help="recycle iterations (0=off). Eval uses this many; training "
+                        "samples 1..N per step. Changes the architecture (adds a "
+                        "recycling embedder) -> use a fresh run dir.")
+    p.add_argument("--unfreeze-sm", type=float, default=0.0,
+                   help="%% of the structure module to unfreeze (last params first)")
+    p.add_argument("--unfreeze-plddt", type=float, default=0.0,
+                   help="%% of the pLDDT head to unfreeze")
+    p.add_argument("--unfreeze-pae", type=float, default=0.0,
+                   help="%% of the PAE/TM head to unfreeze")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
@@ -101,6 +111,8 @@ def main(argv=None) -> None:
         num_workers=args.num_workers, seed=args.seed, device=args.device,
         log_every=args.log_every, ckpt_every=args.ckpt_every,
         tensorboard=not args.no_tensorboard, peptide_weight=args.peptide_weight,
+        recycles=args.recycles, unfreeze_sm=args.unfreeze_sm,
+        unfreeze_plddt=args.unfreeze_plddt, unfreeze_pae=args.unfreeze_pae,
     )
 
 

@@ -21,8 +21,10 @@ import csv
 import glob
 import importlib.util
 import json
+import random
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from tqdm.auto import tqdm
@@ -238,14 +240,36 @@ class EncoderBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 # Encoder (7 variants) and DistillModel
 # --------------------------------------------------------------------------- #
+class RecyclingEmbedder(nn.Module):
+    """AF2-style recycling: fold the previous iteration's outputs back into the
+    initial single/pair. Adds LayerNorm(prev_s), LayerNorm(prev_z) and a binned
+    Cα–Cα distogram of the previous structure (all init so it starts ~no-op)."""
+
+    def __init__(self, d_s: int, d_z: int, min_bin: float = 3.25,
+                 max_bin: float = 20.75, no_bins: int = 15):
+        super().__init__()
+        self.s_norm = LayerNorm(d_s)
+        self.z_norm = LayerNorm(d_z)
+        self.register_buffer("breaks", torch.linspace(min_bin, max_bin, no_bins - 1))
+        self.linear_dist = Linear(no_bins, d_z, init="final")   # 0-init: no-op start
+
+    def forward(self, prev_s, prev_z, prev_ca):
+        d = torch.cdist(prev_ca, prev_ca)                        # [B,N,N]
+        oh = F.one_hot(torch.bucketize(d, self.breaks),
+                       num_classes=self.breaks.numel() + 1).to(prev_z.dtype)
+        return self.s_norm(prev_s), self.z_norm(prev_z) + self.linear_dist(oh)
+
+
 class DistillEncoder(nn.Module):
     """Stripped pairformer encoder: featurize -> ``depth`` blocks -> project to
-    the frozen stack's exact widths s:[B,N,384], z:[B,N,N,128]."""
+    the frozen stack's exact widths s:[B,N,384], z:[B,N,N,128]. With ``recycle``,
+    the previous iteration's (single, pair, Cα) are embedded back into s0/z0."""
 
     def __init__(self, variant: int, d_s: int = 384, d_z: int = 128,
                  depth: int = 1, *, c_hidden_mul: int = 128, c_hidden_tri: int = 32,
                  no_heads_tri: int = 4, no_heads_s: int = 8, c_hidden_s: int = 32,
-                 transition_factor: int = 2, max_offset: int = 32):
+                 transition_factor: int = 2, max_offset: int = 32,
+                 recycle: bool = False):
         super().__init__()
         self.variant = variant
         self.featurizer = Featurizer(d_s, d_z, max_offset)
@@ -263,12 +287,19 @@ class DistillEncoder(nn.Module):
         # the SM from a black hole with no gradient signal.
         self.s_out = Linear(d_s, FROZEN_C_S)
         self.z_out = Linear(d_z, FROZEN_C_Z)
+        # recycler embeds the SM's c_s single + our c_z pair from the prev pass
+        self.recycler = RecyclingEmbedder(FROZEN_C_S, d_z) if recycle else None
 
     def forward(self, aatype: torch.Tensor, residue_index: torch.Tensor,
                 seq_mask: torch.Tensor, anchor: torch.Tensor,
-                segment_id: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                segment_id: torch.Tensor, recyc=None
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]          # [B,N,N]
         s, z = self.featurizer(aatype, residue_index, anchor, segment_id)
+        if self.recycler is not None and recyc is not None:
+            s_up, z_up = self.recycler(*recyc)                  # prev (s, z, ca)
+            s = s + s_up
+            z = z + z_up
         s = s * seq_mask[..., None]
         z = z * pair_mask[..., None]
         for block in self.blocks:
@@ -282,33 +313,80 @@ class DistillModel(nn.Module):
     """Trainable encoder + FROZEN AF2 stack. Only the encoder has gradients."""
 
     def __init__(self, variant: int, model_name: str = "model_2_ptm",
-                 device: str = "cpu", **encoder_kwargs):
+                 device: str = "cpu", recycles: int = 0,
+                 unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
+                 unfreeze_pae: float = 0.0, **encoder_kwargs):
         super().__init__()
-        self.encoder = DistillEncoder(variant, **encoder_kwargs)
+        self.recycles = int(recycles)
+        self.encoder = DistillEncoder(variant, recycle=self.recycles > 0,
+                                      **encoder_kwargs)
         self.frozen = load_frozen_fold(model_name, device=device)
         for p in self.frozen.parameters():
             p.requires_grad_(False)
+        # optionally make the LAST pct% of each frozen sub-module trainable
+        self.unfrozen = {
+            "sm": self._unfreeze_last_pct(self.frozen.sm, unfreeze_sm),
+            "plddt": self._unfreeze_last_pct(self.frozen.plddt, unfreeze_plddt),
+            "pae": self._unfreeze_last_pct(self.frozen.tm, unfreeze_pae),
+        }
         self.to(device)
+
+    @staticmethod
+    def _unfreeze_last_pct(module: nn.Module, pct: float) -> float:
+        """Set requires_grad=True on whole parameter tensors from the END of the
+        module until ~pct% of its parameters (by count) are trainable. Returns the
+        actual fraction unfrozen. pct<=0 -> nothing (stays fully frozen)."""
+        if pct is None or pct <= 0:
+            return 0.0
+        named = list(module.named_parameters())
+        total = sum(p.numel() for _, p in named) or 1
+        target, acc = (pct / 100.0) * total, 0
+        for _, p in reversed(named):
+            if acc >= target:
+                break
+            p.requires_grad_(True)
+            acc += p.numel()
+        return acc / total
 
     def train(self, mode: bool = True) -> "DistillModel":
         super().train(mode)
-        self.frozen.eval()                     # frozen stack never trains
-        return self
+        self.frozen.eval()                     # eval mode (no dropout/BN updates)
+        return self                            #   even for the unfrozen params
 
     def trainable_parameters(self):
-        return self.encoder.parameters()
+        return (p for p in self.parameters() if p.requires_grad)
 
-    def forward(self, batch: Dict[str, torch.Tensor], return_frames: bool = False):
-        """-> (ca[B,N,3], plddt_logits[B,N,50], pae_logits[B,N,N,64])
-        and, if ``return_frames``, the SM backbone-frame trajectory [n_blocks,B,N,7]
-        for FAPE. Uses the frozen submodules directly (identical math to
-        FrozenFold.forward) so the frames are available without a second pass."""
-        s, z = self.encoder(batch["aatype"], batch["residue_index"],
-                            batch["seq_mask"], batch["anchor"],
-                            batch["segment_id"])
-        out = self.frozen.sm({"single": s, "pair": z}, batch["aatype"],
-                             mask=batch["seq_mask"])
-        ca = out["positions"][-1][..., 1, :]
+    def frozen_trainable_state(self) -> Dict[str, torch.Tensor]:
+        """state_dict of the unfrozen FROZEN-stack params (empty when 0% unfrozen);
+        saved/loaded separately so the bulk frozen weights need not be stored."""
+        return {n: p.detach().cpu() for n, p in self.named_parameters()
+                if p.requires_grad and not n.startswith("encoder.")}
+
+    def forward(self, batch: Dict[str, torch.Tensor], return_frames: bool = False,
+                num_recycles: Optional[int] = None):
+        """-> (ca[B,N,3], plddt_logits[B,N,50], pae_logits[B,N,N,64]) and, if
+        ``return_frames``, the SM backbone-frame trajectory for FAPE.
+
+        Recycling: runs ``num_recycles``+1 trunk passes, feeding the previous
+        (SM single, pair, Cα) back through the encoder. Earlier passes run under
+        no_grad (AF2-style) so only the last pass is backpropped — extra passes
+        cost forward-only. ``num_recycles`` defaults to ``self.recycles``."""
+        nr = self.recycles if num_recycles is None else num_recycles
+        if self.encoder.recycler is None:
+            nr = 0
+        aa, ri = batch["aatype"], batch["residue_index"]
+        sm_, an, seg = batch["seq_mask"], batch["anchor"], batch["segment_id"]
+
+        recyc = None
+        out = z = ca = None
+        for it in range(nr + 1):
+            is_last = it == nr
+            with (nullcontext() if is_last else torch.no_grad()):
+                s, z = self.encoder(aa, ri, sm_, an, seg, recyc=recyc)
+                out = self.frozen.sm({"single": s, "pair": z}, aa, mask=sm_)
+                ca = out["positions"][-1][..., 1, :]
+                if not is_last:
+                    recyc = (out["single"].detach(), z.detach(), ca.detach())
         plddt_logits = self.frozen.plddt(out["single"])
         pae_logits = self.frozen.tm(z)
         if return_frames:
@@ -885,8 +963,11 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     for i, batch in enumerate(loader, 1):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
+        # sample the recycle count per step (AF2-style): 1..recycles, else 0
+        max_rc = getattr(model, "recycles", 0)
+        nr = random.randint(1, max_rc) if max_rc >= 1 else 0
         with torch.autocast(device_type=dev_type, enabled=use_amp):
-            ca, plddt, pae, frames = model(batch, return_frames=True)
+            ca, plddt, pae, frames = model(batch, return_frames=True, num_recycles=nr)
             total, terms = loss_mod(ca, plddt, pae, frames, batch)
         if use_amp:
             scaler.scale(total).backward()
@@ -978,7 +1059,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  run_name: Optional[str] = None, resume: Optional[Path] = None,
                  eval_batches: Optional[int] = None, log_every: int = 2000,
                  ckpt_every: int = 2000, tensorboard: bool = True,
-                 peptide_weight: float = 1.0, log=print):
+                 peptide_weight: float = 1.0, recycles: int = 0,
+                 unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
+                 unfreeze_pae: float = 0.0, log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -1006,7 +1089,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                                  num_workers=num_workers)
     steps_per_epoch = (len(train_ds) + bs - 1) // bs
 
-    model = DistillModel(variant, device=device).to(device)
+    model = DistillModel(variant, device=device, recycles=recycles,
+                         unfreeze_sm=unfreeze_sm, unfreeze_plddt=unfreeze_plddt,
+                         unfreeze_pae=unfreeze_pae).to(device)
     loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
@@ -1019,6 +1104,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     config = {
         "variant": variant, "scheme": scheme, "fold": fold, "dummy": dummy,
         "lambdas": tuple(lambdas), "peptide_weight": peptide_weight,
+        "recycles": recycles, "unfreeze_sm": unfreeze_sm,
+        "unfreeze_plddt": unfreeze_plddt, "unfreeze_pae": unfreeze_pae,
+        "unfrozen_fraction": model.unfrozen,
         "bs": bs, "lr": lr, "epochs": epochs,
         "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp,
         "seed": seed, "num_workers": num_workers, "device": str(device),
@@ -1026,6 +1114,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         "af_root": str(af_root) if af_root else None,
         "n_train": len(train_ds), "n_val": len(val_ds),
         "encoder_params": sum(p.numel() for p in model.encoder.parameters()),
+        "trainable_params": sum(p.numel() for p in model.trainable_parameters()),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     run_dir = None
@@ -1045,6 +1134,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         tmp = Path(str(path) + ".tmp")
         torch.save({"epoch": epoch, "global_step": global_step,
                     "encoder": model.encoder.state_dict(),
+                    "frozen_trainable": model.frozen_trainable_state(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "scaler": scaler.state_dict(), "history": history,
@@ -1057,6 +1147,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         try:
             ckpt = torch.load(resume, map_location=device, weights_only=False)
             model.encoder.load_state_dict(ckpt["encoder"])
+            if ckpt.get("frozen_trainable"):       # restore unfrozen SM/head params
+                model.load_state_dict(ckpt["frozen_trainable"], strict=False)
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             # If --epochs changed since the checkpoint, the loaded scheduler still
@@ -1119,6 +1211,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                 best = ev["ca_rmsd"]
                 torch.save({"epoch": epoch, "global_step": global_step,
                             "encoder": model.encoder.state_dict(),
+                            "frozen_trainable": model.frozen_trainable_state(),
                             "val": ev, "config": config}, run_dir / "best.pt")
                 log(f"[train]   new best val Cα-RMSD {best:.3f} -> best.pt")
             save_ckpt(run_dir / "last.pt", global_step, epoch)

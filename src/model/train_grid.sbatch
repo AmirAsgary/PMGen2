@@ -49,19 +49,28 @@ S=${SCHEMES[$(( IDX / 35 ))]}     # scheme
 EPOCHS=6
 BS=10
 LR=1.4e-3
-# Peptide loss up-weighting. 1.0 = uniform (identical to prior runs, so resuming
-# existing checkpoints is unchanged). For a FRESH grid that emphasizes the
-# peptide pose, set ~3 (peptide residues/pairs weighted 3x vs MHC).
+# Peptide loss up-weighting (1.0 = uniform/unchanged; ~3-5 emphasizes the peptide).
 PEPTIDE_W=5.0
+# Recycling: eval uses RECYCLES iterations, training samples 1..RECYCLES per step.
+# 0 = no recycling. >0 changes the architecture (adds a recycling embedder), so
+# such runs land in their own *_rcN dirs (see SUFFIX below) and are ~1.3-1.7x
+# slower to train (extra passes are forward-only).
+RECYCLES=3
+# Partial fine-tuning of the FROZEN stack: % of each sub-module to unfreeze
+# (last params first). 0 = fully frozen (default). Whole tensors are unfrozen,
+# so the realised % can exceed the request — see config.json 'unfrozen_fraction'.
+UNFREEZE_SM=0
+UNFREEZE_PLDDT=0
+UNFREEZE_PAE=0
 
+# ---- run name encodes the non-default knobs so different experiments never
+#      collide / resume each other. baseline (pw1, rc0, no unfreeze) keeps the
+#      plain name so older runs still resume.
 RUN="${S}_fold${F}_variant${V}"
-# Isolate weighted grids: a non-1.0 weight gets its OWN checkpoint dirs (e.g.
-# two_axis_fold1_variant1_pw3.0) so a fresh weighted run never resumes from /
-# collides with the w=1 baseline. w=1.0 keeps the original names so your
-# existing runs still resume.
-if [[ "${PEPTIDE_W}" != "1.0" && "${PEPTIDE_W}" != "1" ]]; then
-    RUN="${RUN}_pw${PEPTIDE_W}"
-fi
+[[ "${PEPTIDE_W}" != "1.0" && "${PEPTIDE_W}" != "1" ]] && RUN="${RUN}_pw${PEPTIDE_W}"
+[[ "${RECYCLES}" != "0" ]] && RUN="${RUN}_rc${RECYCLES}"
+UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
+[[ "${UF}" != "0-0-0" ]] && RUN="${RUN}_uf${UF}"
 
 # per-submission dated log kept INSIDE the run's checkpoint dir (one file per
 # (re)submit, so you get a history: fresh run, resume 1, resume 2, ...)
@@ -114,7 +123,9 @@ $PY src/model/train.py \
     --ckpt-dir checkpoints --run-name "$RUN" \
     --resume "$CKPT" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
-    --peptide-weight ${PEPTIDE_W} \
+    --peptide-weight ${PEPTIDE_W} --recycles ${RECYCLES} \
+    --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
+    --unfreeze-pae ${UNFREEZE_PAE} \
     --log-every 100 --ckpt-every 2000 \
     --num-workers 4 --amp
 
