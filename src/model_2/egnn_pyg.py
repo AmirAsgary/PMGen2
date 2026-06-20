@@ -15,7 +15,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_cluster import knn_graph, radius_graph
+from torch_cluster import knn, knn_graph, radius_graph
 from torch_scatter import scatter
 
 
@@ -41,30 +41,78 @@ def mlp(sizes, act=nn.SiLU, zero_last=False) -> nn.Sequential:
     return net
 
 
-def build_message_edges(pos, batch, pep, residue_index,
-                        cut_pp=8.0, cut_pm=14.0, max_nb=48
-                        ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """radius_graph at the loose 14 Å cutoff, then drop protein-protein pairs
-    beyond 8 Å. Returns (edge_index[2,E], edge_attr[E,5])."""
-    ei = radius_graph(pos, r=cut_pm, batch=batch, loop=False, max_num_neighbors=max_nb)
-    i, j = ei[1], ei[0]                                  # target, source
-    d = (pos[i] - pos[j]).norm(dim=-1)
-    pep_i, pep_j = pep[i].bool(), pep[j].bool()
-    pep_pair = pep_i & pep_j
-    pro_pair = (~pep_i) & (~pep_j)
-    mix = ~(pep_pair | pro_pair)
-    keep = pep_pair | (pro_pair & (d < cut_pp)) | (mix & (d < cut_pm))
-    ei = ei[:, keep]
-    i, j = ei[1], ei[0]
-    pep_i, pep_j = pep[i].bool(), pep[j].bool()
-    same = (pep_i == pep_j).float()
+def _intra_group_pairs(items, groups, n_groups):
+    """All directed pairs (a,b), a≠b, of items sharing a group. Vectorized."""
+    m = items.shape[0]
+    if m == 0:
+        return items.new_zeros(2, 0)
+    order = torch.argsort(groups)
+    g_sorted = groups[order]
+    counts = torch.bincount(g_sorted, minlength=n_groups)
+    starts = torch.cumsum(counts, 0) - counts
+    rep = counts[g_sorted]
+    gs = starts[g_sorted]
+    total = int(rep.sum())
+    if total == 0:
+        return items.new_zeros(2, 0)
+    dev = items.device
+    a_s = torch.repeat_interleave(torch.arange(m, device=dev), rep)
+    cum = torch.cumsum(rep, 0) - rep
+    local = torch.arange(total, device=dev) - torch.repeat_interleave(cum, rep)
+    b_s = torch.repeat_interleave(gs, rep) + local
+    keep = a_s != b_s
+    return torch.stack([items[order[a_s[keep]]], items[order[b_s[keep]]]], 0)
+
+
+def build_message_edges(pos, batch, pep, residue_index, cut_pp=8.0, cut_pm=14.0,
+                        max_nb=48, pep_mhc_k=6) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Message graph (directed, deduped):
+      (a) protein-protein < 8 Å and protein-peptide < 14 Å from radius_graph;
+      (b) the peptide as a COMPLETE subgraph (any distance) so it is always
+          internally connected — even at high diffusion noise;
+      (c) each peptide residue to its ``pep_mhc_k`` nearest MHC residues (k-NN,
+          any distance) so the peptide always 'feels' the groove.
+    Returns (edge_index[2,E], edge_attr[E,5])."""
+    posf = pos.float()
+    pb = pep.bool()
+    n = pos.shape[0]
+    n_graphs = int(batch.max()) + 1
+
+    # (a) radius graph, keep pro-pro<8 and mixed pro-pep<14 (pep-pep handled by (b))
+    ei = radius_graph(posf, r=cut_pm, batch=batch, loop=False, max_num_neighbors=max_nb)
+    d = (posf[ei[1]] - posf[ei[0]]).norm(dim=-1)
+    pi, pj = pb[ei[1]], pb[ei[0]]
+    mix = pi ^ pj
+    keep = ((~pi) & (~pj) & (d < cut_pp)) | (mix & (d < cut_pm))
+    ei_rad = ei[:, keep]
+
+    # (b) complete peptide subgraph
+    pep_idx = pb.nonzero(as_tuple=False).flatten()
+    ei_pep = _intra_group_pairs(pep_idx, batch[pep_idx], n_graphs)
+
+    # (c) peptide <-> nearest MHC (both directions), guaranteed contact
+    mhc_idx = (~pb).nonzero(as_tuple=False).flatten()
+    if pep_idx.numel() and mhc_idx.numel():
+        a = knn(posf[mhc_idx], posf[pep_idx], min(pep_mhc_k, mhc_idx.shape[0]),
+                batch[mhc_idx], batch[pep_idx])          # [2, Pep*k]: (pep, mhc)
+        pg, mg = pep_idx[a[0]], mhc_idx[a[1]]
+        ei_pm = torch.stack([torch.cat([pg, mg]), torch.cat([mg, pg])], 0)
+    else:
+        ei_pm = pep_idx.new_zeros(2, 0)
+
+    # combine + dedupe directed edges
+    edge_index = torch.cat([ei_rad, ei_pep, ei_pm], dim=1)
+    key = torch.unique(edge_index[0].long() * n + edge_index[1].long())
+    edge_index = torch.stack([key // n, key % n], 0)
+
+    i, j = edge_index[1], edge_index[0]
+    pi, pj = pb[i], pb[j]
+    same = (pi == pj).float()
     sep = ((residue_index[i] - residue_index[j]).abs().clamp(max=32).float()
            / 32.0) * same
-    etype = torch.stack([pep[i].bool() & pep[j].bool(),
-                         (~pep[i].bool()) & (~pep[j].bool()),
-                         pep[i].bool() ^ pep[j].bool()], -1).float()
+    etype = torch.stack([pi & pj, (~pi) & (~pj), pi ^ pj], -1).float()
     edge_attr = torch.cat([etype, same[:, None], sep[:, None]], -1)   # [E,5]
-    return ei, edge_attr
+    return edge_index, edge_attr
 
 
 class EGNNLayer(nn.Module):
@@ -100,25 +148,33 @@ class EGNNLayer(nn.Module):
 
 
 def knn_triplets(pos, batch, k=12):
-    """Build (center, edge_a, edge_b) triplets from a k-NN graph: for each node
-    its incident edges are paired. Bounded to O(N·k²)."""
-    ei = knn_graph(pos, k=k, batch=batch, loop=False, flow="target_to_source")
-    i = ei[1]                                            # target (center) per edge
-    order = torch.argsort(i)
-    i_sorted = i[order]
-    counts = torch.bincount(i_sorted, minlength=pos.shape[0])
-    # pair every two edges that share the same center
-    starts = torch.cumsum(counts, 0) - counts
-    a_list, b_list, c_list = [], [], []
-    for node in torch.nonzero(counts >= 2, as_tuple=False).flatten().tolist():
-        edges = order[starts[node]:starts[node] + counts[node]]
-        aa, bb = torch.meshgrid(edges, edges, indexing="ij")
-        mask = aa != bb
-        a_list.append(aa[mask]); b_list.append(bb[mask])
-        c_list.append(torch.full((int(mask.sum()),), node, device=pos.device))
-    if not c_list:
+    """Build (center, edge_a, edge_b) triplets from a k-NN graph — every two
+    incident edges of each centre node are paired. Fully vectorized (no Python
+    loop): all torch ops, O(E + ΣC²) where C = per-node degree (≈ k)."""
+    ei = knn_graph(pos.float(), k=k, batch=batch, loop=False,
+                   flow="target_to_source")            # torch_cluster needs fp32
+    n, dev = pos.shape[0], pos.device
+    i = ei[1]                                            # centre (target) per edge
+    E = i.shape[0]
+    if E == 0:
         return ei, None
-    return ei, (torch.cat(c_list), torch.cat(a_list), torch.cat(b_list))
+    order = torch.argsort(i)                             # group edges by centre
+    i_sorted = i[order]
+    counts = torch.bincount(i_sorted, minlength=n)       # edges per centre
+    starts = torch.cumsum(counts, 0) - counts            # group start (sorted space)
+    rep = counts[i_sorted]                               # group size per sorted edge
+    gs = starts[i_sorted]                                # group start per sorted edge
+    total = int(rep.sum())                               # = ΣC² (pairs incl. self)
+    if total == 0:
+        return ei, None
+    # a = each sorted edge repeated (its group size) times; b = the group's edges
+    a_sorted = torch.repeat_interleave(torch.arange(E, device=dev), rep)
+    cum = torch.cumsum(rep, 0) - rep
+    local = torch.arange(total, device=dev) - torch.repeat_interleave(cum, rep)
+    b_sorted = torch.repeat_interleave(gs, rep) + local
+    keep = a_sorted != b_sorted                          # drop self-pairs (a==b)
+    a_edge, b_edge = order[a_sorted[keep]], order[b_sorted[keep]]
+    return ei, (i[a_edge], a_edge, b_edge)               # (centre, edge_a, edge_b)
 
 
 class EGNNDenoiser(nn.Module):
