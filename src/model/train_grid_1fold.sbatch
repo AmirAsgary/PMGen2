@@ -35,14 +35,20 @@ V=$(( IDX + 1 ))                 # variant 1..7
 S=${SCHEME}
 
 # ---- hyperparameters (keep in sync with train_grid.sbatch) ----
-EPOCHS=6
+EPOCHS=12                         # was 6; bump to CONTINUE the rc3 runs longer
 BS=10
 LR=1.4e-3
 PEPTIDE_W=5.0
-RECYCLES=3                        # eval uses N; training samples 1..N per step
+RECYCLES=3                        # keep =3 so RUN matches the existing _rc3 dirs
+# Per-step recycle distribution during training. Empty = uniform 1..RECYCLES.
+# "0.8 0.2" = 80% no recycle / 20% one recycle (your lighter schedule).
+RECYCLE_PROBS="0.8 0.2"
+EVAL_RECYCLES=1                   # validate with 1 recycle
 UNFREEZE_SM=0                     # % of each frozen sub-module to unfreeze
 UNFREEZE_PLDDT=0
 UNFREEZE_PAE=0
+ANCHOR_RELPOS=0                   # 1 = encode the alignment register in relpos
+                                  # (experimental A/B; fresh run -> _arp dirs)
 
 # ---- run name encodes the non-default knobs (so experiments never collide) ----
 RUN="${S}_fold${F}_variant${V}"
@@ -50,6 +56,8 @@ RUN="${S}_fold${F}_variant${V}"
 [[ "${RECYCLES}" != "0" ]] && RUN="${RUN}_rc${RECYCLES}"
 UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
 [[ "${UF}" != "0-0-0" ]] && RUN="${RUN}_uf${UF}"
+ARP_FLAG=""
+[[ "${ANCHOR_RELPOS}" == "1" ]] && { ARP_FLAG="--anchor-relpos"; RUN="${RUN}_arp"; }
 
 DATE=$(date +%Y%m%d_%H%M%S)
 RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
@@ -85,8 +93,9 @@ $PY src/model/train.py \
     --resume "$CKPT" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
     --peptide-weight ${PEPTIDE_W} --recycles ${RECYCLES} \
+    --recycle-probs ${RECYCLE_PROBS} --eval-recycles ${EVAL_RECYCLES} \
     --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
-    --unfreeze-pae ${UNFREEZE_PAE} \
+    --unfreeze-pae ${UNFREEZE_PAE} ${ARP_FLAG} \
     --log-every 100 --ckpt-every 2000 \
     --num-workers 4 --amp
 
