@@ -39,6 +39,14 @@ EPOCHS=12                         # was 6; bump to CONTINUE the rc3 runs longer
 BS=10
 LR=1.4e-3
 PEPTIDE_W=5.0
+# AF2-style loss weights: geometry (FAPE) dominates; pLDDT/PAE are light aux heads
+# (0.01) so the model spends its capacity on structure, not confidence calibration.
+LAMBDAS="1.0 0.01 0.01"          # FAPE  PLDDT  PAE
+# Down-weight low-confidence teacher structures in the geometry loss: each example's
+# FAPE is scaled by its median peptide pLDDT/100 (floored), so noisy targets count
+# less. Loss-only -> does NOT change the run dir / checkpoint -> resumes in place.
+PLDDT_WEIGHT_STRUCT=1            # 1 = on
+PLDDT_WEIGHT_FLOOR=0.1
 RECYCLES=3                        # keep =3 so RUN matches the existing _rc3 dirs
 # Per-step recycle distribution during training. Empty = uniform 1..RECYCLES.
 # "0.8 0.2" = 80% no recycle / 20% one recycle (your lighter schedule).
@@ -58,6 +66,10 @@ UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
 [[ "${UF}" != "0-0-0" ]] && RUN="${RUN}_uf${UF}"
 ARP_FLAG=""
 [[ "${ANCHOR_RELPOS}" == "1" ]] && { ARP_FLAG="--anchor-relpos"; RUN="${RUN}_arp"; }
+# pLDDT-weighted structure loss is loss-only (no architecture change) -> the RUN
+# name is intentionally NOT modified, so existing _rc3 checkpoints resume in place.
+PWS_FLAG=""
+[[ "${PLDDT_WEIGHT_STRUCT}" == "1" ]] && PWS_FLAG="--plddt-weight-struct --plddt-weight-floor ${PLDDT_WEIGHT_FLOOR}"
 
 DATE=$(date +%Y%m%d_%H%M%S)
 RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
@@ -92,10 +104,11 @@ $PY src/model/train.py \
     --ckpt-dir checkpoints --run-name "$RUN" \
     --resume "$CKPT" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --grad-clip 1.0 \
+    --lambdas ${LAMBDAS} \
     --peptide-weight ${PEPTIDE_W} --recycles ${RECYCLES} \
     --recycle-probs ${RECYCLE_PROBS} --eval-recycles ${EVAL_RECYCLES} \
     --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
-    --unfreeze-pae ${UNFREEZE_PAE} ${ARP_FLAG} \
+    --unfreeze-pae ${UNFREEZE_PAE} ${ARP_FLAG} ${PWS_FLAG} \
     --log-every 100 --ckpt-every 2000 \
     --num-workers 4 --amp
 
