@@ -66,7 +66,8 @@ from openfold.data.data_transforms import (                           # noqa: E4
     atom37_to_frames,
     get_backbone_frames,
 )
-from openfold.utils.loss import backbone_loss                         # noqa: E402
+from openfold.utils.loss import backbone_loss, compute_fape           # noqa: E402
+from openfold.utils.rigid_utils import Rigid, Rotation                # noqa: E402
 
 
 def _load_module(name: str, rel_path: str):
@@ -708,6 +709,28 @@ def _masked_ce(logits: torch.Tensor, target: torch.Tensor,
     return (ce * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def _backbone_fape_per_example(backbone_rigid_tensor, backbone_rigid_mask, traj,
+                               B, pair_mask=None, clamp_distance=None,
+                               loss_unit_distance=10.0, eps=1e-4):
+    """Same FAPE as openfold ``backbone_loss`` but returns one value per example
+    ([B]) instead of the batch-mean scalar, so the per-example loss can be
+    reweighted (e.g. by teacher confidence) before reduction. ``traj`` carries
+    leading trajectory-block dims; we average those out and keep the batch dim."""
+    if traj.shape[-1] == 7:
+        pred_aff = Rigid.from_tensor_7(traj)
+    else:
+        pred_aff = Rigid.from_tensor_4x4(traj)
+    pred_aff = Rigid(Rotation(rot_mats=pred_aff.get_rots().get_rot_mats(),
+                              quats=None), pred_aff.get_trans())
+    gt_aff = Rigid.from_tensor_4x4(backbone_rigid_tensor)
+    fape = compute_fape(                                  # [*, B] (leading = blocks)
+        pred_aff, gt_aff[None], backbone_rigid_mask[None],
+        pred_aff.get_trans(), gt_aff[None].get_trans(), backbone_rigid_mask[None],
+        pair_mask=pair_mask, l1_clamp_distance=clamp_distance,
+        length_scale=loss_unit_distance, eps=eps)
+    return fape.reshape(-1, B).mean(0)                    # mean over blocks -> [B]
+
+
 class DistillLoss(nn.Module):
     """L = λ_fape·FAPE + λ_plddt·CE(plddt, bin50) + λ_pae·CE(pae, bin64).
 
@@ -719,17 +742,24 @@ class DistillLoss(nn.Module):
     def __init__(self, lambda_fape: float = 1.0, lambda_plddt: float = 0.1,
                  lambda_pae: float = 0.1, model_name: str = "model_2_ptm",
                  fape_clamp: Optional[float] = None, fape_unit: float = 10.0,
-                 peptide_weight: float = 5.0):
+                 peptide_weight: float = 5.0, plddt_weight_struct: bool = False,
+                 plddt_weight_floor: float = 0.1):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
         # peptide_weight=1.0 -> uniform (identical to the unweighted loss); >1
         # up-weights peptide residues (and peptide-involving pairs) so the small
         # peptide is not drowned out by the large MHC.
+        # plddt_weight_struct -> weight each example's FAPE by the teacher's median
+        # peptide pLDDT (/100), so low-confidence teacher structures (whose Cα
+        # targets are unreliable) contribute proportionally less to the geometry
+        # loss. plddt_weight_floor keeps the weakest examples from vanishing.
         super().__init__()
         self.l_fape, self.l_plddt, self.l_pae = lambda_fape, lambda_plddt, lambda_pae
         self.fape_clamp, self.fape_unit = fape_clamp, fape_unit
         self.peptide_weight = float(peptide_weight)
+        self.plddt_weight_struct = bool(plddt_weight_struct)
+        self.plddt_weight_floor = float(plddt_weight_floor)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -758,15 +788,27 @@ class DistillLoss(nn.Module):
 
         bb_tensor, bb_mask = _build_gt_backbone_frames(
             batch["aatype"], batch["teacher_bb"], seq_mask)
+        B = seq_mask.shape[0]
 
-        def _fape(pmask):
-            f = backbone_loss(backbone_rigid_tensor=bb_tensor,
-                              backbone_rigid_mask=bb_mask, traj=frames,
-                              pair_mask=pmask, clamp_distance=self.fape_clamp,
-                              loss_unit_distance=self.fape_unit)
-            return f.mean() if f.ndim > 0 else f
+        def _fape_be(pmask):                              # per-example FAPE -> [B]
+            return _backbone_fape_per_example(
+                bb_tensor, bb_mask, frames, B, pair_mask=pmask,
+                clamp_distance=self.fape_clamp, loss_unit_distance=self.fape_unit)
 
-        fape = _fape(fape_pair)
+        fape_be = _fape_be(fape_pair)                     # [B]
+        if self.plddt_weight_struct:
+            # weight = teacher median peptide pLDDT / 100, floored. Confidence-
+            # weighted MEAN (÷Σg) keeps the FAPE scale stable while down-weighting
+            # low-confidence examples relative to confident ones.
+            tp = batch["teacher_plddt"]
+            g = fape_be.new_empty(B)
+            for b in range(B):
+                vals = tp[b][pep[b] > 0.5]
+                g[b] = vals.median() if vals.numel() else tp.new_tensor(0.0)
+            g = (g / 100.0).clamp(min=self.plddt_weight_floor, max=1.0)
+            fape = (g * fape_be).sum() / g.sum().clamp_min(1e-4)
+        else:
+            fape = fape_be.mean()
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
         pae_bins = torch.bucketize(batch["teacher_pae"], self.pae_breaks)
         ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
@@ -775,7 +817,7 @@ class DistillLoss(nn.Module):
 
         # peptide-ONLY loss values, every step (observation; not in `total`).
         with torch.no_grad():
-            pep_fape = _fape(pep[:, None, :])                  # FAPE at peptide pos
+            pep_fape = _fape_be(pep[:, None, :]).mean()        # FAPE at peptide pos
             pep_plddt_ce = _masked_ce(plddt_logits, plddt_bins, pep)
             pep_pae_ce = _masked_ce(pae_logits, pae_bins, pep_pair * pair_mask)
 
@@ -1126,7 +1168,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  recycle_probs: Optional[Sequence[float]] = None,
                  eval_recycles: Optional[int] = None,
                  unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
-                 unfreeze_pae: float = 0.0, anchor_relpos: bool = False, log=print):
+                 unfreeze_pae: float = 0.0, anchor_relpos: bool = False,
+                 plddt_weight_struct: bool = False,
+                 plddt_weight_floor: float = 0.1, log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -1157,7 +1201,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     model = DistillModel(variant, device=device, recycles=recycles,
                          unfreeze_sm=unfreeze_sm, unfreeze_plddt=unfreeze_plddt,
                          unfreeze_pae=unfreeze_pae, anchor_relpos=anchor_relpos).to(device)
-    loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight).to(device)
+    loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight,
+                           plddt_weight_struct=plddt_weight_struct,
+                           plddt_weight_floor=plddt_weight_floor).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
     total_steps = max(1, steps_per_epoch * epochs)
@@ -1170,6 +1216,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         "variant": variant, "scheme": scheme, "fold": fold, "dummy": dummy,
         "lambdas": tuple(lambdas), "peptide_weight": peptide_weight,
         "recycles": recycles, "anchor_relpos": anchor_relpos,
+        "plddt_weight_struct": plddt_weight_struct,
+        "plddt_weight_floor": plddt_weight_floor,
         "unfreeze_sm": unfreeze_sm,
         "unfreeze_plddt": unfreeze_plddt, "unfreeze_pae": unfreeze_pae,
         "unfrozen_fraction": model.unfrozen,

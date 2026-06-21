@@ -46,8 +46,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--bs", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--lambdas", type=float, nargs=3, default=(1.0, 0.1, 0.1),
-                   metavar=("FAPE", "PLDDT", "PAE"))
+    p.add_argument("--lambdas", type=float, nargs=3, default=(1.0, 0.01, 0.01),
+                   metavar=("FAPE", "PLDDT", "PAE"),
+                   help="loss weights. Default 1/0.01/0.01 (AF2-style: geometry "
+                        "dominates; pLDDT/PAE are light auxiliary heads)")
     p.add_argument("--peptide-weight", type=float, default=1.0,
                    help="up-weight peptide residues/pairs in the loss "
                         "(1.0=uniform/unchanged; ~3 emphasizes the peptide)")
@@ -71,6 +73,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="re-number the peptide from its anchors so the alignment "
                         "register reaches the SM via relpos (experimental A/B; "
                         "new architecture-equivalent -> use a fresh run dir)")
+    p.add_argument("--plddt-weight-struct", action="store_true",
+                   help="weight each example's FAPE by the teacher's median peptide "
+                        "pLDDT/100, so low-confidence teacher structures contribute "
+                        "less to the geometry loss (loss-only; resume-safe)")
+    p.add_argument("--plddt-weight-floor", type=float, default=0.1,
+                   help="lower bound on the per-example pLDDT weight (keeps the "
+                        "weakest examples from vanishing entirely)")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
@@ -125,6 +134,8 @@ def main(argv=None) -> None:
         eval_recycles=args.eval_recycles, unfreeze_sm=args.unfreeze_sm,
         unfreeze_plddt=args.unfreeze_plddt, unfreeze_pae=args.unfreeze_pae,
         anchor_relpos=args.anchor_relpos,
+        plddt_weight_struct=args.plddt_weight_struct,
+        plddt_weight_floor=args.plddt_weight_floor,
     )
 
 
