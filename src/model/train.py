@@ -55,12 +55,22 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="recycle iterations (0=off). Eval uses this many; training "
                         "samples 1..N per step. Changes the architecture (adds a "
                         "recycling embedder) -> use a fresh run dir.")
+    p.add_argument("--recycle-probs", type=float, nargs="+", default=None,
+                   metavar="P", help="per-step recycle distribution P(nr=0,1,2,...) "
+                        "during training, e.g. 0.8 0.2 = 80%% no recycle / 20%% one. "
+                        "Overrides the default uniform 1..recycles sampling.")
+    p.add_argument("--eval-recycles", type=int, default=None,
+                   help="recycle count to use at validation (default: model max)")
     p.add_argument("--unfreeze-sm", type=float, default=0.0,
                    help="%% of the structure module to unfreeze (last params first)")
     p.add_argument("--unfreeze-plddt", type=float, default=0.0,
                    help="%% of the pLDDT head to unfreeze")
     p.add_argument("--unfreeze-pae", type=float, default=0.0,
                    help="%% of the PAE/TM head to unfreeze")
+    p.add_argument("--anchor-relpos", action="store_true",
+                   help="re-number the peptide from its anchors so the alignment "
+                        "register reaches the SM via relpos (experimental A/B; "
+                        "new architecture-equivalent -> use a fresh run dir)")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
@@ -111,8 +121,10 @@ def main(argv=None) -> None:
         num_workers=args.num_workers, seed=args.seed, device=args.device,
         log_every=args.log_every, ckpt_every=args.ckpt_every,
         tensorboard=not args.no_tensorboard, peptide_weight=args.peptide_weight,
-        recycles=args.recycles, unfreeze_sm=args.unfreeze_sm,
+        recycles=args.recycles, recycle_probs=args.recycle_probs,
+        eval_recycles=args.eval_recycles, unfreeze_sm=args.unfreeze_sm,
         unfreeze_plddt=args.unfreeze_plddt, unfreeze_pae=args.unfreeze_pae,
+        anchor_relpos=args.anchor_relpos,
     )
 
 

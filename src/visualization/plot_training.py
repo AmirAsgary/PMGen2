@@ -65,17 +65,24 @@ _LOWER_BETTER = {"total", "fape", "plddt_ce", "pae_ce", "pep_fape",
                  "pae_mae", "pep_plddt_mae", "pep_pae_mae"}
 
 _RUN_RE = re.compile(r"^(?P<scheme>.+?)_fold(?P<fold>\d+)_variant(?P<variant>\d+)"
-                     r"(?:_pw(?P<pw>[\d.]+))?$")
+                     r"(?:_pw(?P<pw>[\d.]+))?(?:_rc(?P<rc>\d+))?"
+                     r"(?:_uf(?P<uf>[\d.\-]+))?$")
 
 
 def _parse_run_name(name: str) -> Dict[str, object]:
-    """Fallback metadata from the dir name if config.json is missing."""
+    """Metadata from the dir name (scheme/fold/variant + pw/recycles/unfreeze)."""
     m = _RUN_RE.match(name)
     if not m:
-        return {"scheme": "?", "fold": -1, "variant": -1, "peptide_weight": 1.0}
+        return {"scheme": "?", "fold": -1, "variant": -1, "peptide_weight": 1.0,
+                "recycles": 0, "config": name}
+    pw = float(m["pw"]) if m["pw"] else 1.0
+    rc = int(m["rc"]) if m["rc"] else 0
+    # compact config label for faceting: e.g. base / pw5 / pw5_rc3
+    cfg = "base" if (pw == 1.0 and rc == 0) else (
+        (f"pw{pw:g}" if pw != 1.0 else "") + (f"_rc{rc}" if rc else "")).strip("_")
     return {"scheme": m["scheme"], "fold": int(m["fold"]),
-            "variant": int(m["variant"]),
-            "peptide_weight": float(m["pw"]) if m["pw"] else 1.0}
+            "variant": int(m["variant"]), "peptide_weight": pw,
+            "recycles": rc, "config": cfg}
 
 
 def load_run(run_dir: Path) -> Optional[Tuple[Dict[str, object], pd.DataFrame]]:

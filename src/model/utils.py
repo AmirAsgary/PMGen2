@@ -309,15 +309,58 @@ class DistillEncoder(nn.Module):
         return s_out, z_out
 
 
+def anchor_canonical_resindex(residue_index, anchor, seq_mask, segment_id,
+                              span: int = 8):
+    """Re-number the PEPTIDE so the alignment register shows up in relpos (and thus
+    in z, the only channel into the frozen SM). Anchors are pinned to canonical
+    groove slots: the inter-anchor residues are left-aligned, leaving a NUMBERING
+    GAP (the bulge) before the C-terminal anchor when the peptide is shorter than
+    the canonical span. Different anchor pairs -> different relpos -> the SM can
+    tell registers apart positionally (the same signal AF2 got from the gapped
+    template). MHC numbering and the ~200 MHC->peptide gap are preserved.
+
+    Derived purely from the anchor flag already in the batch (no re-preprocess).
+    EXPERIMENTAL / heuristic: the faithful alternative is PMGen's exact gap string.
+    """
+    out = residue_index.clone()
+    B = residue_index.shape[0]
+    for b in range(B):
+        m = seq_mask[b].bool()
+        if not m.any():
+            continue
+        seg = segment_id[b]
+        pep = (seg == seg[m].max()) & m                  # peptide = highest segment
+        pep_pos = pep.nonzero(as_tuple=False).flatten()
+        L = int(pep_pos.numel())
+        if L == 0:
+            continue
+        mhc = m & ~pep
+        base = (int(residue_index[b][mhc].max()) if mhc.any() else 0) + 200
+        anc = (anchor[b][pep_pos] > 0.5).nonzero(as_tuple=False).flatten().tolist()
+        if len(anc) < 2:                                 # 0/1 anchor -> contiguous
+            slots = list(range(L))
+        else:
+            af, al = anc[0], anc[-1]
+            c_slot = max(span, (al - af))                # gap before C-anchor if short
+            slots = [(k - af) if k < al else
+                     (c_slot if k == al else c_slot + (k - al)) for k in range(L)]
+        s0 = slots[0]
+        for k in range(L):
+            out[b, pep_pos[k]] = base + (slots[k] - s0)
+    return out
+
+
 class DistillModel(nn.Module):
     """Trainable encoder + FROZEN AF2 stack. Only the encoder has gradients."""
 
     def __init__(self, variant: int, model_name: str = "model_2_ptm",
                  device: str = "cpu", recycles: int = 0,
                  unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
-                 unfreeze_pae: float = 0.0, **encoder_kwargs):
+                 unfreeze_pae: float = 0.0, anchor_relpos: bool = False,
+                 **encoder_kwargs):
         super().__init__()
         self.recycles = int(recycles)
+        self.anchor_relpos = bool(anchor_relpos)
         self.encoder = DistillEncoder(variant, recycle=self.recycles > 0,
                                       **encoder_kwargs)
         self.frozen = load_frozen_fold(model_name, device=device)
@@ -376,6 +419,8 @@ class DistillModel(nn.Module):
             nr = 0
         aa, ri = batch["aatype"], batch["residue_index"]
         sm_, an, seg = batch["seq_mask"], batch["anchor"], batch["segment_id"]
+        if self.anchor_relpos:                           # register -> relpos -> z
+            ri = anchor_canonical_resindex(ri, an, sm_, seg)
 
         recyc = None
         out = z = ca = None
@@ -949,7 +994,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     scaler=None, grad_clip: Optional[float] = None,
                     log=None, log_every: int = 0, epoch: int = 0,
                     global_step: int = 0, mlog: Optional[MetricLogger] = None,
-                    ckpt_every: int = 0, save_fn=None
+                    ckpt_every: int = 0, save_fn=None,
+                    recycle_probs: Optional[Sequence[float]] = None
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -972,9 +1018,14 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     for i, batch in enumerate(loader, 1):
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        # sample the recycle count per step (AF2-style): 1..recycles, else 0
+        # sample the recycle count per step. With recycle_probs=[p0,p1,...] draw
+        # nr from that categorical (e.g. [0.8,0.2] -> 80% no recycle, 20% one);
+        # otherwise AF2-style uniform over 1..recycles (0 if the model has none).
         max_rc = getattr(model, "recycles", 0)
-        nr = random.randint(1, max_rc) if max_rc >= 1 else 0
+        if recycle_probs:
+            nr = random.choices(range(len(recycle_probs)), weights=recycle_probs)[0]
+        else:
+            nr = random.randint(1, max_rc) if max_rc >= 1 else 0
         with torch.autocast(device_type=dev_type, enabled=use_amp):
             ca, plddt, pae, frames = model(batch, return_frames=True, num_recycles=nr)
             total, terms = loss_mod(ca, plddt, pae, frames, batch)
@@ -1037,14 +1088,17 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
 
 @torch.no_grad()
 def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
-             device: str, max_batches: Optional[int] = None) -> Dict[str, float]:
-    """Example-weighted mean loss terms + metrics over (part of) a loader."""
+             device: str, max_batches: Optional[int] = None,
+             num_recycles: Optional[int] = None) -> Dict[str, float]:
+    """Example-weighted mean loss terms + metrics over (part of) a loader.
+    ``num_recycles`` overrides the model's default recycle count at eval."""
     model.eval()
     agg: Dict[str, float] = defaultdict(float)
     n = 0
     for i, batch in enumerate(loader):
         batch = move_batch(batch, device)
-        ca, plddt, pae, frames = model(batch, return_frames=True)
+        ca, plddt, pae, frames = model(batch, return_frames=True,
+                                       num_recycles=num_recycles)
         _, terms = loss_mod(ca, plddt, pae, frames, batch)
         mets = eval_metrics(ca, plddt, pae, batch, loss_mod)
         bs = int(batch["aatype"].shape[0])
@@ -1069,8 +1123,10 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  eval_batches: Optional[int] = None, log_every: int = 2000,
                  ckpt_every: int = 2000, tensorboard: bool = True,
                  peptide_weight: float = 1.0, recycles: int = 0,
+                 recycle_probs: Optional[Sequence[float]] = None,
+                 eval_recycles: Optional[int] = None,
                  unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
-                 unfreeze_pae: float = 0.0, log=print):
+                 unfreeze_pae: float = 0.0, anchor_relpos: bool = False, log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -1100,7 +1156,7 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
 
     model = DistillModel(variant, device=device, recycles=recycles,
                          unfreeze_sm=unfreeze_sm, unfreeze_plddt=unfreeze_plddt,
-                         unfreeze_pae=unfreeze_pae).to(device)
+                         unfreeze_pae=unfreeze_pae, anchor_relpos=anchor_relpos).to(device)
     loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
@@ -1113,7 +1169,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     config = {
         "variant": variant, "scheme": scheme, "fold": fold, "dummy": dummy,
         "lambdas": tuple(lambdas), "peptide_weight": peptide_weight,
-        "recycles": recycles, "unfreeze_sm": unfreeze_sm,
+        "recycles": recycles, "anchor_relpos": anchor_relpos,
+        "unfreeze_sm": unfreeze_sm,
         "unfreeze_plddt": unfreeze_plddt, "unfreeze_pae": unfreeze_pae,
         "unfrozen_fraction": model.unfrozen,
         "bs": bs, "lr": lr, "epochs": epochs,
@@ -1202,10 +1259,11 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
             model, train_loader, loss_mod, optimizer, scheduler, device,
             scaler if amp else None, grad_clip, log=log, log_every=log_every,
             epoch=epoch, global_step=global_step, mlog=mlog,
-            ckpt_every=ckpt_every,
+            ckpt_every=ckpt_every, recycle_probs=recycle_probs,
             save_fn=lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep)
             if run_dir is not None else None)
-        ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches)
+        ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches,
+                      num_recycles=eval_recycles)
         history.append({"epoch": epoch, "train": tr, "val": ev})
         mlog.log("val", epoch, global_step, None, ev)
         log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "

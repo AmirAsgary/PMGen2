@@ -64,7 +64,12 @@ class MHCDiff(nn.Module):
 
         h_clean = self._aux_embed(x0, data)
         plddt_pred = self.plddt_head(h_clean).squeeze(-1).sigmoid() * 100.0
-        plddt_loss = (((plddt_pred - data.teacher_plddt) / 100.0) ** 2).mean()
+        plddt_se = ((plddt_pred - data.teacher_plddt) / 100.0) ** 2     # [ΣN]
+        plddt_loss = plddt_se.mean()
+        # peptide-only pLDDT error: the overall mean is dominated by the easy,
+        # uniformly-high MHC, so report the peptide separately (the part we care
+        # about). RMSE in pLDDT points = 100*sqrt(value).
+        pep_plddt = (plddt_se * pep).sum() / pep.sum().clamp_min(1.0)
 
         if hasattr(data, "teacher_chi"):
             sc = self.torsion_head(h_clean).reshape(-1, 4, 2)
@@ -79,18 +84,28 @@ class MHCDiff(nn.Module):
                  + l_tor * tor + l_plddt * plddt_loss)
         terms = {"total": float(total), "pep_coord": float(pep_coord),
                  "mhc_coord": float(mhc_coord), "torsion": float(tor),
-                 "plddt": float(plddt_loss)}
+                 "plddt": float(plddt_loss), "pep_plddt": float(pep_plddt)}
         return total, terms
+
+    def forward(self, data, lambdas=(1.0, 0.25, 0.5, 0.1)):
+        # so DistributedDataParallel can hook the training step (DDP syncs grads
+        # only through .forward()); plain training calls this too.
+        return self.compute_loss(data, lambdas)
 
     @torch.no_grad()
     def sample(self, data, template_pool: "Optional[PD.MHCTemplatePool]" = None,
-               mhc_start_t: Optional[int] = None):
+               mhc_start_t: Optional[int] = None, sampler: str = "ddim",
+               n_steps: int = 25, clip: float = 4.0, mhc_from_truth: bool = False):
         """Generate the complex. Peptide starts from noise; the MHC starts from a
-        same-length real template (point #2) treated as a partial-noise state
-        (``mhc_start_t``), else from noise."""
+        same-length real template, or (``mhc_from_truth``, used by the structural
+        eval) from its own ground-truth coords, else from noise."""
         batch, pep = data.batch, data.pep
         x_init = center(torch.randn_like(data.pos), batch)
-        if template_pool is not None:
+        if mhc_from_truth:                               # eval: place peptide given true MHC
+            mhc = data.pep < 0.5
+            x_init[mhc] = data.pos[mhc] / COORD_SCALE
+            x_init = center(x_init, batch)
+        elif template_pool is not None:
             ptr = data.ptr                                # graph node boundaries
             for g in range(int(batch.max()) + 1):
                 n_mhc = int(data.n_mhc[g]) if torch.is_tensor(data.n_mhc) \
@@ -105,8 +120,11 @@ class MHCDiff(nn.Module):
             h0 = self.denoiser.node_features(data, t_frac=t.float() / self.T)
             return self.denoiser(xt, h0, data)[0]
 
-        x = self.diff.sample(eps_fn, x_init, batch, pep,
-                             start_t=mhc_start_t)
+        if sampler == "ddim":
+            x = self.diff.ddim_sample(eps_fn, x_init, batch, pep, n_steps=n_steps,
+                                      clip=clip, start_t=mhc_start_t)
+        else:                                            # legacy ancestral DDPM
+            x = self.diff.sample(eps_fn, x_init, batch, pep, start_t=mhc_start_t)
         return x * COORD_SCALE
 
 

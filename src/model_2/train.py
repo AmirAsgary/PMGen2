@@ -16,29 +16,48 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import model as M                                       # noqa: E402
 
+
+def setup_distributed():
+    """Read torchrun/SLURM env. Returns (distributed, rank, local_rank, world)."""
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if world > 1:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        return True, rank, local_rank, world
+    return False, 0, 0, 1
+
 _COLS = ["wall_time", "split", "epoch", "step", "lr", "total",
-         "pep_coord", "mhc_coord", "torsion", "plddt"]
+         "pep_coord", "mhc_coord", "torsion", "plddt", "pep_plddt",
+         "pep_ca_rmsd", "mhc_ca_rmsd"]
 
 
-def _csv_init(p: Path):
-    if not p.exists():
-        p.write_text(",".join(_COLS) + "\n")
+def _csv_cols(p: Path):
+    """Use an existing file's header (so a resumed run stays aligned), else create
+    one with the current schema. Returns the column list to write."""
+    if p.exists():
+        return p.read_text().splitlines()[0].split(",")
+    p.write_text(",".join(_COLS) + "\n")
+    return list(_COLS)
 
 
-def _csv_row(p: Path, **kw):
+def _csv_row(p: Path, cols, **kw):
     with open(p, "a") as f:
         f.write(",".join("" if kw.get(c) is None else f"{kw.get(c)}"
-                         for c in _COLS) + "\n")
+                         for c in cols) + "\n")
 
 
 @torch.no_grad()
@@ -56,6 +75,42 @@ def evaluate(net, loader, device, lambdas, max_batches=None):
             break
     net.train()
     return {k: v / max(n, 1) for k, v in agg.items()}
+
+
+def _superpose_on(p, t, align, evalm):
+    """RMSD over evalm points after Kabsch-aligning on the align points."""
+    pa, ta = p[align], t[align]
+    mp, mt = pa.mean(0), ta.mean(0)
+    u, _, vt = torch.linalg.svd((pa - mp).T @ (ta - mt))
+    d = torch.sign(torch.linalg.det(vt.T @ u.T))
+    rot = vt.T @ torch.diag(torch.tensor([1., 1., d], device=p.device)) @ u.T
+    return float((((p[evalm] - mp) @ rot.T - (t[evalm] - mt)) ** 2).sum(-1).mean().sqrt())
+
+
+@torch.no_grad()
+def sample_rmsd(core, loader, device, n_steps=25, max_graphs=64):
+    """Structural eval: DDIM-sample (MHC from its true coords, peptide from noise)
+    and report peptide/MHC Cα-RMSD — the number directly comparable to model_1.
+    Peptide aligned on the MHC."""
+    core.eval()
+    peps, mhcs, seen = [], [], 0
+    for data in loader:
+        data = data.to(device)
+        pred = core.sample(data, sampler="ddim", n_steps=n_steps, mhc_from_truth=True)
+        for g in range(data.num_graphs):
+            m = data.batch == g
+            p, t, pep = pred[m], data.pos[m], data.pep[m].bool()
+            if not torch.isfinite(p).all():
+                continue
+            peps.append(_superpose_on(p, t, ~pep, pep))
+            mhcs.append(_superpose_on(p, t, ~pep, ~pep))
+        seen += data.num_graphs
+        if seen >= max_graphs:
+            break
+    core.train()
+    import numpy as np
+    return ({"pep_ca_rmsd": float(np.median(peps)), "mhc_ca_rmsd": float(np.median(mhcs)),
+             "n": len(peps)} if peps else {})
 
 
 def main(argv=None):
@@ -91,87 +146,118 @@ def main(argv=None):
     p.add_argument("--run-name", default=None)
     p.add_argument("--resume", default=None)
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--sample-eval-every", type=int, default=5,
+                   help="every N epochs, DDIM-sample val complexes and report "
+                        "peptide/MHC Cα-RMSD (comparable to model_1); 0=off")
     p.add_argument("--device", default=None)
     args = p.parse_args(argv)
 
-    torch.manual_seed(args.seed)
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    distributed, rank, local_rank, world = setup_distributed()
+    is_main = rank == 0
+    torch.manual_seed(args.seed + rank)        # different diffusion noise per rank
+    device = (f"cuda:{local_rank}" if distributed
+              else args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     lambdas = tuple(args.lambdas)
 
-    train_loader, val_loader = M.build_loaders(
+    train_loader, val_loader, train_sampler = M.build_loaders(
         args.h5_dir, args.scheme, args.fold, args.bs, args.num_workers,
-        dummy=args.dummy)
-    net = M.MHCDiff(T=args.timesteps, mhc_scale=args.mhc_scale, h_dim=args.hidden,
-                    n_layers=args.layers, k=args.k, use_cross=not args.no_cross,
-                    device=device)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
+        dummy=args.dummy, rank=rank, world_size=world)
+
+    core = M.MHCDiff(T=args.timesteps, mhc_scale=args.mhc_scale, h_dim=args.hidden,
+                     n_layers=args.layers, k=args.k, use_cross=not args.no_cross,
+                     device=device)
+    opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=1e-4)
     steps_per_epoch = max(1, len(train_loader))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=steps_per_epoch * args.epochs)
     scaler = torch.amp.GradScaler(device="cuda", enabled=args.amp)
 
-    run = args.run_name or f"mhcdiff_{args.scheme}_fold{args.fold}"
-    run_dir = Path(args.ckpt_dir) / run
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cfg = {**vars(args), "lambdas": lambdas, "device": str(device),
-           "params": sum(p.numel() for p in net.parameters()),
-           "n_train": len(train_loader.dataset), "created": time.ctime()}
-    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
-    csv = run_dir / "metrics.csv"
-    _csv_init(csv)
-
     start_epoch, best = 1, float("inf")
     if args.resume and Path(args.resume).exists():
         try:
             ck = torch.load(args.resume, map_location=device, weights_only=False)
-            net.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+            core.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
             sched.load_state_dict(ck["sched"]); scaler.load_state_dict(ck["scaler"])
             start_epoch, best = ck["epoch"] + 1, ck.get("best", float("inf"))
-            print(f"[m2] resumed at epoch {start_epoch} (best {best:.3f})")
+            if is_main:
+                print(f"[m2] resumed at epoch {start_epoch} (best {best:.3f})")
         except Exception as e:
-            print(f"[m2] WARNING bad checkpoint ({e}); starting fresh")
+            if is_main:
+                print(f"[m2] WARNING bad checkpoint ({e}); starting fresh")
 
-    print(f"[m2] run={run} device={device} train={len(train_loader.dataset)} "
-          f"params={cfg['params']} T={args.timesteps} k={args.k} "
-          f"layers={args.layers} cross={not args.no_cross} lambdas={lambdas}")
-    dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    # DDP wraps AFTER resume so the loaded weights are broadcast to all ranks.
+    net = DDP(core, device_ids=[local_rank], find_unused_parameters=True) \
+        if distributed else core
+
+    run = args.run_name or f"mhcdiff_{args.scheme}_fold{args.fold}"
+    run_dir = Path(args.ckpt_dir) / run
+    cfg = {**vars(args), "lambdas": lambdas, "device": str(device), "world": world,
+           "params": sum(p.numel() for p in core.parameters()),
+           "n_train": len(train_loader.dataset), "created": time.ctime()}
+    csv = run_dir / "metrics.csv"
+    csv_cols = list(_COLS)
+    if is_main:                                # only rank 0 writes config/logs/ckpts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
+        csv_cols = _csv_cols(csv)
+        print(f"[m2] run={run} device={device} world={world} "
+              f"train={len(train_loader.dataset)} params={cfg['params']} "
+              f"T={args.timesteps} k={args.k} layers={args.layers} "
+              f"cross={not args.no_cross} lambdas={lambdas}")
+
+    dev_type = "cuda"
     for epoch in range(start_epoch, args.epochs + 1):
+        if distributed:
+            train_sampler.set_epoch(epoch)     # reshuffle shards each epoch
         net.train()
         t0 = time.perf_counter()
         for i, data in enumerate(train_loader, 1):
             data = data.to(device)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev_type, enabled=args.amp):
-                total, terms = net.compute_loss(data, lambdas)
+                total, terms = net(data, lambdas)        # DDP forward -> compute_loss
             scaler.scale(total).backward()
             if args.grad_clip:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(core.parameters(), args.grad_clip)
             scaler.step(opt); scaler.update(); sched.step()
-            if args.log_every and i % args.log_every == 0:
+            if is_main and args.log_every and i % args.log_every == 0:
                 rate = i / (time.perf_counter() - t0)
                 lr = opt.param_groups[0]["lr"]
                 print(f"[m2] epoch {epoch} step {i}/{steps_per_epoch} | "
                       f"total {terms['total']:.3f} pep {terms['pep_coord']:.3f} "
-                      f"mhc {terms['mhc_coord']:.3f} plddt {terms['plddt']:.2f} "
-                      f"| lr {lr:.2e} | {rate:.1f} it/s")
-                _csv_row(csv, wall_time=time.time(), split="train", epoch=epoch,
+                      f"mhc {terms['mhc_coord']:.3f} plddt {terms['plddt']:.3f} "
+                      f"pep_plddt {terms['pep_plddt']:.3f} | lr {lr:.2e} "
+                      f"| {rate:.1f} it/s")
+                _csv_row(csv, csv_cols, wall_time=time.time(), split="train", epoch=epoch,
                          step=i, lr=lr, **terms)
-        ev = evaluate(net, val_loader, device, lambdas)
-        _csv_row(csv, wall_time=time.time(), split="val", epoch=epoch, **ev)
-        print(f"[m2] epoch {epoch:3d} | val total {ev['total']:.3f} "
-              f"pep {ev['pep_coord']:.3f} mhc {ev['mhc_coord']:.3f} "
-              f"plddt {ev['plddt']:.2f}")
-        state = {"epoch": epoch, "model": net.state_dict(), "opt": opt.state_dict(),
-                 "sched": sched.state_dict(), "scaler": scaler.state_dict(),
-                 "best": best, "config": cfg}
-        tmp = run_dir / "last.pt.tmp"
-        torch.save(state, tmp); tmp.replace(run_dir / "last.pt")
-        if ev["total"] < best:
-            best = ev["total"]
-            torch.save({"epoch": epoch, "model": net.state_dict(), "val": ev,
-                        "config": cfg}, run_dir / "best.pt")
-            print(f"[m2]   new best val total {best:.3f} -> best.pt")
+        # evaluate + checkpoint on rank 0 only; other ranks wait
+        if is_main:
+            ev = evaluate(core, val_loader, device, lambdas)
+            # periodic STRUCTURAL eval (the real, model_1-comparable number)
+            if args.sample_eval_every and epoch % args.sample_eval_every == 0:
+                ev.update(sample_rmsd(core, val_loader, device))
+            _csv_row(csv, csv_cols, wall_time=time.time(), split="val", epoch=epoch, **ev)
+            print(f"[m2] epoch {epoch:3d} | val total {ev['total']:.3f} "
+                  f"pep {ev['pep_coord']:.3f} mhc {ev['mhc_coord']:.3f} "
+                  f"plddt {ev['plddt']:.3f} pep_plddt {ev['pep_plddt']:.3f}"
+                  + (f" | SAMPLED pep-RMSD {ev['pep_ca_rmsd']:.2f}Å "
+                     f"mhc-RMSD {ev['mhc_ca_rmsd']:.2f}Å (n={ev['n']})"
+                     if 'pep_ca_rmsd' in ev else ""))
+            state = {"epoch": epoch, "model": core.state_dict(),
+                     "opt": opt.state_dict(), "sched": sched.state_dict(),
+                     "scaler": scaler.state_dict(), "best": best, "config": cfg}
+            tmp = run_dir / "last.pt.tmp"
+            torch.save(state, tmp); tmp.replace(run_dir / "last.pt")
+            if ev["total"] < best:
+                best = ev["total"]
+                torch.save({"epoch": epoch, "model": core.state_dict(), "val": ev,
+                            "config": cfg}, run_dir / "best.pt")
+                print(f"[m2]   new best val total {best:.3f} -> best.pt")
+        if distributed:
+            dist.barrier()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

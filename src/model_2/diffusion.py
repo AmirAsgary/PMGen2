@@ -74,12 +74,38 @@ class DifferentialDiffusion:
 
     @torch.no_grad()
     def sample(self, eps_fn, x_init, batch, pep, start_t: Optional[int] = None):
-        """Reverse process. ``x_init`` is the starting coords (noise, or a template
-        for the MHC); ``start_t`` lets the MHC begin at a partial-noise step."""
+        """Ancestral DDPM reverse process (stochastic, all T steps). Kept for
+        reference; ``ddim_sample`` is the default — faster and far more stable."""
         x = center(x_init, batch)
         t0 = (self.T - 1) if start_t is None else min(start_t, self.T - 1)
         for ti in range(t0, -1, -1):
             t = torch.full((int(batch.max()) + 1,), ti, device=x.device,
                            dtype=torch.long)
             x = self.p_sample_step(eps_fn, x, t, batch, pep)
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(self, eps_fn, x_init, batch, pep, n_steps: int = 25,
+                    clip: float = 4.0, start_t: Optional[int] = None):
+        """Deterministic DDIM (eta=0) over a strided ``n_steps`` schedule, with
+        per-step **x0-clipping** (dynamic-thresholding style) — this is what tames
+        the divergence the ancestral sampler showed. ``clip`` is in normalized
+        (÷COORD_SCALE, CoM-centred) units; ~4 ≈ ±60 Å. ``n_steps`` ~10-25 is enough
+        and ~T/n_steps faster than full DDPM."""
+        T = self.T
+        t0 = (T - 1) if start_t is None else min(start_t, T - 1)
+        ts = torch.linspace(t0, 0, n_steps + 1).round().long().to(x_init.device)
+        B = int(batch.max()) + 1
+        x = center(x_init, batch)
+        for i in range(n_steps):
+            tb = torch.full((B,), int(ts[i]), device=x.device, dtype=torch.long)
+            tp = torch.full((B,), int(ts[i + 1]), device=x.device, dtype=torch.long)
+            eps = eps_fn(x, tb)
+            acp_t = self._node_acp(tb, batch, pep)
+            acp_p = self._node_acp(tp, batch, pep)
+            x0 = (x - (1 - acp_t).clamp_min(0).sqrt() * eps) / acp_t.sqrt().clamp_min(1e-4)
+            if clip:
+                x0 = x0.clamp(-clip, clip)
+            x0 = center(x0, batch)
+            x = center(acp_p.sqrt() * x0 + (1 - acp_p).clamp_min(0).sqrt() * eps, batch)
         return x

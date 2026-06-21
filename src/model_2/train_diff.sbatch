@@ -46,12 +46,18 @@ mamba activate pmgen2
 H5=data/processed/h5_store_sc        # the SIDE-CHAIN store (has teacher_chi)
 [[ -f "$H5/index.csv" ]] || { echo "FATAL: $H5/index.csv not found (reprocess first)"; exit 1; }
 
-$PY src/model_2/train.py \
+# Multi-GPU via DistributedDataParallel: one process per GPU on this node.
+# BS is PER-GPU (effective batch = BS x #GPUs); each rank gets a data shard so the
+# epoch is ~#GPUs times faster. num-workers is per rank -> keep <= cpus/#GPUs.
+NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); NGPU=${NGPU:-1}
+echo "launching on ${NGPU} GPU(s) via torchrun"
+$PY -m torch.distributed.run --standalone --nproc_per_node=${NGPU} \
+    src/model_2/train.py \
     --h5-dir "$H5" --scheme "$SCHEME" --fold "$FOLD" \
     --ckpt-dir checkpoints_model2 --run-name "$RUN" \
     --resume "checkpoints_model2/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --layers ${LAYERS} --k ${K} \
     --lambdas 1.0 0.25 0.5 0.1 \
-    --num-workers 8 --amp
+    --num-workers 4 --amp
 
 exit $?

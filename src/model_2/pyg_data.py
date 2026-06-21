@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader as PyGLoader
 
@@ -65,18 +66,29 @@ class H5GraphDataset(Dataset):
         return example_to_data(self.base[i])
 
 
-def build_loaders(h5_dir, scheme, fold, bs, num_workers, dummy=False):
+def build_loaders(h5_dir, scheme, fold, bs, num_workers, dummy=False,
+                  rank=0, world_size=1):
+    """Returns (train_loader, val_loader, train_sampler). When ``world_size>1`` the
+    train loader uses a DistributedSampler (each rank gets a disjoint shard for DDP);
+    ``train_sampler`` is None otherwise. Val runs on rank 0 only (no sharding)."""
     if dummy:
         train = m1.build_dataset(scheme, fold, "train", dummy=True)
         val = m1.build_dataset(scheme, fold, "val", dummy=True)
     else:
         train = m1.build_h5_dataset(h5_dir, scheme, fold, "train")
         val = m1.build_h5_dataset(h5_dir, scheme, fold, "val")
-    tl = PyGLoader(H5GraphDataset(train), batch_size=bs, shuffle=True,
-                   num_workers=num_workers)
+    train_ds = H5GraphDataset(train)
+    if world_size > 1:
+        sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank,
+                                     shuffle=True, drop_last=True)
+        tl = PyGLoader(train_ds, batch_size=bs, sampler=sampler,
+                       num_workers=num_workers)
+    else:
+        sampler = None
+        tl = PyGLoader(train_ds, batch_size=bs, shuffle=True, num_workers=num_workers)
     vl = PyGLoader(H5GraphDataset(val), batch_size=bs, shuffle=False,
                    num_workers=num_workers)
-    return tl, vl
+    return tl, vl, sampler
 
 
 class MHCTemplatePool:
