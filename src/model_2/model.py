@@ -28,12 +28,16 @@ COORD_SCALE = 15.0
 
 
 def _groove_terms_pyg(pos_t, pos_p, ptr, pep, tau_mid=8.0, s_buried=1.5,
-                      tau_out=8.0, tau_far=18.0):
+                      tau_out=8.0, tau_far=18.0, rel=None):
     """Groove-membership geometry on flat PyG coords (Å). Per graph, from per-peptide
     nearest-MHC Cα distance: returns buried[ΣN] (soft 1-in-pocket from the TEACHER,
     gates the peptide coord loss) and a soft-band containment on the PREDICTED coords
     (out-of-pocket peptides pushed into a [tau_out, tau_far] Å shell). Grad flows only
-    through pos_p; the label is detached."""
+    through pos_p; the label is detached. ``rel`` (per-node, in [0,1]) optionally
+    down-weights residues whose predicted coords are unreliable (high-noise steps).
+    Geometry is done in fp32 (AMP-safe)."""
+    pos_t = pos_t.float()
+    pos_p = pos_p.float()
     dev = pos_t.device
     buried = pos_t.new_zeros(pos_t.shape[0])
     cnum = pos_p.new_zeros(())
@@ -52,8 +56,9 @@ def _groove_terms_pyg(pos_t, pos_p, ptr, pep, tau_mid=8.0, s_buried=1.5,
         buried[idx] = bur
         nnd_p = torch.cdist(pos_p[a:b][pe], pos_p[a:b][me]).min(-1).values
         band = F.relu(tau_out - nnd_p) ** 2 + F.relu(nnd_p - tau_far) ** 2
-        cnum = cnum + ((1.0 - bur) * band).sum()
-        cden = cden + (1.0 - bur).sum()
+        wout = (1.0 - bur) if rel is None else (1.0 - bur) * rel[idx].float()
+        cnum = cnum + (wout * band).sum()
+        cden = cden + wout.sum()
     return buried, cnum / cden.clamp_min(1.0)
 
 
@@ -101,11 +106,17 @@ class MHCDiff(nn.Module):
         if self.groove_aware:
             # gate the peptide ε-loss by groove-membership (only dock in-pocket
             # residues) and add containment on the reconstructed x̂0 (expel the rest).
-            acp = self.diff._node_acp(t, batch, pep)
+            acp = self.diff._node_acp(t, batch, pep)              # ᾱ_t per node [ΣN,1]
+            # x̂0 = (xt − √(1−ᾱ)·ε̂)/√ᾱ. At high noise √ᾱ→0 sends x̂0 to ~1e4 and NaNs
+            # the squared-distance loss, so clamp √ᾱ and bound x̂0 to the physical
+            # range (same idea as the sampler clip). `rel`=ᾱ_t down-weights the
+            # high-noise steps where x̂0 is meaningless anyway.
             x0_pred = (xt - (1 - acp).clamp_min(0).sqrt() * eps_hat) \
-                / acp.sqrt().clamp_min(1e-4)
+                / acp.sqrt().clamp_min(1e-2)
+            x0_pred = x0_pred.clamp(-4.0, 4.0)
             buried, contain = _groove_terms_pyg(
-                data.pos, x0_pred * COORD_SCALE, data.ptr, pep, *self.groove)
+                data.pos, x0_pred * COORD_SCALE, data.ptr, pep, *self.groove,
+                rel=acp.squeeze(-1))
             pep_w = pep * buried
             pep_coord = (se * pep_w).sum() / pep_w.sum().clamp_min(1.0)
         else:

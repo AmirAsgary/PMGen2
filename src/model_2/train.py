@@ -185,11 +185,22 @@ def main(argv=None):
     if args.resume and Path(args.resume).exists():
         try:
             ck = torch.load(args.resume, map_location=device, weights_only=False)
-            core.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
-            sched.load_state_dict(ck["sched"]); scaler.load_state_dict(ck["scaler"])
-            start_epoch, best = ck["epoch"] + 1, ck.get("best", float("inf"))
+            core.load_state_dict(ck["model"])
+            # reject NaN/Inf weights (e.g. a checkpoint written after a divergence) —
+            # better to fall back than to resume a poisoned model.
+            if not all(torch.isfinite(p).all() for p in core.parameters()):
+                raise ValueError("resumed weights contain NaN/Inf")
+            # optimizer / scheduler / scaler are OPTIONAL: a model-only checkpoint
+            # (e.g. best.pt, used to recover from a NaN run) reinitialises them.
+            have_opt = all(k in ck for k in ("opt", "sched", "scaler"))
+            if have_opt:
+                opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
+                scaler.load_state_dict(ck["scaler"])
+            start_epoch, best = ck.get("epoch", 0) + 1, ck.get("best", float("inf"))
             if is_main:
-                print(f"[m2] resumed at epoch {start_epoch} (best {best:.3f})")
+                print(f"[m2] resumed at epoch {start_epoch} "
+                      f"({'full state' if have_opt else 'MODEL ONLY -> fresh optimizer'}"
+                      f", best {best:.3f})")
         except Exception as e:
             if is_main:
                 print(f"[m2] WARNING bad checkpoint ({e}); starting fresh")
