@@ -52,6 +52,18 @@ def _median_nearest(pep_ca: torch.Tensor, mhc_ca: torch.Tensor) -> float:
     return float(d.min(dim=1).values.median())
 
 
+def _superpose_on(p, t, align, evalm) -> float:
+    """RMSD over ``evalm`` points after Kabsch-aligning on the ``align`` points.
+    Inlined (not imported from model_2/train.py) because ``pyg_data`` puts
+    ``src/model`` on sys.path first, so ``import train`` would grab model_1's."""
+    pa, ta = p[align], t[align]
+    mp, mt = pa.mean(0), ta.mean(0)
+    u, _, vt = torch.linalg.svd((pa - mp).T @ (ta - mt))
+    d = torch.sign(torch.linalg.det(vt.T @ u.T))
+    rot = vt.T @ torch.diag(torch.tensor([1., 1., d], device=p.device)) @ u.T
+    return float((((p[evalm] - mp) @ rot.T - (t[evalm] - mt)) ** 2).sum(-1).mean().sqrt())
+
+
 # --------------------------------------------------------------------------- #
 # model_1 (distillation)
 # --------------------------------------------------------------------------- #
@@ -111,7 +123,6 @@ def eval_model2(args, device):
     import model as M
     import pyg_data as PD
     from torch_geometric.loader import DataLoader
-    from train import _superpose_on                    # same-dir helper
 
     cfg = json.loads((Path(args.ckpt).parent / "config.json").read_text())
     net = M.MHCDiff(T=cfg["timesteps"], mhc_scale=cfg["mhc_scale"],
