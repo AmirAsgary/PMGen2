@@ -106,8 +106,13 @@ def eval_model1(args, device):
                 recs.append({
                     "pep_ca_rmsd": float(rmsd),
                     "pep_plddt_med": float(tp.median()),
+                    # ground-truth peptide->nearest-MHC (teacher coords)
                     "pep_nndist_med": _median_nearest(batch["teacher_ca"][b][pm],
                                                        batch["teacher_ca"][b][am]),
+                    # PREDICTED peptide->nearest-MHC (model's own coords): does the
+                    # model put the peptide where THIS target wants it, or always in
+                    # the canonical groove?
+                    "pred_nndist_med": _median_nearest(ca[b][pm], ca[b][am]),
                 })
             seen += ca.shape[0]
             if args.max_graphs and seen >= args.max_graphs:
@@ -154,7 +159,8 @@ def eval_model2(args, device):
                 recs.append({
                     "pep_ca_rmsd": float(rmsd),
                     "pep_plddt_med": float(tp.median()),
-                    "pep_nndist_med": _median_nearest(tt[pe], tt[~pe]),
+                    "pep_nndist_med": _median_nearest(tt[pe], tt[~pe]),   # GT
+                    "pred_nndist_med": _median_nearest(pp[pe], pp[~pe]),  # predicted
                 })
             seen += data.num_graphs
             if args.max_graphs and seen >= args.max_graphs:
@@ -172,6 +178,73 @@ def _strat(df, col, bins, labels):
     return g.agg(n="size", median="median", mean="mean",
                  p25=lambda s: s.quantile(.25),
                  p75=lambda s: s.quantile(.75)).reset_index()
+
+
+def groove_report_plot(df, setting, out_dir: Path, model_tag: str):
+    """Does the model place the peptide where THIS target wants it, or always in the
+    canonical groove? Compare the PREDICTED peptide->nearest-MHC distance against the
+    GROUND-TRUTH distance. Mean-pose collapse => predicted is a narrow band
+    (low std, slope~0 vs GT) regardless of where GT actually is."""
+    import numpy as np
+    gt = df["pep_nndist_med"].to_numpy(float)
+    pr = df["pred_nndist_med"].to_numpy(float)
+    # robust window so diverged samples (huge pred distance) don't dominate stats
+    ok = np.isfinite(pr) & np.isfinite(gt) & (pr < 30) & (gt < 30)
+    gtk, prk = gt[ok], pr[ok]
+    corr = float(np.corrcoef(gtk, prk)[0, 1]) if ok.sum() > 2 else float("nan")
+    slope = float(np.polyfit(gtk, prk, 1)[0]) if ok.sum() > 2 else float("nan")
+    std_ratio = float(prk.std() / (gtk.std() + 1e-9))
+    print(f"\n  --- groove placement (predicted vs GT peptide->nearest-MHC) ---")
+    print(f"    GT   distance: mean {gtk.mean():.2f}  std {gtk.std():.2f} Å")
+    print(f"    pred distance: mean {prk.mean():.2f}  std {prk.std():.2f} Å"
+          f"   ({(~ok).sum()} diverged/clipped of {len(df)})")
+    print(f"    corr(pred, GT) = {corr:+.3f}   (1 = tracks target, 0 = ignores it)")
+    print(f"    regression slope pred~GT = {slope:+.3f}   (1 = adapts, 0 = mean pose)")
+    print(f"    std(pred)/std(GT) = {std_ratio:.3f}   (<<1 = collapsed to a fixed pose)")
+    verdict = ("LIKELY MEAN-POSE COLLAPSE" if (slope < 0.3 or std_ratio < 0.4)
+               else "tracks target geometry" if slope > 0.6
+               else "partially adapts")
+    print(f"    => {verdict}")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+    lim = (min(gtk.min(), prk.min()) - 0.5, max(gtk.max(), prk.max()) + 0.5)
+    ax[0].scatter(gtk, prk, s=8, alpha=0.25, color="#4C72B0")
+    ax[0].plot(lim, lim, "k--", lw=1, label="y=x (perfect)")
+    xs = np.linspace(*lim, 50)
+    ax[0].plot(xs, np.polyval(np.polyfit(gtk, prk, 1), xs), color="#C44E52",
+               lw=1.6, label=f"fit (slope {slope:.2f})")
+    ax[0].axhline(prk.mean(), color="#999", ls=":", lw=1,
+                  label=f"pred mean {prk.mean():.1f} Å")
+    ax[0].set(xlim=lim, ylim=lim, xlabel="GROUND-TRUTH peptide nearest-MHC (Å)",
+              ylabel="PREDICTED peptide nearest-MHC (Å)",
+              title=f"placement vs target  (corr {corr:+.2f})")
+    ax[0].legend(fontsize=8)
+    ax[0].grid(alpha=0.25)
+
+    ax[1].hist(gtk, bins=40, range=(3, 14), alpha=0.55, color="#55A868",
+               density=True, label=f"ground truth (std {gtk.std():.2f})")
+    ax[1].hist(prk, bins=40, range=(3, 14), alpha=0.55, color="#C44E52",
+               density=True, label=f"predicted (std {prk.std():.2f})")
+    ax[1].set(xlabel="peptide nearest-MHC (Å)", ylabel="density",
+              title="distance distributions")
+    ax[1].legend(fontsize=8)
+
+    resid = prk - gtk
+    ax[2].scatter(gtk, resid, s=8, alpha=0.25, color="#8172B3")
+    ax[2].axhline(0, color="k", lw=1)
+    ax[2].set(xlabel="GROUND-TRUTH nearest-MHC (Å)",
+              ylabel="predicted − GT (Å)",
+              title="residual (negative = pulled toward groove)")
+    ax[2].grid(alpha=0.25)
+    fig.suptitle(f"{model_tag} — groove placement ({setting}, n={int(ok.sum()):,}) "
+                 f"| {verdict}", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_dir / "groove_placement.png", dpi=140)
+    plt.close(fig)
+    print(f"    [plot] wrote {out_dir/'groove_placement.png'}")
 
 
 def report_plot(recs, setting, out_dir: Path, model_tag: str):
@@ -198,6 +271,9 @@ def report_plot(recs, setting, out_dir: Path, model_tag: str):
     for _, r in sN.iterrows():
         print(f"    {str(r['pep_nndist_med']):<7} n={int(r['n']):>5}  "
               f"median RMSD {r['median']:.2f} Å")
+
+    if "pred_nndist_med" in df.columns:
+        groove_report_plot(df, setting, out_dir, model_tag)
 
     import matplotlib
     matplotlib.use("Agg")

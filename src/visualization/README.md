@@ -82,6 +82,25 @@ $PY src/visualization/plot_overview.py \
   stratified by HLA cluster.
 - `check_test_pdb_distance.py` — the same proximity metric on the `data/test` PDBs
   (AF predictions), overlaid on the H5-store distribution.
-- `eval_stratified.py` — runs a trained model (`--model 1|2`) on val and stratifies
-  peptide Cα-RMSD by teacher peptide pLDDT and peptide nearest-MHC distance, to show
-  whether poor predictions track poor *data*.
+- `eval_stratified.py` — runs a trained model (`--model 1|2`) on val and produces:
+  - `stratified.png` — peptide Cα-RMSD binned by teacher peptide pLDDT and by peptide
+    nearest-MHC distance (does poor prediction track poor *data*?).
+  - `groove_placement.png` — **predicted** vs **ground-truth** peptide→nearest-MHC
+    distance. This separates "model predicts the right pose" from "model dumps every
+    peptide in the canonical groove": a mean-pose collapse shows up as a narrow
+    predicted-distance band (slope≈0, std(pred)/std(GT)≪1) regardless of the target.
+
+## `run_stratified_eval.sh` — drive both models, locally or on Raven
+
+Runs `eval_stratified.py` for model_1 and model_2 (stratified + groove analyses).
+
+```bash
+bash src/visualization/run_stratified_eval.sh            # run now, locally
+bash src/visualization/run_stratified_eval.sh --submit   # submit one Raven GPU job
+```
+
+Everything is env-overridable: `MODELS` (`"1 2"`), `MHC_INIT` (`template|truth|noise`),
+`MAX_GRAPHS`, `FOLD`, `CKPT_M1`/`CKPT_M2`, `H5_M1`/`H5_M2`, `N_STEPS`, `OUT_ROOT`.
+Pass-through flags after the script go to `eval_stratified.py`. With `--submit` the
+script re-`sbatch`es itself (A100, 4 h); without it, it runs in the foreground using
+`PY` (default `python3`).
