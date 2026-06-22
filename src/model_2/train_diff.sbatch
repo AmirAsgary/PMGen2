@@ -27,6 +27,15 @@ EPOCHS=60
 LAYERS=6
 K=12
 
+# Groove-aware loss: dock IN-pocket peptides, expel OUT-of-pocket ones to a [tau_out,
+# tau_far] Å shell (containment), keep learning pLDDT on all. Loss-only (no new
+# params) -> resumes the current checkpoint in place.
+GROOVE_AWARE=1                   # 1 = on
+LAMBDA_CONTAIN=0.5
+GROOVE="8.0 1.5 8.0 18.0"        # tau_mid  s  tau_out  tau_far  (Å)
+GROOVE_FLAG=""
+[[ "${GROOVE_AWARE}" == "1" ]] && GROOVE_FLAG="--groove-aware --lambda-contain ${LAMBDA_CONTAIN} --groove ${GROOVE}"
+
 RUN="mhcdiff_${SCHEME}_fold${FOLD}"
 DATE=$(date +%Y%m%d_%H%M%S)
 mkdir -p logs/diff "checkpoints_model2/${RUN}"
@@ -58,6 +67,7 @@ $PY -m torch.distributed.run --standalone --nproc_per_node=${NGPU} \
     --resume "checkpoints_model2/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} --layers ${LAYERS} --k ${K} \
     --lambdas 1.0 0.25 0.5 0.1 \
+    ${GROOVE_FLAG} \
     --num-workers 4 --amp
 
 exit $?

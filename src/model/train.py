@@ -80,6 +80,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--plddt-weight-floor", type=float, default=0.1,
                    help="lower bound on the per-example pLDDT weight (keeps the "
                         "weakest examples from vanishing entirely)")
+    p.add_argument("--groove-aware", action="store_true",
+                   help="gate the exact FAPE by teacher groove-membership and add a "
+                        "soft-band containment: dock in-pocket peptides, expel "
+                        "out-of-pocket ones to a shell, learn pLDDT on all "
+                        "(loss-only; resume-safe)")
+    p.add_argument("--lambda-contain", type=float, default=0.5,
+                   help="weight of the containment term (groove-aware)")
+    p.add_argument("--groove", type=float, nargs=4,
+                   default=(8.0, 1.5, 8.0, 18.0),
+                   metavar=("TAU_MID", "S", "TAU_OUT", "TAU_FAR"),
+                   help="in/out boundary, sigmoid width, and containment band (Å)")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
@@ -136,6 +147,8 @@ def main(argv=None) -> None:
         anchor_relpos=args.anchor_relpos,
         plddt_weight_struct=args.plddt_weight_struct,
         plddt_weight_floor=args.plddt_weight_floor,
+        groove_aware=args.groove_aware, lambda_contain=args.lambda_contain,
+        groove=tuple(args.groove),
     )
 
 

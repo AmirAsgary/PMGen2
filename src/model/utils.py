@@ -731,6 +731,32 @@ def _backbone_fape_per_example(backbone_rigid_tensor, backbone_rigid_mask, traj,
     return fape.reshape(-1, B).mean(0)                    # mean over blocks -> [B]
 
 
+def _groove_terms(ca_teacher, ca_pred, pep, seq_mask, tau_mid=8.0, s_buried=1.5,
+                  tau_out=8.0, tau_far=18.0):
+    """Groove-membership geometry for the peptide, from per-residue nearest-MHC Cα
+    distance (Å). Returns (buried[B,N], wout[B,N], contain):
+      buried = soft 1-in-pocket / 0-outside (from the TEACHER) -> gates the exact
+               structural (FAPE) loss so we only dock the in-pocket residues;
+      wout   = (1-buried) on the peptide -> weights the containment;
+      contain= soft-band containment on the PREDICTED structure: out-of-pocket
+               residues are pushed into a [tau_out, tau_far] Å shell from the MHC
+               (outside the groove, but not flown away). Direction-free."""
+    INF = 1e9
+    mhc_col = (seq_mask.bool() & ~pep.bool()).float()[:, None, :]       # [B,1,N]
+    pepf = (pep.bool() & seq_mask.bool()).float()                      # [B,N]
+    with torch.no_grad():                                              # label: no grad
+        dt = torch.cdist(ca_teacher, ca_teacher) + (1.0 - mhc_col) * INF
+        nnd_t = dt.min(-1).values                                     # teacher nearest-MHC
+        bur_raw = torch.sigmoid((tau_mid - nnd_t) / s_buried)         # ~1 if close
+    buried = bur_raw * pepf
+    wout = (1.0 - bur_raw) * pepf
+    dp = torch.cdist(ca_pred, ca_pred) + (1.0 - mhc_col) * INF        # predicted (grad)
+    nnd_p = dp.min(-1).values
+    band = F.relu(tau_out - nnd_p) ** 2 + F.relu(nnd_p - tau_far) ** 2
+    contain = (wout * band).sum() / wout.sum().clamp_min(1.0)
+    return buried, wout, contain
+
+
 class DistillLoss(nn.Module):
     """L = λ_fape·FAPE + λ_plddt·CE(plddt, bin50) + λ_pae·CE(pae, bin64).
 
@@ -743,7 +769,8 @@ class DistillLoss(nn.Module):
                  lambda_pae: float = 0.1, model_name: str = "model_2_ptm",
                  fape_clamp: Optional[float] = None, fape_unit: float = 10.0,
                  peptide_weight: float = 5.0, plddt_weight_struct: bool = False,
-                 plddt_weight_floor: float = 0.1):
+                 plddt_weight_floor: float = 0.1, groove_aware: bool = False,
+                 lambda_contain: float = 0.5, groove=(8.0, 1.5, 8.0, 18.0)):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
@@ -760,6 +787,13 @@ class DistillLoss(nn.Module):
         self.peptide_weight = float(peptide_weight)
         self.plddt_weight_struct = bool(plddt_weight_struct)
         self.plddt_weight_floor = float(plddt_weight_floor)
+        # groove_aware: gate the exact FAPE by teacher groove-membership and add a
+        # soft-band containment so out-of-pocket peptides are pushed outside (not
+        # docked) — the model learns to DOCK binders and EXPEL non-binders, while
+        # pLDDT (still trained on every peptide residue) flags the non-binders.
+        self.groove_aware = bool(groove_aware)
+        self.lambda_contain = float(lambda_contain)
+        self.groove = tuple(groove)              # (tau_mid, s_buried, tau_out, tau_far)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -785,6 +819,19 @@ class DistillLoss(nn.Module):
             fape_pair = (1.0 + (w - 1.0) * pep)[:, None, :]               # weight pos j
         else:
             res_w, pair_w, fape_pair = seq_mask, pair_mask, None
+
+        # groove-aware: replace the uniform peptide FAPE weight with a buried-gated
+        # one (in-pocket peptide -> full structural weight; out-of-pocket -> ~0) and
+        # compute the containment term. res_w/pair_w (pLDDT/PAE) are left covering all
+        # peptide residues so confidence is still learned for the expelled ones.
+        contain = ca.new_zeros(())
+        buried_mean = ca.new_zeros(())
+        if self.groove_aware:
+            buried, wout, contain = _groove_terms(
+                batch["teacher_ca"], ca, pep, seq_mask, *self.groove)
+            mhc_valid = (seq_mask.bool() & ~pep.bool()).float()           # [B,N]
+            fape_pair = (mhc_valid + w * buried)[:, None, :]              # weight pos j
+            buried_mean = buried.sum() / pep.sum().clamp_min(1.0)
 
         bb_tensor, bb_mask = _build_gt_backbone_frames(
             batch["aatype"], batch["teacher_bb"], seq_mask)
@@ -814,6 +861,8 @@ class DistillLoss(nn.Module):
         ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
         ce_pae = _masked_ce(pae_logits, pae_bins, pair_w)
         total = self.l_fape * fape + self.l_plddt * ce_plddt + self.l_pae * ce_pae
+        if self.groove_aware:
+            total = total + self.lambda_contain * contain
 
         # peptide-ONLY loss values, every step (observation; not in `total`).
         with torch.no_grad():
@@ -825,6 +874,9 @@ class DistillLoss(nn.Module):
                  "plddt_ce": ce_plddt.detach(), "pae_ce": ce_pae.detach(),
                  "pep_fape": pep_fape.detach(), "pep_plddt_ce": pep_plddt_ce.detach(),
                  "pep_pae_ce": pep_pae_ce.detach()}
+        if self.groove_aware:
+            terms["contain"] = contain.detach()
+            terms["buried_frac"] = buried_mean.detach()
         return total, terms
 
 
@@ -965,7 +1017,8 @@ _METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
                 "total", "fape", "plddt_ce", "pae_ce",
                 "pep_fape", "pep_plddt_ce", "pep_pae_ce",
                 "ca_rmsd", "plddt_spearman", "pae_mae",
-                "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae", "it_per_s"]
+                "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae",
+                "contain", "buried_frac", "it_per_s"]
 
 
 class MetricLogger:
@@ -1116,8 +1169,11 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     f"pae {means.get('pae_ce', 0):.3f} | pep: "
                     f"fape {means.get('pep_fape', 0):.3f} "
                     f"plddt {means.get('pep_plddt_ce', 0):.3f} "
-                    f"pae {means.get('pep_pae_ce', 0):.3f} | "
-                    f"lr {lr:.2e} | {rate:.1f} it/s")
+                    f"pae {means.get('pep_pae_ce', 0):.3f}"
+                    + (f" | contain {means.get('contain', 0):.3f} "
+                       f"buried {means.get('buried_frac', 0):.2f}"
+                       if 'contain' in means else "")
+                    + f" | lr {lr:.2e} | {rate:.1f} it/s")
             if mlog is not None:
                 mlog.log("train", epoch, global_step, lr, means, it_per_s=rate)
             wagg.clear()
@@ -1170,7 +1226,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                  unfreeze_sm: float = 0.0, unfreeze_plddt: float = 0.0,
                  unfreeze_pae: float = 0.0, anchor_relpos: bool = False,
                  plddt_weight_struct: bool = False,
-                 plddt_weight_floor: float = 0.1, log=print):
+                 plddt_weight_floor: float = 0.1, groove_aware: bool = False,
+                 lambda_contain: float = 0.5,
+                 groove=(8.0, 1.5, 8.0, 18.0), log=print):
     """Full single-GPU training loop (DDP-ready: pass a sampler via make_dataloader
     and wrap the encoder in DDP externally). Returns (history, model).
 
@@ -1203,7 +1261,9 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
                          unfreeze_pae=unfreeze_pae, anchor_relpos=anchor_relpos).to(device)
     loss_mod = DistillLoss(*lambdas, peptide_weight=peptide_weight,
                            plddt_weight_struct=plddt_weight_struct,
-                           plddt_weight_floor=plddt_weight_floor).to(device)
+                           plddt_weight_floor=plddt_weight_floor,
+                           groove_aware=groove_aware,
+                           lambda_contain=lambda_contain, groove=groove).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                                   weight_decay=weight_decay)
     total_steps = max(1, steps_per_epoch * epochs)
@@ -1218,6 +1278,8 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         "recycles": recycles, "anchor_relpos": anchor_relpos,
         "plddt_weight_struct": plddt_weight_struct,
         "plddt_weight_floor": plddt_weight_floor,
+        "groove_aware": groove_aware, "lambda_contain": lambda_contain,
+        "groove": tuple(groove),
         "unfreeze_sm": unfreeze_sm,
         "unfreeze_plddt": unfreeze_plddt, "unfreeze_pae": unfreeze_pae,
         "unfrozen_fraction": model.unfrozen,

@@ -47,6 +47,12 @@ LAMBDAS="1.0 0.01 0.01"          # FAPE  PLDDT  PAE
 # less. Loss-only -> does NOT change the run dir / checkpoint -> resumes in place.
 PLDDT_WEIGHT_STRUCT=1            # 1 = on
 PLDDT_WEIGHT_FLOOR=0.1
+# Groove-aware loss: dock IN-pocket peptides exactly, push OUT-of-pocket ones to a
+# shell (don't predict their exact pose), keep learning pLDDT on all peptide residues
+# so non-binders get flagged. Loss-only -> resumes in place.
+GROOVE_AWARE=1                   # 1 = on
+LAMBDA_CONTAIN=0.5
+GROOVE="8.0 1.5 8.0 18.0"        # tau_mid  s  tau_out  tau_far  (Å)
 RECYCLES=3                        # keep =3 so RUN matches the existing _rc3 dirs
 # Per-step recycle distribution during training. Empty = uniform 1..RECYCLES.
 # "0.8 0.2" = 80% no recycle / 20% one recycle (your lighter schedule).
@@ -70,6 +76,8 @@ ARP_FLAG=""
 # name is intentionally NOT modified, so existing _rc3 checkpoints resume in place.
 PWS_FLAG=""
 [[ "${PLDDT_WEIGHT_STRUCT}" == "1" ]] && PWS_FLAG="--plddt-weight-struct --plddt-weight-floor ${PLDDT_WEIGHT_FLOOR}"
+GROOVE_FLAG=""
+[[ "${GROOVE_AWARE}" == "1" ]] && GROOVE_FLAG="--groove-aware --lambda-contain ${LAMBDA_CONTAIN} --groove ${GROOVE}"
 
 DATE=$(date +%Y%m%d_%H%M%S)
 RUN_LOG="checkpoints/${RUN}/train_${DATE}.log"
@@ -108,7 +116,7 @@ $PY src/model/train.py \
     --peptide-weight ${PEPTIDE_W} --recycles ${RECYCLES} \
     --recycle-probs ${RECYCLE_PROBS} --eval-recycles ${EVAL_RECYCLES} \
     --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
-    --unfreeze-pae ${UNFREEZE_PAE} ${ARP_FLAG} ${PWS_FLAG} \
+    --unfreeze-pae ${UNFREEZE_PAE} ${ARP_FLAG} ${PWS_FLAG} ${GROOVE_FLAG} \
     --log-every 100 --ckpt-every 2000 \
     --num-workers 4 --amp
 

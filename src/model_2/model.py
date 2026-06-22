@@ -27,12 +27,48 @@ N_AATYPE, N_SEGMENTS = PD.N_AATYPE, PD.N_SEGMENTS
 COORD_SCALE = 15.0
 
 
+def _groove_terms_pyg(pos_t, pos_p, ptr, pep, tau_mid=8.0, s_buried=1.5,
+                      tau_out=8.0, tau_far=18.0):
+    """Groove-membership geometry on flat PyG coords (Å). Per graph, from per-peptide
+    nearest-MHC Cα distance: returns buried[ΣN] (soft 1-in-pocket from the TEACHER,
+    gates the peptide coord loss) and a soft-band containment on the PREDICTED coords
+    (out-of-pocket peptides pushed into a [tau_out, tau_far] Å shell). Grad flows only
+    through pos_p; the label is detached."""
+    dev = pos_t.device
+    buried = pos_t.new_zeros(pos_t.shape[0])
+    cnum = pos_p.new_zeros(())
+    cden = pos_p.new_zeros(())
+    pep_b = pep.bool()
+    for g in range(ptr.numel() - 1):
+        a, b = int(ptr[g]), int(ptr[g + 1])
+        pe = pep_b[a:b]
+        me = ~pe
+        if int(pe.sum()) == 0 or int(me.sum()) == 0:
+            continue
+        idx = torch.arange(a, b, device=dev)[pe]
+        with torch.no_grad():
+            dt = torch.cdist(pos_t[a:b][pe], pos_t[a:b][me])
+            bur = torch.sigmoid((tau_mid - dt.min(-1).values) / s_buried)
+        buried[idx] = bur
+        nnd_p = torch.cdist(pos_p[a:b][pe], pos_p[a:b][me]).min(-1).values
+        band = F.relu(tau_out - nnd_p) ** 2 + F.relu(nnd_p - tau_far) ** 2
+        cnum = cnum + ((1.0 - bur) * band).sum()
+        cden = cden + (1.0 - bur).sum()
+    return buried, cnum / cden.clamp_min(1.0)
+
+
 class MHCDiff(nn.Module):
     def __init__(self, T=200, mhc_scale=0.1, h_dim=128, n_layers=6, k=12,
-                 use_cross=True, device="cpu"):
+                 use_cross=True, device="cpu", groove_aware=False,
+                 lambda_contain=0.5, groove=(8.0, 1.5, 8.0, 18.0)):
         super().__init__()
         self.diff = DifferentialDiffusion(T=T, mhc_scale=mhc_scale).to(device)
         self.T = T
+        # groove-aware loss (no new params -> checkpoints load unchanged): dock
+        # in-pocket peptides, expel out-of-pocket ones to a shell, learn pLDDT on all.
+        self.groove_aware = bool(groove_aware)
+        self.lambda_contain = float(lambda_contain)
+        self.groove = tuple(groove)
         self.denoiser = EGNNDenoiser(N_AATYPE, N_SEGMENTS, h_dim=h_dim,
                                      n_layers=n_layers, k=k, use_time=True,
                                      use_cross=use_cross)
@@ -59,8 +95,21 @@ class MHCDiff(nn.Module):
         h0 = self.denoiser.node_features(data, t_frac=t.float() / self.T)
         eps_hat, _ = self.denoiser(xt, h0, data)
         se = ((eps_hat - noise) ** 2).sum(-1)                  # [ΣN]
-        pep_coord = (se * pep).sum() / pep.sum().clamp_min(1.0)
         mhc_coord = (se * mhc).sum() / mhc.sum().clamp_min(1.0)
+
+        contain = x0.new_zeros(())
+        if self.groove_aware:
+            # gate the peptide ε-loss by groove-membership (only dock in-pocket
+            # residues) and add containment on the reconstructed x̂0 (expel the rest).
+            acp = self.diff._node_acp(t, batch, pep)
+            x0_pred = (xt - (1 - acp).clamp_min(0).sqrt() * eps_hat) \
+                / acp.sqrt().clamp_min(1e-4)
+            buried, contain = _groove_terms_pyg(
+                data.pos, x0_pred * COORD_SCALE, data.ptr, pep, *self.groove)
+            pep_w = pep * buried
+            pep_coord = (se * pep_w).sum() / pep_w.sum().clamp_min(1.0)
+        else:
+            pep_coord = (se * pep).sum() / pep.sum().clamp_min(1.0)
 
         h_clean = self._aux_embed(x0, data)
         plddt_pred = self.plddt_head(h_clean).squeeze(-1).sigmoid() * 100.0
@@ -82,9 +131,12 @@ class MHCDiff(nn.Module):
 
         total = (l_pep * pep_coord + l_mhc * mhc_coord
                  + l_tor * tor + l_plddt * plddt_loss)
+        if self.groove_aware:
+            total = total + self.lambda_contain * contain
         terms = {"total": float(total), "pep_coord": float(pep_coord),
                  "mhc_coord": float(mhc_coord), "torsion": float(tor),
-                 "plddt": float(plddt_loss), "pep_plddt": float(pep_plddt)}
+                 "plddt": float(plddt_loss), "pep_plddt": float(pep_plddt),
+                 "contain": float(contain)}
         return total, terms
 
     def forward(self, data, lambdas=(1.0, 0.25, 0.5, 0.1)):

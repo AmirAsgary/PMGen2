@@ -85,7 +85,11 @@ def eval_model1(args, device):
 
     ds = U.build_h5_dataset(args.h5_dir, args.scheme, args.fold, args.split)
     loader = U.make_dataloader(ds, args.bs, shuffle=False, num_workers=args.num_workers)
-    er = cfg.get("recycles", 0) or None
+    # --recycles overrides the eval recycle count (None = model's configured value).
+    # Use it to A/B whether recycling buys anything: 0 recycles bypasses the recycler
+    # entirely (same forward cost as a non-recycling model), so if 0≈N, drop it.
+    er = args.recycles if args.recycles is not None else (cfg.get("recycles", 0) or None)
+    print(f"  [model_1] eval recycles = {er}")
     recs, seen = [], 0
     with torch.no_grad():
         for batch in loader:
@@ -147,7 +151,7 @@ def eval_model2(args, device):
         for data in DataLoader(val, batch_size=args.bs):
             data = data.to(device)
             pred = net.sample(data, template_pool=pool, sampler="ddim",
-                              n_steps=args.n_steps,
+                              n_steps=args.n_steps, clip=args.clip,
                               mhc_from_truth=(args.mhc_init == "truth"))
             for g in range(data.num_graphs):
                 m = data.batch == g
@@ -329,6 +333,13 @@ def main(argv=None):
     ap.add_argument("--mhc-init", choices=["template", "truth", "noise"],
                     default="template", help="model_2 only: MHC initialisation")
     ap.add_argument("--n-steps", type=int, default=25, help="model_2 DDIM steps")
+    ap.add_argument("--clip", type=float, default=4.0,
+                    help="model_2 only: DDIM x0-clip in normalized units (÷15 Å). "
+                         "4≈±60 Å (loose); ~2.5 bounds reconstruction to physical "
+                         "size and curbs sampling divergence.")
+    ap.add_argument("--recycles", type=int, default=None,
+                    help="model_1 only: override eval recycle count (0 bypasses the "
+                         "recycler). Use to A/B whether recycling helps.")
     ap.add_argument("--out-dir", default="outputs/eval_stratified")
     args = ap.parse_args(argv)
 

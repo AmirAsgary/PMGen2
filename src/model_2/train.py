@@ -42,7 +42,7 @@ def setup_distributed():
 
 _COLS = ["wall_time", "split", "epoch", "step", "lr", "total",
          "pep_coord", "mhc_coord", "torsion", "plddt", "pep_plddt",
-         "pep_ca_rmsd", "mhc_ca_rmsd"]
+         "contain", "pep_ca_rmsd", "mhc_ca_rmsd"]
 
 
 def _csv_cols(p: Path):
@@ -138,6 +138,14 @@ def main(argv=None):
                    help="disable the chirality (cross-product) term -> E(3) only")
     p.add_argument("--lambdas", type=float, nargs=4, default=(1.0, 0.25, 0.5, 0.1),
                    metavar=("PEP", "MHC", "TORSION", "PLDDT"))
+    p.add_argument("--groove-aware", action="store_true",
+                   help="dock in-pocket peptides, expel out-of-pocket ones to a "
+                        "shell (containment), learn pLDDT on all (loss-only; "
+                        "resume-safe — no new parameters)")
+    p.add_argument("--lambda-contain", type=float, default=0.5)
+    p.add_argument("--groove", type=float, nargs=4, default=(8.0, 1.5, 8.0, 18.0),
+                   metavar=("TAU_MID", "S", "TAU_OUT", "TAU_FAR"),
+                   help="in/out boundary, sigmoid width, containment band (Å)")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
@@ -165,7 +173,8 @@ def main(argv=None):
 
     core = M.MHCDiff(T=args.timesteps, mhc_scale=args.mhc_scale, h_dim=args.hidden,
                      n_layers=args.layers, k=args.k, use_cross=not args.no_cross,
-                     device=device)
+                     device=device, groove_aware=args.groove_aware,
+                     lambda_contain=args.lambda_contain, groove=tuple(args.groove))
     opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=1e-4)
     steps_per_epoch = max(1, len(train_loader))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(

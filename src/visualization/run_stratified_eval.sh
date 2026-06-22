@@ -66,6 +66,8 @@ CKPT_M2=${CKPT_M2:-checkpoints_model2/mhcdiff_two_axis_fold1/last.pt}
 H5_M2=${H5_M2:-data/processed/h5_store_sc}
 MHC_INIT=${MHC_INIT:-template}          # template | truth | noise (model_2 only)
 N_STEPS=${N_STEPS:-25}                  # model_2 DDIM steps
+CLIP=${CLIP:-4.0}                       # model_2 DDIM x0-clip (try 2.5 to curb divergence)
+RECYCLES=${RECYCLES:-}                  # model_1 eval recycles override (empty = config)
 
 EVAL=src/post_structure_prediction_processing/eval_stratified.py
 
@@ -74,14 +76,15 @@ echo "[cfg] PY=$PY MODELS='$MODELS' scheme=$SCHEME fold=$FOLD max_graphs=$MAX_GR
 for m in $MODELS; do
     if [[ "$m" == "1" ]]; then
         echo; echo ">>> model_1  ($CKPT_M1)"
+        REC_FLAG=(); [[ -n "$RECYCLES" ]] && REC_FLAG=(--recycles "$RECYCLES")
         $PY "$EVAL" --model 1 --ckpt "$CKPT_M1" --h5-dir "$H5_M1" \
             --scheme "$SCHEME" --fold "$FOLD" --max-graphs "$MAX_GRAPHS" \
-            --out-dir "$OUT_ROOT/model1" ${PASS[@]+"${PASS[@]}"}
+            "${REC_FLAG[@]}" --out-dir "$OUT_ROOT/model1" ${PASS[@]+"${PASS[@]}"}
     elif [[ "$m" == "2" ]]; then
-        echo; echo ">>> model_2  ($CKPT_M2, mhc-init=$MHC_INIT)"
+        echo; echo ">>> model_2  ($CKPT_M2, mhc-init=$MHC_INIT, clip=$CLIP)"
         $PY "$EVAL" --model 2 --ckpt "$CKPT_M2" --h5-dir "$H5_M2" \
             --scheme "$SCHEME" --fold "$FOLD" --max-graphs "$MAX_GRAPHS" \
-            --mhc-init "$MHC_INIT" --n-steps "$N_STEPS" \
+            --mhc-init "$MHC_INIT" --n-steps "$N_STEPS" --clip "$CLIP" \
             --out-dir "$OUT_ROOT/model2" ${PASS[@]+"${PASS[@]}"}
     else
         echo "[warn] unknown model '$m' (use 1 and/or 2)"
