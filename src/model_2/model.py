@@ -55,7 +55,9 @@ def _groove_terms_pyg(pos_t, pos_p, ptr, pep, tau_mid=8.0, s_buried=1.5,
             bur = torch.sigmoid((tau_mid - dt.min(-1).values) / s_buried)
         buried[idx] = bur
         nnd_p = torch.cdist(pos_p[a:b][pe], pos_p[a:b][me]).min(-1).values
-        band = F.relu(tau_out - nnd_p) ** 2 + F.relu(nnd_p - tau_far) ** 2
+        # cap the band so a far-off residue can't deliver an unbounded gradient
+        band = (F.relu(tau_out - nnd_p) ** 2
+                + F.relu(nnd_p - tau_far) ** 2).clamp(max=400.0)
         wout = (1.0 - bur) if rel is None else (1.0 - bur) * rel[idx].float()
         cnum = cnum + (wout * band).sum()
         cden = cden + wout.sum()
@@ -114,9 +116,14 @@ class MHCDiff(nn.Module):
             x0_pred = (xt - (1 - acp).clamp_min(0).sqrt() * eps_hat) \
                 / acp.sqrt().clamp_min(1e-2)
             x0_pred = x0_pred.clamp(-4.0, 4.0)
+            # HARD-gate containment to LOW-noise steps (ᾱ_t>0.5). Where ᾱ_t is small
+            # x̂0 is unreliable AND its gradient ∝ 1/√ᾱ_t blows up — that is what kept
+            # poisoning the run. Above 0.5 the reconstruction is trustworthy and the
+            # gradient factor is <=~1.4x. (soft ᾱ-weighting was not enough.)
+            rel = (acp.squeeze(-1) > 0.5).float()
             buried, contain = _groove_terms_pyg(
                 data.pos, x0_pred * COORD_SCALE, data.ptr, pep, *self.groove,
-                rel=acp.squeeze(-1))
+                rel=rel)
             pep_w = pep * buried
             pep_coord = (se * pep_w).sum() / pep_w.sum().clamp_min(1.0)
         else:

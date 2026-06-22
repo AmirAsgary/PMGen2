@@ -236,6 +236,17 @@ def main(argv=None):
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=dev_type, enabled=args.amp):
                 total, terms = net(data, lambdas)        # DDP forward -> compute_loss
+            # non-finite guard: a single bad batch must NOT poison the weights (grad
+            # clipping does not help — it propagates NaN). All ranks must agree to skip
+            # together, else the DDP backward all-reduce deadlocks.
+            bad = torch.tensor([0.0 if torch.isfinite(total) else 1.0], device=device)
+            if distributed:
+                torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.MAX)
+            if bad.item() > 0:
+                opt.zero_grad(set_to_none=True)
+                if is_main:
+                    print(f"[m2] epoch {epoch} step {i}: non-finite loss -> skipped")
+                continue
             scaler.scale(total).backward()
             if args.grad_clip:
                 scaler.unscale_(opt)
