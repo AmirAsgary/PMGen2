@@ -58,25 +58,44 @@ def _smooth(y, frac):
     return np.convolve(y, np.ones(win) / win, mode="same")
 
 
-def plot_model2(csv: Path, out_dir: Path, smooth: float = 0.03):
+def _epoch_float(sub: pd.DataFrame) -> pd.Series:
+    """Continuous x in fractional epochs. The logged ``epoch`` is an integer and
+    ``step`` resets every epoch, so MANY train rows share one epoch — plotting vs
+    ``epoch`` alone stacks them on a single x (vertical zig-zag). Spread them within
+    [epoch, epoch+1) by the per-epoch step fraction."""
+    if "step" not in sub.columns or sub["step"].notna().sum() == 0:
+        return sub["epoch"].astype(float)
+    smax = float(sub["step"].max())
+    if smax <= 0:
+        return sub["epoch"].astype(float)
+    return sub["epoch"].astype(float) + sub["step"].astype(float) / (smax + 1.0)
+
+
+def plot_model2(csv: Path, out_dir: Path, smooth: float = 0.04):
     df = pd.read_csv(csv)
     for split, panels, sm, fname in [
         ("train", _M2_TRAIN, smooth, "model2_train.png"),
         ("val", _M2_VAL, 0.0, "model2_val.png")]:
-        sub = df[df["split"] == split]
+        sub = df[df["split"] == split].copy()
+        sub["epoch_float"] = _epoch_float(sub)
         panels = [(c, lbl) for c, lbl in panels
                   if c in sub.columns and sub[c].notna().any()]
         n = len(panels)
         ncol = 2
         nrow = math.ceil(n / ncol)
         fig, axes = plt.subplots(nrow, ncol, figsize=(11, 2.6 * nrow), squeeze=False)
-        x = sub["epoch"].to_numpy(float)
         for i, (c, lbl) in enumerate(panels):
             ax = axes[i // ncol][i % ncol]
-            s = sub[["epoch", c]].dropna()
-            xs, ys = s["epoch"].to_numpy(float), s[c].to_numpy(float)
-            ys_s = _smooth(ys, sm)
-            ax.plot(xs, ys_s, color="#3b6", lw=1.6)
+            s = sub[["epoch_float", c]].dropna().sort_values("epoch_float")
+            xs, ys = s["epoch_float"].to_numpy(float), s[c].to_numpy(float)
+            if split == "train":                          # faint raw + bold trend
+                ax.plot(xs, ys, color="#3b6", lw=0.5, alpha=0.25)
+                ax.plot(xs, _smooth(ys, sm), color="#176", lw=1.8)
+                # zoom y to the trend, not the per-step noise spikes
+                lo, hi = np.percentile(ys, [1, 97])
+                ax.set_ylim(lo - 0.02 * (hi - lo), hi + 0.05 * (hi - lo))
+            else:
+                ax.plot(xs, ys, color="#3b6", lw=1.6)
             if c in ("pep_ca_rmsd", "mhc_ca_rmsd"):       # sampled: mark points
                 ax.plot(xs, ys, "o", color="#176", ms=4)
                 best = np.nanmin(ys)
