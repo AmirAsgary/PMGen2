@@ -20,8 +20,8 @@
 #SBATCH --array=0-6%7              # 7 variants; %7 = all at once (tune to GPU quota)
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:2          # ONE A100 per task (training is single-GPU)
-#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:a100:2          # TWO A100s per task (DDP, both GPUs used)
+#SBATCH --cpus-per-task=8          # ~num-workers x #GPUs
 #SBATCH --mem=128G                 # data pipeline RSS grows over an epoch
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/distill/%A_%a.out
@@ -106,7 +106,16 @@ CKPT="checkpoints/${RUN}/last.pt"
 if [[ -f "$CKPT" ]]; then echo "resume: found ${CKPT} (continue / skip-if-done)";
 else echo "resume: no checkpoint -> fresh start"; fi
 
-$PY src/model/train.py \
+# ---- Multi-GPU via DDP (torchrun): one process per GPU on this task's node.
+# BS is PER-GPU (effective batch = BS x #GPUs); each rank gets a disjoint data shard
+# so the epoch is ~#GPUs faster. A UNIQUE rendezvous port per array task avoids a
+# collision when SLURM co-locates two array tasks on the same node.
+NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); NGPU=${NGPU:-1}
+PORT=$((29500 + ${SLURM_ARRAY_TASK_ID:-0}))
+echo "launching on ${NGPU} GPU(s) via torchrun (rdzv port ${PORT})"
+$PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
+    --master_addr=127.0.0.1 --master_port=${PORT} \
+    src/model/train.py \
     --h5-dir "$H5" \
     --scheme "$S" --fold "$F" --variant "$V" \
     --ckpt-dir checkpoints --run-name "$RUN" \

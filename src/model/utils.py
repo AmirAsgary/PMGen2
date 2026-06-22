@@ -1072,12 +1072,20 @@ class MetricLogger:
 
 
 def make_epoch_loader(dataset, batch_size: int, num_workers: int, seed: int,
-                      epoch: int, skip_batches: int = 0) -> DataLoader:
+                      epoch: int, skip_batches: int = 0,
+                      rank: int = 0, world_size: int = 1) -> DataLoader:
     """Deterministic per-epoch shuffle (so a mid-epoch resume can replay the exact
     order). ``skip_batches`` drops the first N batches *without loading them* by
-    slicing the precomputed permutation — used to fast-forward on resume."""
+    slicing the precomputed permutation — used to fast-forward on resume.
+
+    For DDP (``world_size>1``) the permutation is truncated to a multiple of
+    ``world_size`` and strided by ``rank``, so every rank gets an EQUAL-size disjoint
+    shard (equal step counts -> no collective deadlock on the last batch)."""
     g = torch.Generator().manual_seed((seed + 1) * 1_000_003 + epoch)
     perm = torch.randperm(len(dataset), generator=g).tolist()
+    if world_size > 1:
+        usable = (len(perm) // world_size) * world_size
+        perm = perm[:usable][rank::world_size]
     if skip_batches > 0:
         perm = perm[skip_batches * batch_size:]
     return make_dataloader(dataset, batch_size, shuffle=False,
@@ -1090,7 +1098,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     log=None, log_every: int = 0, epoch: int = 0,
                     global_step: int = 0, mlog: Optional[MetricLogger] = None,
                     ckpt_every: int = 0, save_fn=None,
-                    recycle_probs: Optional[Sequence[float]] = None
+                    recycle_probs: Optional[Sequence[float]] = None,
+                    core: Optional[DistillModel] = None, is_main: bool = True
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1100,8 +1109,9 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     ``ckpt_every`` steps it calls ``save_fn(global_step, epoch)`` to checkpoint, so
     a crash mid-epoch loses at most ``ckpt_every`` steps."""
     import time
-    model.train()
-    use_amp = scaler is not None and scaler.is_enabled()
+    core = core or model                 # unwrapped module (DDP -> .module) for
+    model.train()                        # attribute/param access; `model` (maybe DDP)
+    use_amp = scaler is not None and scaler.is_enabled()   # is what we call forward on
     dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
     agg: Dict[str, float] = defaultdict(float)        # whole-epoch (returned)
     wagg: Dict[str, float] = defaultdict(float)       # window since last log
@@ -1116,7 +1126,7 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
         # sample the recycle count per step. With recycle_probs=[p0,p1,...] draw
         # nr from that categorical (e.g. [0.8,0.2] -> 80% no recycle, 20% one);
         # otherwise AF2-style uniform over 1..recycles (0 if the model has none).
-        max_rc = getattr(model, "recycles", 0)
+        max_rc = getattr(core, "recycles", 0)
         if recycle_probs:
             nr = random.choices(range(len(recycle_probs)), weights=recycle_probs)[0]
         else:
@@ -1128,7 +1138,7 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             scaler.scale(total).backward()
             if grad_clip is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.trainable_parameters(),
+                torch.nn.utils.clip_grad_norm_(core.trainable_parameters(),
                                                grad_clip)
             prev_scale = scaler.get_scale()
             scaler.step(optimizer)
@@ -1140,7 +1150,7 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
         else:
             total.backward()
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.trainable_parameters(),
+                torch.nn.utils.clip_grad_norm_(core.trainable_parameters(),
                                                grad_clip)
             optimizer.step()
             stepped = True
@@ -1179,7 +1189,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             wagg.clear()
             wn = 0
             tw = now
-        if ckpt_every and save_fn is not None and global_step % ckpt_every == 0:
+        if is_main and ckpt_every and save_fn is not None \
+                and global_step % ckpt_every == 0:
             save_fn(global_step, epoch)
     return {k: v / max(n, 1) for k, v in agg.items()}, global_step
 
@@ -1208,6 +1219,22 @@ def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
             break
     model.train()
     return {k: v / max(n, 1) for k, v in agg.items()}
+
+
+def setup_distributed():
+    """Init torch.distributed from the env torchrun sets (WORLD_SIZE/RANK/LOCAL_RANK).
+    Returns (distributed, rank, local_rank, world_size); a no-op single-GPU tuple
+    when WORLD_SIZE<=1 so the same code path runs on one GPU."""
+    import os
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world <= 1:
+        return False, 0, 0, 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+    return True, rank, local_rank, world
 
 
 def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
@@ -1242,7 +1269,17 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     ``variant{v}_{scheme}_fold{fold}`` so a SLURM array over variants is isolated.
     """
     set_seed(seed)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    # Multi-GPU via DistributedDataParallel (torchrun sets the env). One process per
+    # GPU; each rank trains on a disjoint data shard, grads are all-reduced, only
+    # rank 0 logs/evaluates/checkpoints. Single-GPU (WORLD_SIZE<=1) is a no-op.
+    distributed, rank, local_rank, world = setup_distributed()
+    is_main = (rank == 0)
+    if distributed:
+        device = f"cuda:{local_rank}"
+    else:
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if not is_main:                       # silence non-main ranks
+        log = (lambda *a, **k: None)
 
     if h5_dir is not None:
         train_ds = build_h5_dataset(h5_dir, scheme, fold, "train", all_ids=dummy)
@@ -1254,7 +1291,10 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
     # resume can fast-forward to the exact batch; val loader is fixed.
     val_loader = make_dataloader(val_ds, bs, shuffle=False,
                                  num_workers=num_workers)
-    steps_per_epoch = (len(train_ds) + bs - 1) // bs
+    # per-RANK steps (data is sharded across ranks under DDP) -> the loop, scheduler
+    # horizon and resume math all count per-rank steps.
+    shard_n = len(train_ds) // world if world > 1 else len(train_ds)
+    steps_per_epoch = (shard_n + bs - 1) // bs
 
     model = DistillModel(variant, device=device, recycles=recycles,
                          unfreeze_sm=unfreeze_sm, unfreeze_plddt=unfreeze_plddt,
@@ -1298,14 +1338,16 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         run_name = run_name or f"variant{variant}_{scheme}_fold{fold}"
         config["run_name"] = run_name
         run_dir = Path(ckpt_dir) / run_name
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+        if is_main:                       # only rank 0 writes config / checkpoints
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "config.json").write_text(json.dumps(config, indent=2))
 
-    mlog = MetricLogger(run_dir, enable_tb=tensorboard)
+    # metric logging / checkpoint writing on rank 0 only (None -> no-op elsewhere)
+    mlog = MetricLogger(run_dir if is_main else None, enable_tb=tensorboard)
 
     def save_ckpt(path: Path, global_step: int, epoch: int) -> None:
         """Atomic checkpoint (tmp + rename) holding everything needed to resume."""
-        if run_dir is None:
+        if run_dir is None or not is_main:           # rank 0 only -> no write races
             return
         tmp = Path(str(path) + ".tmp")
         torch.save({"epoch": epoch, "global_step": global_step,
@@ -1339,12 +1381,22 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
             scaler.load_state_dict(ckpt["scaler"])
             history = ckpt.get("history", [])
             best = ckpt.get("best", float("inf"))
-            # global_step pinpoints where we stopped; derive epoch + batch to skip.
-            # (Older epoch-only checkpoints fall back to an epoch boundary.)
-            global_step = int(ckpt.get("global_step",
-                                       int(ckpt["epoch"]) * steps_per_epoch))
-            start_epoch = global_step // steps_per_epoch + 1
-            resume_skip = global_step % steps_per_epoch
+            if distributed:
+                # the per-rank step basis differs from a single-GPU checkpoint, so
+                # the saved global_step is not comparable. Resume at the EPOCH
+                # boundary and realign the step counter + LR schedule to the new
+                # (per-rank) basis.
+                start_epoch = int(ckpt["epoch"]) + 1
+                resume_skip = 0
+                global_step = int(ckpt["epoch"]) * steps_per_epoch
+                scheduler.last_epoch = global_step
+            else:
+                # global_step pinpoints where we stopped; derive epoch + batch to skip.
+                # (Older epoch-only checkpoints fall back to an epoch boundary.)
+                global_step = int(ckpt.get("global_step",
+                                           int(ckpt["epoch"]) * steps_per_epoch))
+                start_epoch = global_step // steps_per_epoch + 1
+                resume_skip = global_step % steps_per_epoch
             log(f"[train] resumed from {resume} at epoch {start_epoch} "
                 f"(global_step {global_step}, skip {resume_skip} batches, "
                 f"best val Cα-RMSD {best:.3f})")
@@ -1361,38 +1413,54 @@ def run_training(*, variant: int = 7, scheme: str = "two_axis", fold: int = 1,
         f"bs={bs} epochs={epochs} steps/epoch={steps_per_epoch} "
         f"total_steps={total_steps} amp={amp} ckpt_every={ckpt_every}"
         + (f" | ckpt={run_dir}" if run_dir else ""))
+    # wrap for DDP just before the loop (model stays the unwrapped 'core' used for
+    # eval/checkpoint/attribute access; 'net' is what we run forward+backward on).
+    if distributed:
+        net = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True)
+    else:
+        net = model
+
     for epoch in range(start_epoch, epochs + 1):
         skip = resume_skip if epoch == start_epoch else 0
         train_loader = make_epoch_loader(train_ds, bs, num_workers, seed, epoch,
-                                         skip_batches=skip)
+                                         skip_batches=skip, rank=rank,
+                                         world_size=world)
         tr, global_step = train_one_epoch(
-            model, train_loader, loss_mod, optimizer, scheduler, device,
-            scaler if amp else None, grad_clip, log=log, log_every=log_every,
-            epoch=epoch, global_step=global_step, mlog=mlog,
+            net, train_loader, loss_mod, optimizer, scheduler, device,
+            scaler if amp else None, grad_clip, log=(log if is_main else None),
+            log_every=log_every, epoch=epoch, global_step=global_step, mlog=mlog,
             ckpt_every=ckpt_every, recycle_probs=recycle_probs,
-            save_fn=lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep)
-            if run_dir is not None else None)
-        ev = evaluate(model, val_loader, loss_mod, device, max_batches=eval_batches,
-                      num_recycles=eval_recycles)
-        history.append({"epoch": epoch, "train": tr, "val": ev})
-        mlog.log("val", epoch, global_step, None, ev)
-        log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "
-            f"(fape {tr['fape']:.3f} plddt {tr['plddt_ce']:.3f} "
-            f"pae {tr['pae_ce']:.3f} | pep fape {tr.get('pep_fape', 0):.3f} "
-            f"plddt {tr.get('pep_plddt_ce', 0):.3f} pae {tr.get('pep_pae_ce', 0):.3f}) "
-            f"| val total {ev['total']:.3f} Cα-RMSD {ev['ca_rmsd']:.2f} "
-            f"pep-RMSD {ev['pep_ca_rmsd']:.2f} pLDDT-sp {ev['plddt_spearman']:.2f} "
-            f"PAE-MAE {ev['pae_mae']:.2f}")
-        if run_dir is not None:
-            if ev["ca_rmsd"] < best:
-                best = ev["ca_rmsd"]
-                torch.save({"epoch": epoch, "global_step": global_step,
-                            "encoder": model.encoder.state_dict(),
-                            "frozen_trainable": model.frozen_trainable_state(),
-                            "val": ev, "config": config}, run_dir / "best.pt")
-                log(f"[train]   new best val Cα-RMSD {best:.3f} -> best.pt")
-            save_ckpt(run_dir / "last.pt", global_step, epoch)
+            core=model, is_main=is_main,
+            save_fn=(lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
+            if (run_dir is not None and is_main) else None)
+        # evaluation + checkpoint on rank 0 only; other ranks loop to the next epoch
+        # and wait at the first all-reduce.
+        if is_main:
+            ev = evaluate(model, val_loader, loss_mod, device,
+                          max_batches=eval_batches, num_recycles=eval_recycles)
+            history.append({"epoch": epoch, "train": tr, "val": ev})
+            mlog.log("val", epoch, global_step, None, ev)
+            log(f"[train] epoch {epoch:3d} | train total {tr['total']:.3f} "
+                f"(fape {tr['fape']:.3f} plddt {tr['plddt_ce']:.3f} "
+                f"pae {tr['pae_ce']:.3f} | pep fape {tr.get('pep_fape', 0):.3f} "
+                f"plddt {tr.get('pep_plddt_ce', 0):.3f} pae {tr.get('pep_pae_ce', 0):.3f}) "
+                f"| val total {ev['total']:.3f} Cα-RMSD {ev['ca_rmsd']:.2f} "
+                f"pep-RMSD {ev['pep_ca_rmsd']:.2f} pLDDT-sp {ev['plddt_spearman']:.2f} "
+                f"PAE-MAE {ev['pae_mae']:.2f}")
+            if run_dir is not None:
+                if ev["ca_rmsd"] < best:
+                    best = ev["ca_rmsd"]
+                    torch.save({"epoch": epoch, "global_step": global_step,
+                                "encoder": model.encoder.state_dict(),
+                                "frozen_trainable": model.frozen_trainable_state(),
+                                "val": ev, "config": config}, run_dir / "best.pt")
+                    log(f"[train]   new best val Cα-RMSD {best:.3f} -> best.pt")
+                save_ckpt(run_dir / "last.pt", global_step, epoch)
     mlog.close()
+    if distributed:
+        torch.distributed.destroy_process_group()
     return history, model
 
 
