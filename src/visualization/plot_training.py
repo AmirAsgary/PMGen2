@@ -134,12 +134,15 @@ def load_run(run_dir: Path) -> Optional[Tuple[Dict[str, object], pd.DataFrame]]:
         except Exception:
             pass
 
-    # x in fractional epochs: comparable across folds even when steps/epoch differ
-    if meta.get("n_train") and meta.get("bs"):
-        spe = max(1, math.ceil(meta["n_train"] / meta["bs"]))
-        df["epoch_float"] = df["global_step"] / spe
-    else:
-        df["epoch_float"] = df["epoch"].astype(float)
+    # x in fractional epochs, derived from the ROW ORDER within each epoch (per split)
+    # rather than global_step. This is immune to a global_step basis change across a
+    # resume — e.g. single-GPU (83615 steps/epoch) -> DDP (41808/epoch) resets/rescales
+    # the counter — which would otherwise fold the post-resume curve back on itself.
+    df = df.reset_index(drop=True)
+    grp = df.groupby(["split", "epoch"], sort=False)
+    ordn = grp.cumcount()
+    cnt = grp["epoch"].transform("size").clip(lower=1)
+    df["epoch_float"] = (df["epoch"].astype(float) - 1.0) + (ordn + 1) / cnt
     for col, val in meta.items():
         df[col] = val
     return meta, df
