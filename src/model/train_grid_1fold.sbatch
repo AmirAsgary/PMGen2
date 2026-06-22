@@ -20,9 +20,9 @@
 #SBATCH --array=0-6%7              # 7 variants; %7 = all at once (tune to GPU quota)
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:2          # TWO A100s per task (DDP, both GPUs used)
+#SBATCH --gres=gpu:a100:4          # TWO A100s per task (DDP, both GPUs used)
 #SBATCH --cpus-per-task=8          # ~num-workers x #GPUs
-#SBATCH --mem=128G                 # data pipeline RSS grows over an epoch
+#SBATCH --mem=240G                 # data pipeline RSS grows over an epoch
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/distill/%A_%a.out
 #SBATCH --error=logs/distill/%A_%a.err
