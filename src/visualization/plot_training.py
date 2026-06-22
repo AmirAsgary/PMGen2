@@ -44,9 +44,17 @@ import matplotlib.pyplot as plt             # noqa: E402
 import numpy as np                          # noqa: E402
 import pandas as pd                         # noqa: E402
 
+# Reference loss weights used to reconstruct a *comparable* total across runs that
+# were trained with different λ (we cut λ_plddt/λ_pae from 0.1 to 0.01 mid-project).
+# The logged `fape`/`plddt_ce`/`pae_ce` are RAW (un-weighted), so re-mixing them with
+# one fixed λ gives a `total_norm` curve that is continuous across that change.
+REF_LAMBDAS = (1.0, 0.1, 0.1)               # (FAPE, pLDDT, PAE)
+
 # metric -> human label (everything else falls back to the column name)
 _LABELS = {
-    "total": "total loss", "fape": "FAPE", "plddt_ce": "pLDDT CE",
+    "total": "total loss (as-trained)",
+    "total_norm": f"total loss (norm λ={REF_LAMBDAS})",
+    "fape": "FAPE", "plddt_ce": "pLDDT CE",
     "pae_ce": "PAE CE", "pep_fape": "peptide FAPE",
     "pep_plddt_ce": "peptide pLDDT CE", "pep_pae_ce": "peptide PAE CE",
     "ca_rmsd": "Cα-RMSD (Å)", "pep_ca_rmsd": "peptide Cα-RMSD (Å)",
@@ -54,13 +62,15 @@ _LABELS = {
     "pep_plddt_mae": "peptide pLDDT-MAE", "pep_pae_mae": "peptide PAE-MAE (Å)",
     "lr": "learning rate", "it_per_s": "it/s",
 }
-# sensible default metric sets per split (only those present are kept)
-_DEFAULT_TRAIN = ["total", "fape", "plddt_ce", "pae_ce",
+# sensible default metric sets per split (only those present are kept). Use the
+# λ-independent `total_norm` / raw components so curves stay comparable across the
+# loss-weight change.
+_DEFAULT_TRAIN = ["total_norm", "fape", "plddt_ce", "pae_ce",
                   "pep_fape", "pep_plddt_ce", "pep_pae_ce"]
 _DEFAULT_VAL = ["ca_rmsd", "pep_ca_rmsd", "pae_mae", "pep_pae_mae",
-                "plddt_spearman", "total"]
+                "plddt_spearman", "total_norm"]
 # metrics where LOWER is better (annotate the best run)
-_LOWER_BETTER = {"total", "fape", "plddt_ce", "pae_ce", "pep_fape",
+_LOWER_BETTER = {"total", "total_norm", "fape", "plddt_ce", "pae_ce", "pep_fape",
                  "pep_plddt_ce", "pep_pae_ce", "ca_rmsd", "pep_ca_rmsd",
                  "pae_mae", "pep_plddt_mae", "pep_pae_mae"}
 
@@ -110,6 +120,19 @@ def load_run(run_dir: Path) -> Optional[Tuple[Dict[str, object], pd.DataFrame]]:
         except Exception:
             pass
     meta["run"] = run_dir.name
+
+    # λ-normalised total: re-mix the RAW components with one fixed λ so the curve is
+    # continuous across runs trained with different loss weights. (`total` itself is
+    # left as-trained for reference.) record the run's own λ for the report.
+    lf, lp, la = REF_LAMBDAS
+    if {"fape", "plddt_ce", "pae_ce"}.issubset(df.columns):
+        df["total_norm"] = lf * df["fape"] + lp * df["plddt_ce"] + la * df["pae_ce"]
+    if cfg_path.exists():
+        try:                                    # provenance string (scalar, not tuple)
+            lam = json.loads(cfg_path.read_text()).get("lambdas", None)
+            meta["lambdas"] = ",".join(f"{x:g}" for x in lam) if lam else ""
+        except Exception:
+            pass
 
     # x in fractional epochs: comparable across folds even when steps/epoch differ
     if meta.get("n_train") and meta.get("bs"):
