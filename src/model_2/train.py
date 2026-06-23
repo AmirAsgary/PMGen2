@@ -35,7 +35,12 @@ def setup_distributed():
     if world > 1:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # long timeout: only rank 0 runs val + DDIM sampling between epochs while the
+        # others wait at the next collective; NCCL's default 10-min watchdog would
+        # abort them. (60 min headroom.)
+        import datetime
+        dist.init_process_group(backend="nccl", init_method="env://",
+                                timeout=datetime.timedelta(minutes=60))
         torch.cuda.set_device(local_rank)
         return True, rank, local_rank, world
     return False, 0, 0, 1

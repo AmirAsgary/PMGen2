@@ -1233,7 +1233,12 @@ def setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="nccl")
+        # Long timeout: rank 0 runs the full validation between epochs (~15+ min on
+        # the frozen AF2 stack) while the other ranks wait at the next collective.
+        # NCCL's default 10-min watchdog would abort them mid-eval -> raise it.
+        import datetime
+        torch.distributed.init_process_group(
+            backend="nccl", timeout=datetime.timedelta(minutes=60))
     return True, rank, local_rank, world
 
 
