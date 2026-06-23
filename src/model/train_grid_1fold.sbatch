@@ -45,12 +45,12 @@ LAMBDAS="1.0 0.01 0.01"          # FAPE  PLDDT  PAE
 # Down-weight low-confidence teacher structures in the geometry loss: each example's
 # FAPE is scaled by its median peptide pLDDT/100 (floored), so noisy targets count
 # less. Loss-only -> does NOT change the run dir / checkpoint -> resumes in place.
-PLDDT_WEIGHT_STRUCT=1            # 1 = on
+PLDDT_WEIGHT_STRUCT=0            # DISABLED (made it worse) — 1 to re-enable
 PLDDT_WEIGHT_FLOOR=0.1
 # Groove-aware loss: dock IN-pocket peptides exactly, push OUT-of-pocket ones to a
 # shell (don't predict their exact pose), keep learning pLDDT on all peptide residues
 # so non-binders get flagged. Loss-only -> resumes in place.
-GROOVE_AWARE=1                   # 1 = on
+GROOVE_AWARE=0                   # DISABLED (made it worse) — 1 to re-enable
 LAMBDA_CONTAIN=0.5
 GROOVE="8.0 1.5 8.0 18.0"        # tau_mid  s  tau_out  tau_far  (Å)
 RECYCLES=3                        # keep =3 so RUN matches the existing _rc3 dirs

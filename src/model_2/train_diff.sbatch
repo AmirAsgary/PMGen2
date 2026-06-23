@@ -30,7 +30,7 @@ K=12
 # Groove-aware loss: dock IN-pocket peptides, expel OUT-of-pocket ones to a [tau_out,
 # tau_far] Å shell (containment), keep learning pLDDT on all. Loss-only (no new
 # params) -> resumes the current checkpoint in place.
-GROOVE_AWARE=1                   # 1 = on
+GROOVE_AWARE=0                   # DISABLED (made it worse) — 1 to re-enable
 LAMBDA_CONTAIN=0.5
 GROOVE="8.0 1.5 8.0 18.0"        # tau_mid  s  tau_out  tau_far  (Å)
 GROOVE_FLAG=""
