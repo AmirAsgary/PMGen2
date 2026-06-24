@@ -33,8 +33,14 @@ EPOCHS=${EPOCHS:-3}
 UNFREEZE_SM=${UNFREEZE_SM:-0}
 UNFREEZE_PLDDT=${UNFREEZE_PLDDT:-0}
 UNFREEZE_PAE=${UNFREEZE_PAE:-0}
+# FULL_EVO=1 -> retrain the WHOLE Evoformer + input embedder (use with EVO_LAYERS=48).
+#   e.g.: FULL_EVO=1 EVO_LAYERS=48 BS=1 sbatch src/model_3/train_af3.sbatch
+FULL_EVO=${FULL_EVO:-0}
+FULL_FLAG=""
+[[ "${FULL_EVO}" == "1" ]] && FULL_FLAG="--full-evoformer"
 
 RUN="af3_${SCHEME}_fold${FOLD}_K${EVO_LAYERS}"
+[[ "${FULL_EVO}" == "1" ]] && RUN="${RUN}_full"
 UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
 [[ "${UF}" != "0-0-0" ]] && RUN="${RUN}_uf${UF}"
 DATE=$(date +%Y%m%d_%H%M%S)
@@ -66,7 +72,7 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --h5-dir "$H5" --scheme "$SCHEME" --fold "$FOLD" \
     --evo-layers ${EVO_LAYERS} --trainable ${TRAINABLE} \
     --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
-    --unfreeze-pae ${UNFREEZE_PAE} \
+    --unfreeze-pae ${UNFREEZE_PAE} ${FULL_FLAG} \
     --ckpt-dir checkpoints_model3 --run-name "$RUN" \
     --resume "checkpoints_model3/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} \

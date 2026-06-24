@@ -45,7 +45,8 @@ class EvoDistillModel(nn.Module):
     def __init__(self, evo_layers: int = 3, trainable: float = 10.0,
                  model_name: str = "model_2_ptm", npz: Path = NPZ,
                  device: str = "cpu", unfreeze_sm: float = 0.0,
-                 unfreeze_plddt: float = 0.0, unfreeze_pae: float = 0.0):
+                 unfreeze_plddt: float = 0.0, unfreeze_pae: float = 0.0,
+                 full_evoformer: bool = False):
         super().__init__()
         cfg = model_config(model_name)
         # Build the FULL model and import the full npz cleanly (avoids any
@@ -55,31 +56,41 @@ class EvoDistillModel(nn.Module):
 
         self.input_embedder = af.input_embedder
         self.evoformer = af.evoformer
-        # truncate to the first K blocks (keeps blocks 0..K-1 = correct AF2 weights)
+        # keep the first K blocks (K=48 -> the FULL Evoformer)
         K = int(evo_layers)
         self.evoformer.blocks = nn.ModuleList(list(self.evoformer.blocks)[:K])
-        # NO gradient checkpointing: OpenFold's reentrant checkpoint detaches when the
-        # block inputs don't require grad (ours come from the FROZEN input-embedder),
-        # which severs the trainable last block from the loss. With only one trainable
-        # block + bs 1-2 the activation memory is fine without it.
-        self.evoformer.blocks_per_ckpt = None
         self.structure_module = af.structure_module
         self.plddt = af.aux_heads.plddt
         self.pae = af.aux_heads.tm                     # ptm TM/PAE head
         del af                                         # free templates/extra-msa/etc.
 
-        # freeze everything, then unfreeze the last % of: the LAST kept Evoformer
-        # block, and (optionally) the structure module + pLDDT/PAE heads. These all
-        # run OUTSIDE the no_grad prefix, so their gradients flow normally. (reuse
-        # model_1's last-pct unfreezer.)
+        self.full_evoformer = bool(full_evoformer)
         _uf = m1.DistillModel._unfreeze_last_pct
         self.requires_grad_(False)
-        self.unfrozen = {
-            "evo_last_block": _uf(self.evoformer.blocks[K - 1], trainable),
-            "sm": _uf(self.structure_module, unfreeze_sm),
-            "plddt": _uf(self.plddt, unfreeze_plddt),
-            "pae": _uf(self.pae, unfreeze_pae),
-        }
+        if self.full_evoformer:
+            # FULL retrain: input embedder + every kept Evoformer block are trainable.
+            # Gradient checkpointing ON (essential at K=48) — and it WORKS here because
+            # the now-trainable embedder output requires grad (the reentrant checkpoint
+            # only breaks when its inputs don't, which was the frozen-prefix case).
+            self.input_embedder.requires_grad_(True)
+            self.evoformer.requires_grad_(True)
+            self.evoformer.blocks_per_ckpt = 1
+            self.unfrozen = {
+                "input_embedder": 1.0, "evoformer_all": 1.0,
+                "sm": _uf(self.structure_module, unfreeze_sm),
+                "plddt": _uf(self.plddt, unfreeze_plddt),
+                "pae": _uf(self.pae, unfreeze_pae)}
+        else:
+            # lightweight: frozen prefix (run under no_grad in forward), only the last
+            # block's last `trainable` % + optional SM/head tails. No checkpointing
+            # (reentrant checkpoint would detach the trainable block from the no_grad
+            # prefix); cheap enough without it.
+            self.evoformer.blocks_per_ckpt = None
+            self.unfrozen = {
+                "evo_last_block": _uf(self.evoformer.blocks[K - 1], trainable),
+                "sm": _uf(self.structure_module, unfreeze_sm),
+                "plddt": _uf(self.plddt, unfreeze_plddt),
+                "pae": _uf(self.pae, unfreeze_pae)}
         self.evo_layers = K
         self.recycles = 0                              # train loop reads this (no recycle)
         self.to(device)
@@ -105,25 +116,31 @@ class EvoDistillModel(nn.Module):
             batch["aatype"], batch["residue_index"], batch["anchor"],
             batch["segment_id"], batch["seq_mask"],
             anchor_fn=m1.anchor_canonical_resindex)
-        # Run the FROZEN prefix (input embedder + all but the last Evoformer block)
-        # under no_grad: nothing before the trainable last block needs a backward, so
-        # this skips that compute AND frees the prefix activations -> far less memory
-        # (=> a much larger batch) and a faster step.
-        with torch.no_grad():
+        if self.full_evoformer:
+            # everything trainable -> standard checkpointed Evoformer forward.
             m, z = self.input_embedder(feats["target_feat"], feats["residue_index"],
                                        feats["msa_feat"])
-            blocks = self.evoformer._prep_blocks(
-                m=m, z=z, chunk_size=None,
-                use_deepspeed_evo_attention=False, use_cuequivariance_attention=False,
-                use_cuequivariance_multiplicative_update=False, use_lma=False,
-                use_flash=False, msa_mask=feats["msa_mask"],
-                pair_mask=feats["pair_mask"], inplace_safe=False, _mask_trans=True)
-            for blk in blocks[:-1]:
-                m, z = blk(m, z)
-        # the last Evoformer block holds the only trainable params -> run WITH grad;
-        # the frozen SM/heads stay in the graph so grad flows back into that block.
-        m, z = blocks[-1](m, z)
-        s = self.evoformer.linear(m[..., 0, :, :])
+            m, z, s = self.evoformer(m, z, feats["msa_mask"], feats["pair_mask"])
+        else:
+            # Run the FROZEN prefix (input embedder + all but the last Evoformer block)
+            # under no_grad: nothing before the trainable last block needs a backward,
+            # so this skips that compute AND frees the prefix activations -> far less
+            # memory (=> a much larger batch) and a faster step.
+            with torch.no_grad():
+                m, z = self.input_embedder(feats["target_feat"], feats["residue_index"],
+                                           feats["msa_feat"])
+                blocks = self.evoformer._prep_blocks(
+                    m=m, z=z, chunk_size=None, use_deepspeed_evo_attention=False,
+                    use_cuequivariance_attention=False,
+                    use_cuequivariance_multiplicative_update=False, use_lma=False,
+                    use_flash=False, msa_mask=feats["msa_mask"],
+                    pair_mask=feats["pair_mask"], inplace_safe=False, _mask_trans=True)
+                for blk in blocks[:-1]:
+                    m, z = blk(m, z)
+            # the last block holds the only trainable params -> run WITH grad; the
+            # frozen SM/heads stay in the graph so grad flows back into that block.
+            m, z = blocks[-1](m, z)
+            s = self.evoformer.linear(m[..., 0, :, :])
         out = self.structure_module({"single": s, "pair": z}, batch["aatype"],
                                     mask=batch["seq_mask"])
         ca = out["positions"][-1][..., 1, :]
