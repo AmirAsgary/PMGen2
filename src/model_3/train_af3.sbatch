@@ -11,8 +11,8 @@
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:3
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=320G                 # the full AF2 model is built per rank at init
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=280G                 # the full AF2 model is built per rank at init
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/af3/%j.out
 #SBATCH --error=logs/af3/%j.err
