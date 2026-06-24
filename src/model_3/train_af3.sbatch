@@ -21,7 +21,8 @@ SCHEME=two_axis
 FOLD=1
 EVO_LAYERS=3                       # K: first AF2 Evoformer blocks to keep (of 48)
 TRAINABLE=10                       # % of the LAST kept block to fine-tune
-BS=1                               # real Evoformer is heavy (triangle ops) -> small
+BS=4                               # frozen prefix runs under no_grad -> bs can grow;
+                                   #   raise (8/16) while it fits in 40GB (nvidia-smi)
 LR=5e-4
 EPOCHS=12
 

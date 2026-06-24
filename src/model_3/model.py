@@ -97,11 +97,25 @@ class EvoDistillModel(nn.Module):
             batch["aatype"], batch["residue_index"], batch["anchor"],
             batch["segment_id"], batch["seq_mask"],
             anchor_fn=m1.anchor_canonical_resindex)
-        m, z = self.input_embedder(feats["target_feat"], feats["residue_index"],
-                                   feats["msa_feat"])
-        m, z, s = self.evoformer(m, z, feats["msa_mask"], feats["pair_mask"])
-        # frozen SM/heads stay in the autograd graph (grad flows THROUGH them into the
-        # trainable Evoformer slice) — same as model_1.
+        # Run the FROZEN prefix (input embedder + all but the last Evoformer block)
+        # under no_grad: nothing before the trainable last block needs a backward, so
+        # this skips that compute AND frees the prefix activations -> far less memory
+        # (=> a much larger batch) and a faster step.
+        with torch.no_grad():
+            m, z = self.input_embedder(feats["target_feat"], feats["residue_index"],
+                                       feats["msa_feat"])
+            blocks = self.evoformer._prep_blocks(
+                m=m, z=z, chunk_size=None,
+                use_deepspeed_evo_attention=False, use_cuequivariance_attention=False,
+                use_cuequivariance_multiplicative_update=False, use_lma=False,
+                use_flash=False, msa_mask=feats["msa_mask"],
+                pair_mask=feats["pair_mask"], inplace_safe=False, _mask_trans=True)
+            for blk in blocks[:-1]:
+                m, z = blk(m, z)
+        # the last Evoformer block holds the only trainable params -> run WITH grad;
+        # the frozen SM/heads stay in the graph so grad flows back into that block.
+        m, z = blocks[-1](m, z)
+        s = self.evoformer.linear(m[..., 0, :, :])
         out = self.structure_module({"single": s, "pair": z}, batch["aatype"],
                                     mask=batch["seq_mask"])
         ca = out["positions"][-1][..., 1, :]
