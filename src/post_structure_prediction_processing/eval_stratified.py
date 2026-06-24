@@ -125,6 +125,52 @@ def eval_model1(args, device):
 
 
 # --------------------------------------------------------------------------- #
+# model_3 (AF-Evo distill) — same forward contract as model_1
+# --------------------------------------------------------------------------- #
+def eval_model3(args, device):
+    sys.path.insert(0, str(_SRC / "model_3"))
+    import model as M3
+    U = M3.m1                                          # model_1 utils (already loaded)
+    cfg = json.loads((Path(args.ckpt).parent / "config.json").read_text())
+    net = M3.EvoDistillModel(evo_layers=int(cfg.get("evo_layers", 3)),
+                             trainable=float(cfg.get("trainable_pct", 10.0)),
+                             device=device)
+    ck = torch.load(args.ckpt, map_location=device, weights_only=False)
+    net.load_state_dict(ck.get("trainable", {}), strict=False)   # frozen come from npz
+    net.eval()
+    ds = U.build_h5_dataset(args.h5_dir, args.scheme, args.fold, args.split)
+    loader = U.make_dataloader(ds, args.bs, shuffle=False, num_workers=args.num_workers)
+    recs, seen = [], 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = U.move_batch(batch, device)
+            ca, _, _ = net(batch, return_frames=False)
+            sm = batch["seq_mask"]
+            pep = U.peptide_mask_from_batch(sm, batch["segment_id"])
+            for b in range(ca.shape[0]):
+                m = sm[b].bool()
+                pm = pep[b].bool() & m
+                am = (~pep[b].bool()) & m
+                if int(am.sum()) < 3 or int(pm.sum()) < 1:
+                    continue
+                rmsd = U._superpose_rmsd_on(ca[b], batch["teacher_ca"][b], am, pm)
+                if rmsd is None or not torch.isfinite(rmsd):
+                    continue
+                tp = batch["teacher_plddt"][b][pm]
+                recs.append({
+                    "pep_ca_rmsd": float(rmsd),
+                    "pep_plddt_med": float(tp.median()),
+                    "pep_nndist_med": _median_nearest(batch["teacher_ca"][b][pm],
+                                                       batch["teacher_ca"][b][am]),
+                    "pred_nndist_med": _median_nearest(ca[b][pm], ca[b][am]),
+                })
+            seen += ca.shape[0]
+            if args.max_graphs and seen >= args.max_graphs:
+                break
+    return recs, "own predicted MHC (AF2-evo)"
+
+
+# --------------------------------------------------------------------------- #
 # model_2 (MHC-Diff)
 # --------------------------------------------------------------------------- #
 def eval_model2(args, device):
@@ -320,7 +366,7 @@ def report_plot(recs, setting, out_dir: Path, model_tag: str):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", type=int, choices=[1, 2], required=True)
+    ap.add_argument("--model", type=int, choices=[1, 2, 3], required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--h5-dir", required=True)
     ap.add_argument("--scheme", default="two_axis")
@@ -347,6 +393,9 @@ def main(argv=None):
     if args.model == 1:
         recs, setting = eval_model1(args, device)
         tag = f"model_1 ({Path(args.ckpt).parent.name})"
+    elif args.model == 3:
+        recs, setting = eval_model3(args, device)
+        tag = f"model_3 ({Path(args.ckpt).parent.name})"
     else:
         recs, setting = eval_model2(args, device)
         tag = f"model_2 ({Path(args.ckpt).parent.name})"
