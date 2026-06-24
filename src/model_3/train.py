@@ -32,6 +32,12 @@ def parse_args(argv=None):
                    help="K: number of first AF2 Evoformer blocks to keep (of 48)")
     p.add_argument("--trainable", type=float, default=10.0,
                    help="%% of the LAST kept Evoformer block to unfreeze (rest frozen)")
+    p.add_argument("--unfreeze-sm", type=float, default=0.0,
+                   help="%% of the frozen structure module to ALSO unfreeze (last params)")
+    p.add_argument("--unfreeze-plddt", type=float, default=0.0,
+                   help="%% of the pLDDT head to ALSO unfreeze")
+    p.add_argument("--unfreeze-pae", type=float, default=0.0,
+                   help="%% of the PAE/TM head to ALSO unfreeze")
     p.add_argument("--scheme", default="two_axis", choices=["two_axis", "hla_only"])
     p.add_argument("--fold", type=int, default=1)
     p.add_argument("--dummy", action="store_true")
@@ -84,7 +90,9 @@ def main(argv=None):
     total_steps = steps_per_epoch * args.epochs
 
     model = M3.EvoDistillModel(evo_layers=args.evo_layers, trainable=args.trainable,
-                               device=device)
+                               device=device, unfreeze_sm=args.unfreeze_sm,
+                               unfreeze_plddt=args.unfreeze_plddt,
+                               unfreeze_pae=args.unfreeze_pae)
     n_train = sum(p.numel() for p in model.trainable_parameters())
     loss_mod = m1.DistillLoss(*args.lambdas, peptide_weight=args.peptide_weight).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
@@ -98,12 +106,19 @@ def main(argv=None):
 
     run_dir = None
     config = {"evo_layers": args.evo_layers, "trainable_pct": args.trainable,
+              "unfreeze_sm": args.unfreeze_sm, "unfreeze_plddt": args.unfreeze_plddt,
+              "unfreeze_pae": args.unfreeze_pae,
               "unfrozen": getattr(model, "unfrozen", None), "scheme": args.scheme,
               "fold": args.fold, "bs": args.bs, "lr": args.lr,
               "lambdas": tuple(args.lambdas), "peptide_weight": args.peptide_weight,
               "epochs": args.epochs, "trainable_params": n_train, "world": world}
     if args.ckpt_dir is not None:
         run_name = args.run_name or f"af3_{args.scheme}_fold{args.fold}_K{args.evo_layers}"
+        # distinct dir when heads/SM are also unfrozen -> parallel run won't collide
+        if not args.run_name and (args.unfreeze_sm or args.unfreeze_plddt
+                                  or args.unfreeze_pae):
+            run_name += (f"_uf{args.unfreeze_sm:g}-{args.unfreeze_plddt:g}"
+                         f"-{args.unfreeze_pae:g}")
         run_dir = Path(args.ckpt_dir) / run_name
         if is_main:
             run_dir.mkdir(parents=True, exist_ok=True)

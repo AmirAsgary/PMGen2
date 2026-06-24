@@ -25,8 +25,16 @@ BS=4                               # frozen prefix runs under no_grad -> bs can 
                                    #   raise (8/16) while it fits in 40GB (nvidia-smi)
 LR=5e-4
 EPOCHS=3
+# ALSO unfreeze the last % of the frozen tail (structure module + pLDDT/PAE heads).
+# 0-0-0 = heads/SM stay fully frozen (the default run). Set e.g. 10/10/10 for a
+# PARALLEL run that fine-tunes their last layers too — it gets its own _uf dir.
+UNFREEZE_SM=0
+UNFREEZE_PLDDT=0
+UNFREEZE_PAE=0
 
 RUN="af3_${SCHEME}_fold${FOLD}_K${EVO_LAYERS}"
+UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
+[[ "${UF}" != "0-0-0" ]] && RUN="${RUN}_uf${UF}"
 DATE=$(date +%Y%m%d_%H%M%S)
 mkdir -p logs/af3 "checkpoints_model3/${RUN}"
 RUN_LOG="checkpoints_model3/${RUN}/train_${DATE}.log"
@@ -55,6 +63,8 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     src/model_3/train.py \
     --h5-dir "$H5" --scheme "$SCHEME" --fold "$FOLD" \
     --evo-layers ${EVO_LAYERS} --trainable ${TRAINABLE} \
+    --unfreeze-sm ${UNFREEZE_SM} --unfreeze-plddt ${UNFREEZE_PLDDT} \
+    --unfreeze-pae ${UNFREEZE_PAE} \
     --ckpt-dir checkpoints_model3 --run-name "$RUN" \
     --resume "checkpoints_model3/${RUN}/last.pt" \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} \

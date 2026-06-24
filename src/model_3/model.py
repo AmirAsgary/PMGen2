@@ -44,7 +44,8 @@ class EvoDistillModel(nn.Module):
 
     def __init__(self, evo_layers: int = 3, trainable: float = 10.0,
                  model_name: str = "model_2_ptm", npz: Path = NPZ,
-                 device: str = "cpu"):
+                 device: str = "cpu", unfreeze_sm: float = 0.0,
+                 unfreeze_plddt: float = 0.0, unfreeze_pae: float = 0.0):
         super().__init__()
         cfg = model_config(model_name)
         # Build the FULL model and import the full npz cleanly (avoids any
@@ -67,11 +68,18 @@ class EvoDistillModel(nn.Module):
         self.pae = af.aux_heads.tm                     # ptm TM/PAE head
         del af                                         # free templates/extra-msa/etc.
 
-        # freeze everything, then unfreeze the last `trainable` % of the LAST kept
-        # Evoformer block (reuse model_1's last-pct unfreezer).
+        # freeze everything, then unfreeze the last % of: the LAST kept Evoformer
+        # block, and (optionally) the structure module + pLDDT/PAE heads. These all
+        # run OUTSIDE the no_grad prefix, so their gradients flow normally. (reuse
+        # model_1's last-pct unfreezer.)
+        _uf = m1.DistillModel._unfreeze_last_pct
         self.requires_grad_(False)
-        self.unfrozen = m1.DistillModel._unfreeze_last_pct(
-            self.evoformer.blocks[K - 1], trainable)
+        self.unfrozen = {
+            "evo_last_block": _uf(self.evoformer.blocks[K - 1], trainable),
+            "sm": _uf(self.structure_module, unfreeze_sm),
+            "plddt": _uf(self.plddt, unfreeze_plddt),
+            "pae": _uf(self.pae, unfreeze_pae),
+        }
         self.evo_layers = K
         self.recycles = 0                              # train loop reads this (no recycle)
         self.to(device)
