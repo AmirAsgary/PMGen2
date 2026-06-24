@@ -57,7 +57,11 @@ class EvoDistillModel(nn.Module):
         # truncate to the first K blocks (keeps blocks 0..K-1 = correct AF2 weights)
         K = int(evo_layers)
         self.evoformer.blocks = nn.ModuleList(list(self.evoformer.blocks)[:K])
-        self.evoformer.blocks_per_ckpt = 1             # gradient checkpoint each block
+        # NO gradient checkpointing: OpenFold's reentrant checkpoint detaches when the
+        # block inputs don't require grad (ours come from the FROZEN input-embedder),
+        # which severs the trainable last block from the loss. With only one trainable
+        # block + bs 1-2 the activation memory is fine without it.
+        self.evoformer.blocks_per_ckpt = None
         self.structure_module = af.structure_module
         self.plddt = af.aux_heads.plddt
         self.pae = af.aux_heads.tm                     # ptm TM/PAE head
