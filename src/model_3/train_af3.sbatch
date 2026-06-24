@@ -10,21 +10,21 @@
 #SBATCH --job-name=pmgen2_af3
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:2
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=240G                 # the full AF2 model is built per rank at init
+#SBATCH --gres=gpu:a100:3
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=320G                 # the full AF2 model is built per rank at init
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/af3/%j.out
 #SBATCH --error=logs/af3/%j.err
 
 SCHEME=two_axis
 FOLD=1
-EVO_LAYERS=3                       # K: first AF2 Evoformer blocks to keep (of 48)
-TRAINABLE=10                       # % of the LAST kept block to fine-tune
+EVO_LAYERS=10                       # K: first AF2 Evoformer blocks to keep (of 48)
+TRAINABLE=30                       # % of the LAST kept block to fine-tune
 BS=4                               # frozen prefix runs under no_grad -> bs can grow;
                                    #   raise (8/16) while it fits in 40GB (nvidia-smi)
 LR=5e-4
-EPOCHS=12
+EPOCHS=3
 
 RUN="af3_${SCHEME}_fold${FOLD}_K${EVO_LAYERS}"
 DATE=$(date +%Y%m%d_%H%M%S)
