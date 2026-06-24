@@ -161,7 +161,9 @@ def main(argv=None):
         except Exception as e:
             log(f"[m3] WARNING bad checkpoint ({e}); starting fresh")
 
-    log(f"[m3] K={args.evo_layers} trainable={args.trainable}% "
+    scope = ("FULL evoformer+embedder" if args.full_evoformer
+             else f"last block {args.trainable:g}%")
+    log(f"[m3] K={args.evo_layers} | trainable: {scope} "
         f"({n_train:,} params) | train={len(train_ds)} val={len(val_ds)} "
         f"bs={args.bs} world={world} steps/epoch={steps_per_epoch} amp={args.amp}"
         + (f" | ckpt={run_dir}" if run_dir else ""))
