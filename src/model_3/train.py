@@ -90,7 +90,11 @@ def main(argv=None):
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    scaler = torch.amp.GradScaler(device="cuda", enabled=args.amp)
+    # AF2/OpenFold must run in bf16, NOT fp16 (fp16 overflows the Evoformer -> NaN).
+    # bf16 needs no GradScaler (fp32 exponent range), so we keep one only (disabled)
+    # for checkpoint compatibility and use plain backward.
+    amp_dtype = torch.bfloat16 if args.amp else None
+    scaler = torch.amp.GradScaler(device="cuda", enabled=False)
 
     run_dir = None
     config = {"evo_layers": args.evo_layers, "trainable_pct": args.trainable,
@@ -139,9 +143,11 @@ def main(argv=None):
         f"bs={args.bs} world={world} steps/epoch={steps_per_epoch} amp={args.amp}"
         + (f" | ckpt={run_dir}" if run_dir else ""))
 
+    # only the last Evoformer block trains and it's fully used every step -> no unused
+    # params, so find_unused_parameters=False (faster, no extra graph traversal).
     net = (torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[local_rank], output_device=local_rank,
-        find_unused_parameters=True) if distributed else model)
+        find_unused_parameters=False) if distributed else model)
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_loader = m1.make_epoch_loader(train_ds, args.bs, args.num_workers,
@@ -149,10 +155,10 @@ def main(argv=None):
                                             world_size=world)
         tr, global_step = m1.train_one_epoch(
             net, train_loader, loss_mod, optimizer, scheduler, device,
-            scaler if args.amp else None, args.grad_clip,
+            None, args.grad_clip,                      # bf16: plain backward, no scaler
             log=(log if is_main else None), log_every=args.log_every, epoch=epoch,
             global_step=global_step, mlog=mlog, ckpt_every=args.ckpt_every,
-            core=model, is_main=is_main,
+            core=model, is_main=is_main, amp_dtype=amp_dtype,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep, best))
                      if (run_dir is not None and is_main) else None))
         if is_main:

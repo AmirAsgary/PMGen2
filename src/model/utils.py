@@ -1099,7 +1099,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     global_step: int = 0, mlog: Optional[MetricLogger] = None,
                     ckpt_every: int = 0, save_fn=None,
                     recycle_probs: Optional[Sequence[float]] = None,
-                    core: Optional[DistillModel] = None, is_main: bool = True
+                    core: Optional[DistillModel] = None, is_main: bool = True,
+                    amp_dtype=None
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1131,7 +1132,13 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             nr = random.choices(range(len(recycle_probs)), weights=recycle_probs)[0]
         else:
             nr = random.randint(1, max_rc) if max_rc >= 1 else 0
-        with torch.autocast(device_type=dev_type, enabled=use_amp):
+        # amp_dtype=bfloat16 -> autocast in bf16 WITHOUT a GradScaler (bf16 has fp32's
+        # exponent range, so no overflow and no loss scaling needed). This is the path
+        # AF2/OpenFold needs — fp16 overflows the Evoformer into NaN. fp16 (the
+        # original behaviour) still runs when a scaler is enabled.
+        with torch.autocast(device_type=dev_type,
+                            enabled=(use_amp or amp_dtype is not None),
+                            dtype=(amp_dtype or torch.float16)):
             ca, plddt, pae, frames = model(batch, return_frames=True, num_recycles=nr)
             total, terms = loss_mod(ca, plddt, pae, frames, batch)
         if use_amp:
