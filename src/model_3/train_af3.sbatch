@@ -17,20 +17,22 @@
 #SBATCH --output=logs/af3/%j.out
 #SBATCH --error=logs/af3/%j.err
 
-SCHEME=two_axis
-FOLD=1
-EVO_LAYERS=10                       # K: first AF2 Evoformer blocks to keep (of 48)
-TRAINABLE=30                       # % of the LAST kept block to fine-tune
-BS=4                               # frozen prefix runs under no_grad -> bs can grow;
-                                   #   raise (8/16) while it fits in 40GB (nvidia-smi)
-LR=5e-4
-EPOCHS=3
+# All knobs are env-overridable, so a parallel variant needs no file edit, e.g.:
+#   UNFREEZE_SM=10 UNFREEZE_PLDDT=10 UNFREEZE_PAE=10 sbatch src/model_3/train_af3.sbatch
+SCHEME=${SCHEME:-two_axis}
+FOLD=${FOLD:-1}
+EVO_LAYERS=${EVO_LAYERS:-10}        # K: first AF2 Evoformer blocks to keep (of 48)
+TRAINABLE=${TRAINABLE:-30}          # % of the LAST kept block to fine-tune
+BS=${BS:-4}                         # frozen prefix runs under no_grad -> bs can grow;
+                                    #   raise (8/16) while it fits in 40GB (nvidia-smi)
+LR=${LR:-5e-4}
+EPOCHS=${EPOCHS:-3}
 # ALSO unfreeze the last % of the frozen tail (structure module + pLDDT/PAE heads).
 # 0-0-0 = heads/SM stay fully frozen (the default run). Set e.g. 10/10/10 for a
 # PARALLEL run that fine-tunes their last layers too — it gets its own _uf dir.
-UNFREEZE_SM=0
-UNFREEZE_PLDDT=0
-UNFREEZE_PAE=0
+UNFREEZE_SM=${UNFREEZE_SM:-0}
+UNFREEZE_PLDDT=${UNFREEZE_PLDDT:-0}
+UNFREEZE_PAE=${UNFREEZE_PAE:-0}
 
 RUN="af3_${SCHEME}_fold${FOLD}_K${EVO_LAYERS}"
 UF="${UNFREEZE_SM}-${UNFREEZE_PLDDT}-${UNFREEZE_PAE}"
