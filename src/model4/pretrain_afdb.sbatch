@@ -31,9 +31,13 @@ MLM_FRAC=${MLM_FRAC:-0.15}
 ANCHOR_REVEAL=${ANCHOR_REVEAL:-0.2}
 ANCHOR_SEQSEP=${ANCHOR_SEQSEP:-6}
 FREEZE_PLDDT=${FREEZE_PLDDT:-1}
+WARMUP=${WARMUP:-1000}
 L1=${L1:-0}
 WD=${WD:-1e-4}
-LAMBDAS=${LAMBDAS:-"1.0 0.5 0.5"}        # plddt mlm anchor
+LAMBDAS=${LAMBDAS:-"1.0 0.5 0.3 0.5"}    # plddt mlm anchor distogram
+# GRADCKPT=1 trades a little compute for ~40% less activation memory -> bigger BS.
+GRADCKPT=${GRADCKPT:-0}
+GC_FLAG=""; [[ "${GRADCKPT}" == "1" ]] && GC_FLAG="--grad-checkpoint"
 
 RUN="afdb_b${BLOCKS}_crop${CROP}"
 [[ "${L1}" != "0" ]] && RUN="${RUN}_l1${L1}"
@@ -66,6 +70,7 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --blocks ${BLOCKS} --crop-len ${CROP} --dropout ${DROPOUT} \
     --mlm-frac ${MLM_FRAC} --anchor-reveal-prob ${ANCHOR_REVEAL} \
     --anchor-seq-sep ${ANCHOR_SEQSEP} --freeze-plddt-epochs ${FREEZE_PLDDT} \
+    --warmup-steps ${WARMUP} ${GC_FLAG} \
     --lambdas ${LAMBDAS} --l1 ${L1} --weight-decay ${WD} \
     --ckpt-dir checkpoints_model4 --run-name "$RUN" \
     --resume "checkpoints_model4/${RUN}/last.pt" \

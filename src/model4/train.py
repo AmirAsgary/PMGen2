@@ -26,11 +26,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import model as M                                            # noqa: E402
-from data import AFDBMonomerDataset, worker_init_fn          # noqa: E402
+from data import (AFDBMonomerDataset, worker_init_fn, collate_varlen,  # noqa: E402
+                  LengthBucketBatchSampler)
 
 AF_PLDDT_DEFAULT = "params/alphafold/plddt_af2.pt"
 
@@ -46,7 +47,11 @@ def parse_args(argv=None):
     p.add_argument("--c-s", type=int, default=384)
     p.add_argument("--c-z", type=int, default=128)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--both-tri-mul", action="store_true")
+    p.add_argument("--both-tri-mul", action=argparse.BooleanOptionalAction, default=True,
+                   help="use both outgoing+incoming triangle multiplication (B1)")
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="gradient-checkpoint each block (A4): less activation memory, "
+                        "bigger batch / more blocks at a small recompute cost")
     p.add_argument("--mlm-frac", type=float, default=0.15)
     p.add_argument("--anchor-reveal-prob", type=float, default=0.2)
     p.add_argument("--reveal-frac-max", type=float, default=0.5)
@@ -62,11 +67,13 @@ def parse_args(argv=None):
     p.add_argument("--pair-fp32", action="store_true",
                    help="force the pair stack to fp32 (only needed under fp16 amp; "
                         "default bf16 keeps it in autocast for tensor-core speed)")
-    p.add_argument("--lambdas", type=float, nargs=3, default=[1.0, 0.5, 0.5],
-                   help="[plddt, mlm, anchor]")
+    p.add_argument("--lambdas", type=float, nargs=4, default=[1.0, 0.5, 0.3, 0.5],
+                   help="[plddt, mlm, anchor, distogram]")
     p.add_argument("--l1", type=float, default=0.0)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup-steps", type=int, default=1000,
+                   help="linear LR warmup steps before cosine decay (A3)")
     p.add_argument("--bs", type=int, default=4)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--amp", action="store_true")
@@ -100,17 +107,17 @@ def setup_distributed():
     return False, 0, 0, 1
 
 
-def make_loader(ds, bs, num_workers, epoch, distributed, rank, world, seed, shuffle):
-    if distributed:
-        sampler = DistributedSampler(ds, num_replicas=world, rank=rank,
-                                     shuffle=shuffle, seed=seed, drop_last=False)
-        sampler.set_epoch(epoch)
-    else:
-        sampler = RandomSampler(ds) if shuffle else None
-    return DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=num_workers,
-                      pin_memory=True, drop_last=False,
-                      worker_init_fn=worker_init_fn,
-                      persistent_workers=bool(num_workers))
+def make_sampler(ds, bs, distributed, rank, world, seed, shuffle):
+    return LengthBucketBatchSampler(
+        ds.lengths, bs, num_replicas=(world if distributed else 1),
+        rank=(rank if distributed else 0), shuffle=shuffle, seed=seed,
+        drop_last=shuffle)                          # drop_last on train -> even DDP steps
+
+
+def make_loader(ds, sampler, num_workers):
+    return DataLoader(ds, batch_sampler=sampler, num_workers=num_workers,
+                      pin_memory=True, worker_init_fn=worker_init_fn,
+                      collate_fn=collate_varlen)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,8 +136,9 @@ def mlm_ce(logits, labels):
 
 
 def anchor_bce(logits, target, loss_mask, neg_ratio):
-    pos = (target > 0.5) & (loss_mask > 0.5)
-    neg = (target < 0.5) & (loss_mask > 0.5)
+    target = target.float(); m = loss_mask.float()
+    pos = (target > 0.5) & (m > 0.5)
+    neg = (target < 0.5) & (m > 0.5)
     n_pos = int(pos.sum().item())
     if n_pos == 0:
         keep = neg & (torch.rand_like(target) < 0.001)
@@ -141,6 +149,15 @@ def anchor_bce(logits, target, loss_mask, neg_ratio):
     if sel.sum() == 0:
         return logits.sum() * 0.0
     return F.binary_cross_entropy_with_logits(logits[sel], target[sel])
+
+
+def disto_ce(logits, target, loss_mask):
+    # logits [B,N,N,16]; target uint8 [B,N,N]; dense over all real (unleaked) pairs
+    nb = logits.shape[-1]
+    ce = F.cross_entropy(logits.reshape(-1, nb), target.long().reshape(-1),
+                         reduction="none")
+    m = loss_mask.float().reshape(-1)
+    return (ce * m).sum() / m.sum().clamp_min(1.0)
 
 
 def _pearson(x, y):
@@ -170,8 +187,13 @@ def batch_metrics(out, batch):
     am = batch["anchor_loss_mask"] > 0.5
     if am.any():
         ap = (torch.sigmoid(out["anchor_logits"])[am] > 0.5).float()
-        at = batch["anchor_target"][am]
+        at = batch["anchor_target"][am].float()
         metr["anchor_acc"] = float((ap == at).float().mean())
+    dm = batch["disto_loss_mask"] > 0.5
+    if dm.any():
+        dp = out["disto_logits"].argmax(-1)[dm]
+        dt = batch["disto_target"][dm].long()
+        metr["disto_acc"] = float((dp == dt).float().mean())
     return metr
 
 
@@ -180,8 +202,10 @@ def compute_loss(out, batch, lambdas, neg_ratio):
     lm = mlm_ce(out["mlm_logits"], batch["mlm_labels"])
     la = anchor_bce(out["anchor_logits"], batch["anchor_target"],
                     batch["anchor_loss_mask"], neg_ratio)
-    total = lambdas[0] * lp + lambdas[1] * lm + lambdas[2] * la
-    return total, {"plddt_ce": float(lp), "mlm_ce": float(lm), "anchor_bce": float(la)}
+    ld = disto_ce(out["disto_logits"], batch["disto_target"], batch["disto_loss_mask"])
+    total = lambdas[0] * lp + lambdas[1] * lm + lambdas[2] * la + lambdas[3] * ld
+    return total, {"plddt_ce": float(lp), "mlm_ce": float(lm),
+                   "anchor_bce": float(la), "disto_ce": float(ld)}
 
 
 def l1_penalty(params):
@@ -228,7 +252,8 @@ def main(argv=None):
     # model
     model = M.PlddtModel(c_s=args.c_s, c_z=args.c_z, n_blocks=args.blocks,
                          dropout=args.dropout, both_tri_mul=args.both_tri_mul,
-                         pair_fp32=args.pair_fp32).to(device)
+                         pair_fp32=args.pair_fp32,
+                         grad_checkpoint=args.grad_checkpoint).to(device)
     if not args.no_af_plddt and Path(args.af_plddt_path).exists():
         model.load_af_plddt(args.af_plddt_path)
         if is_main:
@@ -242,9 +267,19 @@ def main(argv=None):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
-    steps_per_epoch = max(1, len(train_ds) // (args.bs * world))
-    total_steps = steps_per_epoch * args.epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    # steps/epoch come from the length-bucket sampler (even across ranks)
+    train_sampler = make_sampler(train_ds, args.bs, distributed, rank, world,
+                                 args.seed, shuffle=True)
+    steps_per_epoch = len(train_sampler)
+    total_steps = max(1, steps_per_epoch * args.epochs)
+    # linear warmup -> cosine decay (A3)
+    warmup = max(1, min(args.warmup_steps, total_steps // 10))
+    sched_warm = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-2, total_iters=warmup)
+    sched_cos = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - warmup))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, [sched_warm, sched_cos], milestones=[warmup])
 
     if is_main:
         summary = M.summarize_model(model)
@@ -269,7 +304,8 @@ def main(argv=None):
 
     log_path = run_dir / "metrics.csv"
     log_cols = ["wall", "split", "epoch", "step", "lr", "total", "plddt_ce", "mlm_ce",
-                "anchor_bce", "plddt_mae", "plddt_spear", "mlm_acc", "anchor_acc"]
+                "anchor_bce", "disto_ce", "plddt_mae", "plddt_spear", "mlm_acc",
+                "anchor_acc", "disto_acc"]
     if is_main and not log_path.exists():
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(log_cols)
@@ -280,8 +316,9 @@ def main(argv=None):
         row = [round(time.time(), 1), split, epoch, step, lr,
                losses.get("total", 0.0), losses.get("plddt_ce", 0.0),
                losses.get("mlm_ce", 0.0), losses.get("anchor_bce", 0.0),
-               metr.get("plddt_mae", 0.0), metr.get("plddt_spear", 0.0),
-               metr.get("mlm_acc", 0.0), metr.get("anchor_acc", 0.0)]
+               losses.get("disto_ce", 0.0), metr.get("plddt_mae", 0.0),
+               metr.get("plddt_spear", 0.0), metr.get("mlm_acc", 0.0),
+               metr.get("anchor_acc", 0.0), metr.get("disto_acc", 0.0)]
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([round(x, 4) if isinstance(x, float) else x for x in row])
 
@@ -304,8 +341,8 @@ def main(argv=None):
             print(f"epoch {epoch}/{args.epochs}: pLDDT head unfrozen layers = "
                   f"{unfrozen if unfrozen else 'NONE (frozen)'}")
         net.train()
-        loader = make_loader(train_ds, args.bs, args.num_workers, epoch,
-                             distributed, rank, world, args.seed, shuffle=True)
+        train_sampler.set_epoch(epoch)
+        loader = make_loader(train_ds, train_sampler, args.num_workers)
         t0 = time.time()
         for it, batch in enumerate(loader):
             batch = to_device(batch, device)
@@ -339,7 +376,8 @@ def main(argv=None):
             vmetr, vloss = evaluate(net, val_ds, args, device, amp_ctx)
             print(f"[val] e{epoch} plddt_ce={vloss['plddt_ce']:.3f} "
                   f"spear={vmetr.get('plddt_spear',0):.3f} mae={vmetr.get('plddt_mae',0):.2f} "
-                  f"mlm_acc={vmetr.get('mlm_acc',0):.3f} anch_acc={vmetr.get('anchor_acc',0):.3f}")
+                  f"mlm_acc={vmetr.get('mlm_acc',0):.3f} anch_acc={vmetr.get('anchor_acc',0):.3f} "
+                  f"disto_acc={vmetr.get('disto_acc',0):.3f}")
             log_row("val", epoch, global_step, scheduler.get_last_lr()[0], vloss, vmetr)
             save_ckpt(run_dir / "last.pt", model, optimizer, scheduler,
                       epoch, global_step, best, vars(args))
@@ -357,8 +395,10 @@ def main(argv=None):
 @torch.no_grad()
 def evaluate(net, ds, args, device, amp_ctx):
     net.eval()
-    loader = DataLoader(ds, batch_size=args.bs, shuffle=False,
-                        num_workers=args.num_workers, worker_init_fn=worker_init_fn)
+    sampler = LengthBucketBatchSampler(ds.lengths, args.bs, num_replicas=1, rank=0,
+                                       shuffle=False, drop_last=False)
+    loader = DataLoader(ds, batch_sampler=sampler, num_workers=args.num_workers,
+                        worker_init_fn=worker_init_fn, collate_fn=collate_varlen)
     agg_l, agg_m, n = {}, {}, 0
     for it, batch in enumerate(loader):
         if args.eval_batches and it >= args.eval_batches:

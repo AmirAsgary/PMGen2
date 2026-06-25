@@ -71,16 +71,27 @@ MASK_TOKEN = N_AA + 2                        # 27
 VOCAB_SIZE = N_AA + 3                         # 28  (pad, 25 aa, sep, mask)
 
 MAX_SEGMENTS = 16                            # simulated chains (domains) per crop
+SEG_SEP = MAX_SEGMENTS                       # reserved segment id for SEP / pad rows
 N_PE_BINS = 16                              # 0..13 contact dist, 14 non-contact, 15 null
 PE_NULL_BIN = 15
 N_ANCHOR_STATES = 3                          # 0=Unknown, 1=NoAnchor, 2=AnchorKnown
+N_DIST_BINS = 16                            # distogram: 15 buckets over [0,8A) + 1 ">=8A"
+N_DIST_FAR = N_DIST_BINS - 1                 # bin index for non-contact (>=8A) pairs
 
 
-def _relpos_onehot(residue_index: torch.Tensor, max_offset: int) -> torch.Tensor:
-    """AF-style clipped relative-position one-hot. residue_index: [B, N] (long)."""
+def _chain_relpos_onehot(residue_index: torch.Tensor, segment_id: torch.Tensor,
+                         max_offset: int) -> torch.Tensor:
+    """AF-Multimer-style relative position: clipped |i-j| WITHIN a segment, plus a
+    dedicated 'different-segment' bin for cross-chain pairs. residue_index is reset
+    per segment, so same-segment offsets are true sequence separations and cross-
+    segment pairs are explicitly distinguished (key for the cross-chain anchors).
+    Returns [B, N, N, 2*max_offset+2]."""
     diff = residue_index[:, :, None] - residue_index[:, None, :]
-    binned = diff.clamp(-max_offset, max_offset) + max_offset       # 0..2k
-    return F.one_hot(binned, num_classes=2 * max_offset + 1).float()
+    binned = diff.clamp(-max_offset, max_offset) + max_offset           # 0..2k
+    same = segment_id[:, :, None] == segment_id[:, None, :]             # [B,N,N]
+    diff_idx = 2 * max_offset + 1                                       # extra bin
+    binned = torch.where(same, binned, torch.full_like(binned, diff_idx))
+    return F.one_hot(binned, num_classes=2 * max_offset + 2).float()
 
 
 # --------------------------------------------------------------------------- #
@@ -91,8 +102,8 @@ class Featurizer(nn.Module):
         super().__init__()
         self.max_offset = max_offset
         self.tok_emb = nn.Embedding(VOCAB_SIZE, c_s, padding_idx=PAD_TOKEN)
-        self.seg_emb = nn.Embedding(MAX_SEGMENTS + 1, c_s)             # +1 pad slot
-        self.relpos = Linear(2 * max_offset + 1, c_z)
+        self.seg_emb = nn.Embedding(MAX_SEGMENTS + 1, c_s)             # +1 SEP/pad slot
+        self.relpos = Linear(2 * max_offset + 2, c_z)                  # +1 cross-segment bin
         self.left = Linear(c_s, c_z)
         self.right = Linear(c_s, c_z)
         self.anchor_state = Linear(N_ANCHOR_STATES, c_z)               # 3-way one-hot
@@ -100,14 +111,14 @@ class Featurizer(nn.Module):
 
     def forward(self, tokens, residue_index, segment_id,
                 anchor_state, pe_bin) -> Tuple[torch.Tensor, torch.Tensor]:
-        seg = segment_id.clamp(0, MAX_SEGMENTS)                        # pad/oob -> last slot
+        seg = segment_id.clamp(0, MAX_SEGMENTS)                        # SEP/pad -> last slot
         s0 = self.tok_emb(tokens) + self.seg_emb(seg)                  # [B,N,c_s]
-        rel = self.relpos(_relpos_onehot(residue_index, self.max_offset))
+        rel = self.relpos(_chain_relpos_onehot(residue_index, segment_id, self.max_offset))
         astate = self.anchor_state(
-            F.one_hot(anchor_state.clamp(0, N_ANCHOR_STATES - 1),
+            F.one_hot(anchor_state.long().clamp(0, N_ANCHOR_STATES - 1),
                       num_classes=N_ANCHOR_STATES).float())
         z0 = (self.left(s0)[:, :, None, :] + self.right(s0)[:, None, :, :]
-              + rel + astate + self.pe_emb(pe_bin.clamp(0, N_PE_BINS - 1)))
+              + rel + astate + self.pe_emb(pe_bin.long().clamp(0, N_PE_BINS - 1)))
         return s0, z0
 
 
@@ -148,7 +159,7 @@ class SingleRowEvoBlock(nn.Module):
                  c_hidden_tri: int = 32, no_heads_tri: int = 4, no_heads_s: int = 8,
                  c_hidden_s: int = 32, c_hidden_opm: int = 32,
                  transition_factor: int = 4, dropout: float = 0.1,
-                 both_tri_mul: bool = False, pair_fp32: bool = False):
+                 both_tri_mul: bool = True, pair_fp32: bool = False):
         super().__init__()
         # pair_fp32=True forces the pair stack to fp32. Only needed under *fp16*
         # autocast, where OpenFold's 1e9 inf-masking overflows (-> NaN on padded
@@ -200,10 +211,11 @@ class SingleRowEvoBlock(nn.Module):
 class PlddtModel(nn.Module):
     def __init__(self, c_s: int = 384, c_z: int = 128, n_blocks: int = 1,
                  dropout: float = 0.1, max_offset: int = 32,
-                 both_tri_mul: bool = False, no_plddt_bins: int = 50,
-                 pair_fp32: bool = False):
+                 both_tri_mul: bool = True, no_plddt_bins: int = 50,
+                 pair_fp32: bool = False, grad_checkpoint: bool = False):
         super().__init__()
         self.c_s, self.c_z = c_s, c_z
+        self.grad_checkpoint = grad_checkpoint
         self.featurizer = Featurizer(c_s, c_z, max_offset=max_offset)
         self.blocks = nn.ModuleList([
             SingleRowEvoBlock(c_s, c_z, dropout=dropout, both_tri_mul=both_tri_mul,
@@ -213,7 +225,8 @@ class PlddtModel(nn.Module):
         self.plddt_head = PerResidueLDDTCaPredictor(
             no_bins=no_plddt_bins, c_in=c_s, c_hidden=128)
         self.mlm_head = Linear(c_s, VOCAB_SIZE, init="final")
-        self.anchor_head = Linear(c_z, 1, init="final")
+        self.anchor_head = Linear(c_z, 1, init="final")               # binary anchor
+        self.disto_head = Linear(c_z, N_DIST_BINS, init="final")      # distogram (B2)
 
     # -- representation + heads ------------------------------------------- #
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -223,12 +236,17 @@ class PlddtModel(nn.Module):
                                batch["pe_bin"])
         pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]
         for blk in self.blocks:
-            s, z = blk(s, z, seq_mask, pair_mask)
+            if self.grad_checkpoint and self.training:
+                s, z = torch.utils.checkpoint.checkpoint(
+                    blk, s, z, seq_mask, pair_mask, use_reentrant=False)
+            else:
+                s, z = blk(s, z, seq_mask, pair_mask)
         z_sym = 0.5 * (z + z.transpose(1, 2))
         return {
             "plddt_logits": self.plddt_head(s),                       # [B,N,50]
             "mlm_logits": self.mlm_head(s),                           # [B,N,VOCAB]
             "anchor_logits": self.anchor_head(z_sym).squeeze(-1),     # [B,N,N]
+            "disto_logits": self.disto_head(z_sym),                   # [B,N,N,16]
             "single": s, "pair": z,
         }
 
@@ -280,7 +298,8 @@ _DATAFLOW = r"""
    |
    v  Featurizer
    single s[B,N,{cs}]                pair z[B,N,N,{cz}]
-   = tok_emb + seg_emb              = left(s)+right(s) + relpos
+   = tok_emb + seg_emb              = left(s)+right(s)
+                                      + chain_relpos (per-segment + cross-seg bin)
                                       + anchor_state(3) + pe_bin(16)
    |
    |  x{nb} SingleRowEvoBlock:
@@ -292,7 +311,8 @@ _DATAFLOW = r"""
    |     z += OuterProductMean(s)       # pair  <- single
    |     z += PairTransition(z)
    v
- heads:  pLDDT(s)->[B,N,50]   MLM(s)->[B,N,{vocab}]   Anchor(sym z)->[B,N,N]
+ heads:  pLDDT(s)->[B,N,50]   MLM(s)->[B,N,{vocab}]
+         Anchor(sym z)->[B,N,N]   Distogram(sym z)->[B,N,N,16]
 """
 
 
@@ -306,6 +326,8 @@ def summarize_model(model: "PlddtModel", title: str = "model4 / PlddtModel") -> 
     tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     lines = ["=" * 72, title, "=" * 72, diagram, "-" * 72,
              f"pair stack dtype : {'fp32 (forced)' if (blk and blk.pair_fp32) else 'autocast (bf16)'}",
+             f"both tri-mul     : {blk.tri_mul_in is not None if blk else False}",
+             f"grad checkpoint  : {model.grad_checkpoint}",
              f"parameters       : total={tot:,}  trainable={tr:,}", "-" * 72,
              f"{'module':22s}{'params':>14s}   class"]
     for name, mod in model.named_children():
