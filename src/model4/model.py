@@ -77,6 +77,8 @@ PE_NULL_BIN = 15
 N_ANCHOR_STATES = 3                          # 0=Unknown, 1=NoAnchor, 2=AnchorKnown
 N_DIST_BINS = 16                            # distogram: 15 buckets over [0,8A) + 1 ">=8A"
 N_DIST_FAR = N_DIST_BINS - 1                 # bin index for non-contact (>=8A) pairs
+PLDDT_HEAD_DIM = 384                         # AF pLDDT head input dim (fixed by weights);
+                                            # the body runs narrower and up-projects to this
 
 
 def _chain_relpos_onehot(residue_index: torch.Tensor, segment_id: torch.Tensor,
@@ -155,12 +157,16 @@ class SingleRowEvoBlock(nn.Module):
     """pair tri-mul + tri-attn -> single<-pair -> pair rowwise attn + transition
     -> pair<-single (outer product mean) -> pair transition."""
 
-    def __init__(self, c_s: int, c_z: int, *, c_hidden_mul: int = 128,
-                 c_hidden_tri: int = 32, no_heads_tri: int = 4, no_heads_s: int = 8,
-                 c_hidden_s: int = 32, c_hidden_opm: int = 32,
+    def __init__(self, c_s: int, c_z: int, *, c_hidden_mul: Optional[int] = None,
+                 c_hidden_tri: int = 32, no_heads_tri: int = 4, no_heads_s: int = 4,
+                 c_hidden_s: Optional[int] = None, c_hidden_opm: int = 32,
                  transition_factor: int = 4, dropout: float = 0.1,
                  both_tri_mul: bool = True, pair_fp32: bool = False):
         super().__init__()
+        # hidden widths scale with the (narrow) channel so the dominant O(N^3)
+        # triangle-mul cost shrinks with c_z; tri-attn/opm heads stay small.
+        c_hidden_mul = c_hidden_mul or c_z
+        c_hidden_s = c_hidden_s or max(8, c_s // no_heads_s)
         # pair_fp32=True forces the pair stack to fp32. Only needed under *fp16*
         # autocast, where OpenFold's 1e9 inf-masking overflows (-> NaN on padded
         # rows). Under bf16 (our default) 1e9 is representable, so we leave it in
@@ -209,12 +215,13 @@ class SingleRowEvoBlock(nn.Module):
 # Full model.
 # --------------------------------------------------------------------------- #
 class PlddtModel(nn.Module):
-    def __init__(self, c_s: int = 384, c_z: int = 128, n_blocks: int = 1,
+    def __init__(self, c_s: int = 64, c_z: int = 64, n_blocks: int = 1,
                  dropout: float = 0.1, max_offset: int = 32,
                  both_tri_mul: bool = True, no_plddt_bins: int = 50,
-                 pair_fp32: bool = False, grad_checkpoint: bool = False):
+                 pair_fp32: bool = False, grad_checkpoint: bool = False,
+                 plddt_c: int = PLDDT_HEAD_DIM):
         super().__init__()
-        self.c_s, self.c_z = c_s, c_z
+        self.c_s, self.c_z, self.plddt_c = c_s, c_z, plddt_c
         self.grad_checkpoint = grad_checkpoint
         self.featurizer = Featurizer(c_s, c_z, max_offset=max_offset)
         self.blocks = nn.ModuleList([
@@ -222,8 +229,16 @@ class PlddtModel(nn.Module):
                               pair_fp32=pair_fp32)
             for _ in range(n_blocks)
         ])
+        # Up-projection transition: the narrow single (c_s) is widened to the AF
+        # pLDDT head's native dim so its pretrained weights load unchanged. This
+        # adapter is always trainable (it learns to feed the frozen AF head).
+        # NB: a normal (non-zero "final") init on the last layer so the adapter
+        # passes signal into the pretrained AF head from step 0.
+        self.plddt_proj = nn.Sequential(
+            LayerNorm(c_s), Linear(c_s, plddt_c, init="relu"), nn.ReLU(),
+            Linear(plddt_c, plddt_c, init="default"))
         self.plddt_head = PerResidueLDDTCaPredictor(
-            no_bins=no_plddt_bins, c_in=c_s, c_hidden=128)
+            no_bins=no_plddt_bins, c_in=plddt_c, c_hidden=128)
         self.mlm_head = Linear(c_s, VOCAB_SIZE, init="final")
         self.anchor_head = Linear(c_z, 1, init="final")               # binary anchor
         self.disto_head = Linear(c_z, N_DIST_BINS, init="final")      # distogram (B2)
@@ -243,7 +258,7 @@ class PlddtModel(nn.Module):
                 s, z = blk(s, z, seq_mask, pair_mask)
         z_sym = 0.5 * (z + z.transpose(1, 2))
         return {
-            "plddt_logits": self.plddt_head(s),                       # [B,N,50]
+            "plddt_logits": self.plddt_head(self.plddt_proj(s)),      # up-proj -> AF head [B,N,50]
             "mlm_logits": self.mlm_head(s),                           # [B,N,VOCAB]
             "anchor_logits": self.anchor_head(z_sym).squeeze(-1),     # [B,N,N]
             "disto_logits": self.disto_head(z_sym),                   # [B,N,N,16]
@@ -311,7 +326,7 @@ _DATAFLOW = r"""
    |     z += OuterProductMean(s)       # pair  <- single
    |     z += PairTransition(z)
    v
- heads:  pLDDT(s)->[B,N,50]   MLM(s)->[B,N,{vocab}]
+ heads:  pLDDT( up-proj s:{cs}->{pc} -> AF head )->[B,N,50]   MLM(s)->[B,N,{vocab}]
          Anchor(sym z)->[B,N,N]   Distogram(sym z)->[B,N,N,16]
 """
 
@@ -319,7 +334,8 @@ _DATAFLOW = r"""
 def summarize_model(model: "PlddtModel", title: str = "model4 / PlddtModel") -> str:
     blk = model.blocks[0] if len(model.blocks) else None
     diagram = _DATAFLOW.format(
-        cs=model.c_s, cz=model.c_z, nb=len(model.blocks), vocab=VOCAB_SIZE,
+        cs=model.c_s, cz=model.c_z, pc=model.plddt_c, nb=len(model.blocks),
+        vocab=VOCAB_SIZE,
         tmi=" + TriangleMultiplicationIncoming(z)"
             if (blk is not None and blk.tri_mul_in is not None) else "")
     tot = sum(p.numel() for p in model.parameters())

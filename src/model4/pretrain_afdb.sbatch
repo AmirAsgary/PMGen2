@@ -11,9 +11,9 @@
 #SBATCH --job-name=pmgen2_m4
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:2
+#SBATCH --gres=gpu:a100:4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=120G
+#SBATCH --mem=280G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/m4/%j.out
 #SBATCH --error=logs/m4/%j.err
@@ -21,8 +21,10 @@
 # Env-overridable knobs (no file edit for a parallel variant).
 BLOCKS=${BLOCKS:-1}
 CROP=${CROP:-256}
-BS=${BS:-8}
-LR=${LR:-3e-4}
+CS=${CS:-32}                        # body single channel (AF pLDDT head up-projects to 384)
+CZ=${CZ:-64}                        # body pair channel
+BS=${BS:-16}
+LR=${LR:-1e-2}
 # pLDDT head: frozen epoch 0, then 1 layer/epoch unfrozen (output->input) over the
 # next 4 epochs -> keep EPOCHS >= FREEZE_PLDDT+4 so it fully unfreezes with margin.
 EPOCHS=${EPOCHS:-8}
@@ -34,7 +36,7 @@ FREEZE_PLDDT=${FREEZE_PLDDT:-1}
 WARMUP=${WARMUP:-1000}
 L1=${L1:-0}
 WD=${WD:-1e-4}
-LAMBDAS=${LAMBDAS:-"1.0 0.5 0.3 0.5"}    # plddt mlm anchor distogram
+LAMBDAS=${LAMBDAS:-"1.0 0.1 0.1 0.1"}    # plddt mlm anchor distogram
 # GRADCKPT=1 trades a little compute for ~40% less activation memory -> bigger BS.
 GRADCKPT=${GRADCKPT:-0}
 GC_FLAG=""; [[ "${GRADCKPT}" == "1" ]] && GC_FLAG="--grad-checkpoint"
@@ -67,7 +69,7 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --master_addr=127.0.0.1 --master_port=${PORT} \
     src/model4/train.py \
     --h5 "$H5" --domains-tsv "$DOMAINS" \
-    --blocks ${BLOCKS} --crop-len ${CROP} --dropout ${DROPOUT} \
+    --blocks ${BLOCKS} --crop-len ${CROP} --c-s ${CS} --c-z ${CZ} --dropout ${DROPOUT} \
     --mlm-frac ${MLM_FRAC} --anchor-reveal-prob ${ANCHOR_REVEAL} \
     --anchor-seq-sep ${ANCHOR_SEQSEP} --freeze-plddt-epochs ${FREEZE_PLDDT} \
     --warmup-steps ${WARMUP} ${GC_FLAG} \

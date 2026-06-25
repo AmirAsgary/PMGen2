@@ -44,8 +44,8 @@ def parse_args(argv=None):
     p.add_argument("--domains-tsv", default=None)
     p.add_argument("--crop-len", type=int, default=256)
     p.add_argument("--blocks", type=int, default=1)
-    p.add_argument("--c-s", type=int, default=384)
-    p.add_argument("--c-z", type=int, default=128)
+    p.add_argument("--c-s", type=int, default=64, help="single channel (body width)")
+    p.add_argument("--c-z", type=int, default=64, help="pair channel (body width)")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--both-tri-mul", action=argparse.BooleanOptionalAction, default=True,
                    help="use both outgoing+incoming triangle multiplication (B1)")
