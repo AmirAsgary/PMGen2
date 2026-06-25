@@ -1,0 +1,74 @@
+#!/bin/bash -l
+# ============================================================================
+# model4 / plddt_model — stage-1 pretraining on the AFDB monomer set.
+# Predicts per-residue pLDDT (50-bin CE) + aux masked-LM + aux anchor/contact.
+# AF pLDDT head initialised + frozen for FREEZE_PLDDT epochs, then unfrozen.
+# Resumable; multi-GPU via DDP (torchrun).
+#
+# Submit:   sbatch src/model4/pretrain_afdb.sbatch
+# Continue: re-submit (--resume picks up last.pt at the epoch boundary).
+# ============================================================================
+#SBATCH --job-name=pmgen2_m4
+#SBATCH --nodes=1
+#SBATCH --constraint="gpu"
+#SBATCH --gres=gpu:a100:2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=120G
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/m4/%j.out
+#SBATCH --error=logs/m4/%j.err
+
+# Env-overridable knobs (no file edit for a parallel variant).
+BLOCKS=${BLOCKS:-1}
+CROP=${CROP:-256}
+BS=${BS:-8}
+LR=${LR:-3e-4}
+EPOCHS=${EPOCHS:-5}
+DROPOUT=${DROPOUT:-0.1}
+MLM_FRAC=${MLM_FRAC:-0.15}
+ANCHOR_REVEAL=${ANCHOR_REVEAL:-0.2}
+ANCHOR_SEQSEP=${ANCHOR_SEQSEP:-6}
+FREEZE_PLDDT=${FREEZE_PLDDT:-1}
+L1=${L1:-0}
+WD=${WD:-1e-4}
+LAMBDAS=${LAMBDAS:-"1.0 0.5 0.5"}        # plddt mlm anchor
+
+RUN="afdb_b${BLOCKS}_crop${CROP}"
+[[ "${L1}" != "0" ]] && RUN="${RUN}_l1${L1}"
+DATE=$(date +%Y%m%d_%H%M%S)
+mkdir -p logs/m4 "checkpoints_model4/${RUN}"
+RUN_LOG="checkpoints_model4/${RUN}/train_${DATE}.log"
+exec > >(tee -a "$RUN_LOG") 2> >(tee -a "$RUN_LOG" >&2)
+echo "=== $(date '+%F %T') | ${RUN} on $(hostname) ==="
+nvidia-smi -L || true
+
+export PYTHONUNBUFFERED=1
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=0
+module load apptainer gcc/13 cuda/12.6 openmpi_gpu/5.0
+PY=$(conda info --base)/envs/pmgen2/bin/python
+cd "$HOME/projects/PMGen_2/PMGen2" || cd "$HOME/amir/ParseFold/PMGen2" || { echo "FATAL: repo dir missing"; exit 1; }
+mamba activate pmgen2
+
+H5=data/afdb/plddt_dataset.h5
+DOMAINS=data/afdb/final_domains_mapped_clean.tsv
+[[ -f "$H5" ]] || { echo "FATAL: $H5 not found"; exit 1; }
+
+NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); NGPU=${NGPU:-1}
+PORT=$((29700 + ${SLURM_ARRAY_TASK_ID:-0}))
+echo "launching on ${NGPU} GPU(s) via torchrun (rdzv port ${PORT})"
+$PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
+    --master_addr=127.0.0.1 --master_port=${PORT} \
+    src/model4/train.py \
+    --h5 "$H5" --domains-tsv "$DOMAINS" \
+    --blocks ${BLOCKS} --crop-len ${CROP} --dropout ${DROPOUT} \
+    --mlm-frac ${MLM_FRAC} --anchor-reveal-prob ${ANCHOR_REVEAL} \
+    --anchor-seq-sep ${ANCHOR_SEQSEP} --freeze-plddt-epochs ${FREEZE_PLDDT} \
+    --lambdas ${LAMBDAS} --l1 ${L1} --weight-decay ${WD} \
+    --ckpt-dir checkpoints_model4 --run-name "$RUN" \
+    --resume "checkpoints_model4/${RUN}/last.pt" \
+    --epochs ${EPOCHS} --bs ${BS} --lr ${LR} \
+    --log-every 50 --ckpt-every 1000 \
+    --num-workers 4 --amp
+
+exit $?
