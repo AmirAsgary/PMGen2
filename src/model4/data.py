@@ -55,8 +55,8 @@ class AFDBMonomerDataset(Dataset):
                  anchor_seq_sep: int = 6, reveal_prob: float = 0.2,
                  reveal_frac_max: float = 0.5, pe_reveal_frac: float = 0.5,
                  neg_reveal_frac: float = 0.02, mlm_frac: float = 0.15,
-                 val_frac: float = 0.005, seed: int = 0, min_len: int = 8,
-                 limit: Optional[int] = None):
+                 val_frac: float = 0.1, test_frac: float = 0.1, seed: int = 0,
+                 min_len: int = 8, limit: Optional[int] = None):
         self.h5_path = str(h5_path)
         self.crop_len = crop_len
         self.max_offset = max_offset
@@ -77,10 +77,15 @@ class AFDBMonomerDataset(Dataset):
             self.pdb_id = f["pdb_id"][:]                       # bytes array
         n = self.seq_length.shape[0]
 
-        # deterministic train/val split (no index file needed)
+        # deterministic random 80/10/10 train/val/test split (no index file needed)
+        assert split in ("train", "val", "test"), split
         perm = np.random.default_rng(seed).permutation(n)
+        n_test = int(n * test_frac)
         n_val = int(n * val_frac)
-        idx = perm[:n_val] if split == "val" else perm[n_val:]
+        parts = {"test": perm[:n_test],
+                 "val": perm[n_test:n_test + n_val],
+                 "train": perm[n_test + n_val:]}
+        idx = parts[split]
         idx = idx[self.seq_length[idx] >= min_len]
         if limit is not None:
             idx = idx[:limit]

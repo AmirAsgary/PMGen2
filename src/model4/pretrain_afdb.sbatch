@@ -23,7 +23,9 @@ BLOCKS=${BLOCKS:-1}
 CROP=${CROP:-256}
 BS=${BS:-8}
 LR=${LR:-3e-4}
-EPOCHS=${EPOCHS:-5}
+# pLDDT head: frozen epoch 0, then 1 layer/epoch unfrozen (output->input) over the
+# next 4 epochs -> keep EPOCHS >= FREEZE_PLDDT+4 so it fully unfreezes with margin.
+EPOCHS=${EPOCHS:-8}
 DROPOUT=${DROPOUT:-0.1}
 MLM_FRAC=${MLM_FRAC:-0.15}
 ANCHOR_REVEAL=${ANCHOR_REVEAL:-0.2}

@@ -21,6 +21,7 @@ Env: pmgen2 (~/miniforge3/envs/pmgen2/bin/python).
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -147,8 +148,13 @@ class SingleRowEvoBlock(nn.Module):
                  c_hidden_tri: int = 32, no_heads_tri: int = 4, no_heads_s: int = 8,
                  c_hidden_s: int = 32, c_hidden_opm: int = 32,
                  transition_factor: int = 4, dropout: float = 0.1,
-                 both_tri_mul: bool = False):
+                 both_tri_mul: bool = False, pair_fp32: bool = False):
         super().__init__()
+        # pair_fp32=True forces the pair stack to fp32. Only needed under *fp16*
+        # autocast, where OpenFold's 1e9 inf-masking overflows (-> NaN on padded
+        # rows). Under bf16 (our default) 1e9 is representable, so we leave it in
+        # bf16 -> the O(N^3) triangle ops use tensor cores (the main speedup).
+        self.pair_fp32 = pair_fp32
         self.tri_mul_out = TriangleMultiplicationOutgoing(c_z, c_hidden_mul)
         self.tri_mul_in = (TriangleMultiplicationIncoming(c_z, c_hidden_mul)
                            if both_tri_mul else None)
@@ -160,25 +166,30 @@ class SingleRowEvoBlock(nn.Module):
         self.pair_trans2 = PairTransition(c_z, transition_factor)
         self.drop = nn.Dropout(dropout)
 
+    def _pair_ctx(self, dev: str):
+        return (torch.autocast(device_type=dev, enabled=False)
+                if self.pair_fp32 else contextlib.nullcontext())
+
     def forward(self, s, z, seq_mask, pair_mask):
-        # OpenFold's triangle ops 1e9-mask overflows under fp16 autocast (fully
-        # padded rows -> NaN); run the whole pair stack in fp32 (mirrors model_1
-        # PairUpdate). tri-mul already forces fp32 internally, so this is cheap.
-        with torch.autocast(device_type=z.device.type, enabled=False):
-            z = z.float()
+        dev = z.device.type
+        with self._pair_ctx(dev):
+            if self.pair_fp32:
+                z = z.float()
             z = z + self.drop(self.tri_mul_out(z, mask=pair_mask))
             if self.tri_mul_in is not None:
                 z = z + self.drop(self.tri_mul_in(z, mask=pair_mask))
             z = z + self.drop(self.tri_attn_start(z, mask=pair_mask))
             z = z * pair_mask[..., None]
-        s = self.single(s, z, seq_mask)
+        s = self.single(s, z, seq_mask)                       # single <- pair
         s = s * seq_mask[..., None]
-        with torch.autocast(device_type=z.device.type, enabled=False):
-            z = z.float()
+        with self._pair_ctx(dev):
+            if self.pair_fp32:
+                z = z.float()
             z = z + self.drop(self.tri_attn_end(z, mask=pair_mask))
             z = z + self.pair_trans1(z, mask=pair_mask)
-            z = z + self.opm(s.float().unsqueeze(1), mask=seq_mask.float().unsqueeze(1))
-            z = z + self.pair_trans2(z, mask=pair_mask)
+            m_in = s.float() if self.pair_fp32 else s
+            z = z + self.opm(m_in.unsqueeze(1), mask=seq_mask.float().unsqueeze(1))
+            z = z + self.pair_trans2(z, mask=pair_mask)        # pair <- single
             z = z * pair_mask[..., None]
         return s, z
 
@@ -189,12 +200,14 @@ class SingleRowEvoBlock(nn.Module):
 class PlddtModel(nn.Module):
     def __init__(self, c_s: int = 384, c_z: int = 128, n_blocks: int = 1,
                  dropout: float = 0.1, max_offset: int = 32,
-                 both_tri_mul: bool = False, no_plddt_bins: int = 50):
+                 both_tri_mul: bool = False, no_plddt_bins: int = 50,
+                 pair_fp32: bool = False):
         super().__init__()
         self.c_s, self.c_z = c_s, c_z
         self.featurizer = Featurizer(c_s, c_z, max_offset=max_offset)
         self.blocks = nn.ModuleList([
-            SingleRowEvoBlock(c_s, c_z, dropout=dropout, both_tri_mul=both_tri_mul)
+            SingleRowEvoBlock(c_s, c_z, dropout=dropout, both_tri_mul=both_tri_mul,
+                              pair_fp32=pair_fp32)
             for _ in range(n_blocks)
         ])
         self.plddt_head = PerResidueLDDTCaPredictor(
@@ -228,6 +241,26 @@ class PlddtModel(nn.Module):
         for p in self.plddt_head.parameters():
             p.requires_grad_(flag)
 
+    def plddt_head_groups(self):
+        """Head sub-modules ordered output->input (gradual-unfreeze order)."""
+        h = self.plddt_head
+        return [("linear_3", h.linear_3), ("linear_2", h.linear_2),
+                ("linear_1", h.linear_1), ("layer_norm", h.layer_norm)]
+
+    def set_plddt_unfreeze(self, n_groups: int) -> List[str]:
+        """Unfreeze the first ``n_groups`` head layers (from the output side);
+        freeze the rest. n_groups=0 -> fully frozen, >=4 -> fully trainable.
+        DDP-safe: the module is wrapped with all params trainable, so the reducer
+        already tracks these; toggling requires_grad later syncs correctly."""
+        for p in self.plddt_head.parameters():
+            p.requires_grad_(False)
+        unfrozen = []
+        for name, mod in self.plddt_head_groups()[:max(0, n_groups)]:
+            for p in mod.parameters():
+                p.requires_grad_(True)
+            unfrozen.append(name)
+        return unfrozen
+
     def trainable_parameters(self) -> List[nn.Parameter]:
         return [p for p in self.parameters() if p.requires_grad]
 
@@ -239,3 +272,44 @@ class PlddtModel(nn.Module):
 def predicted_plddt(plddt_logits: torch.Tensor) -> torch.Tensor:
     """Expected pLDDT in [0,100] from 50-bin logits (OpenFold convention)."""
     return compute_plddt(plddt_logits)
+
+
+_DATAFLOW = r"""
+ inputs: tokens[B,N]  residue_index[B,N]  segment_id[B,N]
+         anchor_state[B,N,N]  pe_bin[B,N,N]   (token_mask[B,N])
+   |
+   v  Featurizer
+   single s[B,N,{cs}]                pair z[B,N,N,{cz}]
+   = tok_emb + seg_emb              = left(s)+right(s) + relpos
+                                      + anchor_state(3) + pe_bin(16)
+   |
+   |  x{nb} SingleRowEvoBlock:
+   |     z += TriangleMultiplicationOutgoing(z){tmi}
+   |     z += TriangleAttentionStartingNode(z)
+   |     s  = SingleUpdate(s, z)        # single <- pair (attn bias) + transition
+   |     z += TriangleAttentionEndingNode(z)
+   |     z += PairTransition(z)
+   |     z += OuterProductMean(s)       # pair  <- single
+   |     z += PairTransition(z)
+   v
+ heads:  pLDDT(s)->[B,N,50]   MLM(s)->[B,N,{vocab}]   Anchor(sym z)->[B,N,N]
+"""
+
+
+def summarize_model(model: "PlddtModel", title: str = "model4 / PlddtModel") -> str:
+    blk = model.blocks[0] if len(model.blocks) else None
+    diagram = _DATAFLOW.format(
+        cs=model.c_s, cz=model.c_z, nb=len(model.blocks), vocab=VOCAB_SIZE,
+        tmi=" + TriangleMultiplicationIncoming(z)"
+            if (blk is not None and blk.tri_mul_in is not None) else "")
+    tot = sum(p.numel() for p in model.parameters())
+    tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lines = ["=" * 72, title, "=" * 72, diagram, "-" * 72,
+             f"pair stack dtype : {'fp32 (forced)' if (blk and blk.pair_fp32) else 'autocast (bf16)'}",
+             f"parameters       : total={tot:,}  trainable={tr:,}", "-" * 72,
+             f"{'module':22s}{'params':>14s}   class"]
+    for name, mod in model.named_children():
+        n = sum(p.numel() for p in mod.parameters())
+        lines.append(f"{name:22s}{n:>14,}   {mod.__class__.__name__}")
+    lines.append("=" * 72)
+    return "\n".join(lines)

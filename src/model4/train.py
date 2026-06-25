@@ -54,7 +54,14 @@ def parse_args(argv=None):
     p.add_argument("--neg-reveal-frac", type=float, default=0.02)
     p.add_argument("--anchor-seq-sep", type=int, default=6)
     p.add_argument("--neg-ratio", type=float, default=4.0, help="anchor-loss neg:pos")
-    p.add_argument("--freeze-plddt-epochs", type=int, default=1)
+    p.add_argument("--freeze-plddt-epochs", type=int, default=1,
+                   help="epochs the AF pLDDT head stays fully frozen before unfreezing")
+    p.add_argument("--gradual-unfreeze", action=argparse.BooleanOptionalAction, default=True,
+                   help="after the freeze, unfreeze the pLDDT head one layer/epoch "
+                        "(output->input); --no-gradual-unfreeze unfreezes it all at once")
+    p.add_argument("--pair-fp32", action="store_true",
+                   help="force the pair stack to fp32 (only needed under fp16 amp; "
+                        "default bf16 keeps it in autocast for tensor-core speed)")
     p.add_argument("--lambdas", type=float, nargs=3, default=[1.0, 0.5, 0.5],
                    help="[plddt, mlm, anchor]")
     p.add_argument("--l1", type=float, default=0.0)
@@ -65,7 +72,8 @@ def parse_args(argv=None):
     p.add_argument("--amp", action="store_true")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--val-frac", type=float, default=0.005)
+    p.add_argument("--val-frac", type=float, default=0.1)
+    p.add_argument("--test-frac", type=float, default=0.1)
     p.add_argument("--min-len", type=int, default=8)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -191,6 +199,9 @@ def main(argv=None):
     is_main = rank == 0
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed + rank)
+    # TF32 for any residual fp32 matmuls (cheap global speedup on Ampere+)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     run_name = args.run_name or f"afdb_b{args.blocks}_cs{args.c_s}"
     run_dir = Path(args.ckpt_dir) / run_name
@@ -203,17 +214,21 @@ def main(argv=None):
                   anchor_seq_sep=args.anchor_seq_sep, reveal_prob=args.anchor_reveal_prob,
                   reveal_frac_max=args.reveal_frac_max, pe_reveal_frac=args.pe_reveal_frac,
                   neg_reveal_frac=args.neg_reveal_frac, mlm_frac=args.mlm_frac,
-                  val_frac=args.val_frac, seed=args.seed, min_len=args.min_len,
-                  max_offset=32)
+                  val_frac=args.val_frac, test_frac=args.test_frac, seed=args.seed,
+                  min_len=args.min_len, max_offset=32)
     train_ds = AFDBMonomerDataset(split="train", limit=args.limit, **common)
     val_ds = AFDBMonomerDataset(split="val",
                                 limit=(args.limit if args.limit else None), **common)
+    test_ds = AFDBMonomerDataset(split="test",
+                                 limit=(args.limit if args.limit else None), **common)
     if is_main:
-        print(f"train={len(train_ds)} val={len(val_ds)} device={device} ddp={distributed}")
+        print(f"split 80/10/10 -> train={len(train_ds)} val={len(val_ds)} "
+              f"test={len(test_ds)} | device={device} ddp={distributed} world={world}")
 
     # model
     model = M.PlddtModel(c_s=args.c_s, c_z=args.c_z, n_blocks=args.blocks,
-                         dropout=args.dropout, both_tri_mul=args.both_tri_mul).to(device)
+                         dropout=args.dropout, both_tri_mul=args.both_tri_mul,
+                         pair_fp32=args.pair_fp32).to(device)
     if not args.no_af_plddt and Path(args.af_plddt_path).exists():
         model.load_af_plddt(args.af_plddt_path)
         if is_main:
@@ -230,6 +245,15 @@ def main(argv=None):
     steps_per_epoch = max(1, len(train_ds) // (args.bs * world))
     total_steps = steps_per_epoch * args.epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    if is_main:
+        summary = M.summarize_model(model)
+        print(summary)
+        print(f"schedule: {args.epochs} epochs x {steps_per_epoch} steps/epoch "
+              f"= {total_steps} total optimizer steps (bs={args.bs} x world={world})")
+        (run_dir / "architecture.txt").write_text(
+            summary + f"\n\n{args.epochs} epochs x {steps_per_epoch} steps = "
+            f"{total_steps} total steps\n")
 
     start_epoch, global_step, best = 0, 0, float("inf")
     if args.resume and Path(args.resume).exists():
@@ -264,12 +288,21 @@ def main(argv=None):
     amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                if args.amp and device.type == "cuda" else torch.autocast("cpu", enabled=False))
 
+    n_head_groups = len(model.plddt_head_groups())
     for epoch in range(start_epoch, args.epochs):
-        # freeze schedule for the AF pLDDT head
-        model.set_plddt_trainable(epoch >= args.freeze_plddt_epochs)
+        # pLDDT-head freeze schedule: fully frozen for the first
+        # --freeze-plddt-epochs, then gradually unfrozen one layer/epoch
+        # (output->input), or all-at-once if --no-gradual-unfreeze.
+        if epoch < args.freeze_plddt_epochs:
+            n_unfreeze = 0
+        elif args.gradual_unfreeze:
+            n_unfreeze = min(epoch - args.freeze_plddt_epochs + 1, n_head_groups)
+        else:
+            n_unfreeze = n_head_groups
+        unfrozen = model.set_plddt_unfreeze(n_unfreeze)
         if is_main:
-            print(f"epoch {epoch}: plddt_head trainable="
-                  f"{epoch >= args.freeze_plddt_epochs}")
+            print(f"epoch {epoch}/{args.epochs}: pLDDT head unfrozen layers = "
+                  f"{unfrozen if unfrozen else 'NONE (frozen)'}")
         net.train()
         loader = make_loader(train_ds, args.bs, args.num_workers, epoch,
                              distributed, rank, world, args.seed, shuffle=True)
@@ -292,10 +325,10 @@ def main(argv=None):
                 losses["total"] = float(total)
                 metr = batch_metrics(out, batch)
                 its = (it + 1) / (time.time() - t0)
-                print(f"e{epoch} s{global_step} loss={float(total):.3f} "
-                      f"plddt={losses['plddt_ce']:.3f} mlm={losses['mlm_ce']:.3f} "
-                      f"anch={losses['anchor_bce']:.3f} spear={metr.get('plddt_spear',0):.3f} "
-                      f"{its:.2f}it/s")
+                print(f"e{epoch}/{args.epochs} s{global_step}/{total_steps} "
+                      f"loss={float(total):.3f} plddt={losses['plddt_ce']:.3f} "
+                      f"mlm={losses['mlm_ce']:.3f} anch={losses['anchor_bce']:.3f} "
+                      f"spear={metr.get('plddt_spear',0):.3f} {its:.2f}it/s")
                 log_row("train", epoch, global_step, scheduler.get_last_lr()[0], losses, metr)
             if is_main and global_step % args.ckpt_every == 0:
                 save_ckpt(run_dir / "last.pt", model, optimizer, scheduler,
