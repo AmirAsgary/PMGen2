@@ -11,9 +11,9 @@
 #SBATCH --job-name=pmgen2_m4
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:2
+#SBATCH --gres=gpu:a100:4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=130G
+#SBATCH --mem=280G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/m4_2/%j.out
 #SBATCH --error=logs/m4_2/%j.err
