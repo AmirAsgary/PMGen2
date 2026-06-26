@@ -13,7 +13,7 @@
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=240G
+#SBATCH --mem=130G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/m4_2/%j.out
 #SBATCH --error=logs/m4_2/%j.err
