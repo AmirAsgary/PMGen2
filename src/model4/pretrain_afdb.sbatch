@@ -28,12 +28,24 @@ LR=${LR:-1e-2}
 # pLDDT head: frozen epoch 0, then 1 layer/epoch unfrozen (output->input) over the
 # next 4 epochs -> keep EPOCHS >= FREEZE_PLDDT+4 so it fully unfreezes with margin.
 EPOCHS=${EPOCHS:-8}
+# Per-epoch validation batches PER RANK (val set is huge: ~230k). Distributed eval
+# shards across ranks; a cap keeps each epoch's val quick. Set EVAL_BATCHES=0 for full val.
+EVAL_BATCHES=${EVAL_BATCHES:-200}
 DROPOUT=${DROPOUT:-0.1}
 MLM_FRAC=${MLM_FRAC:-0.15}
 ANCHOR_REVEAL=${ANCHOR_REVEAL:-0.2}
 ANCHOR_SEQSEP=${ANCHOR_SEQSEP:-6}
 FREEZE_PLDDT=${FREEZE_PLDDT:-1}
+# GRADUAL=1: unfreeze the pLDDT head one layer/epoch after the freeze (default).
+# GRADUAL=0: unfreeze the WHOLE head at once (use with FREEZE_PLDDT=0 to continue a
+#            run with the full head trainable from the resumed epoch).
+GRADUAL=${GRADUAL:-1}
+GRADUAL_FLAG="--gradual-unfreeze"; [[ "${GRADUAL}" == "0" ]] && GRADUAL_FLAG="--no-gradual-unfreeze"
 WARMUP=${WARMUP:-1000}
+# RESET_SCHED=1: on resume, start a FRESH optimizer + warmup->cosine over the
+# remaining steps using the LR/WARMUP below (e.g. to fine-tune at a lower LR).
+RESET_SCHED=${RESET_SCHED:-0}
+RESET_FLAG=""; [[ "${RESET_SCHED}" == "1" ]] && RESET_FLAG="--reset-schedule"
 L1=${L1:-0}
 WD=${WD:-1e-4}
 LAMBDAS=${LAMBDAS:-"1.0 0.1 0.1 0.1"}    # plddt mlm anchor distogram
@@ -72,7 +84,7 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --blocks ${BLOCKS} --crop-len ${CROP} --c-s ${CS} --c-z ${CZ} --dropout ${DROPOUT} \
     --mlm-frac ${MLM_FRAC} --anchor-reveal-prob ${ANCHOR_REVEAL} \
     --anchor-seq-sep ${ANCHOR_SEQSEP} --freeze-plddt-epochs ${FREEZE_PLDDT} \
-    --warmup-steps ${WARMUP} ${GC_FLAG} \
+    ${GRADUAL_FLAG} --warmup-steps ${WARMUP} ${GC_FLAG} ${RESET_FLAG} --eval-batches ${EVAL_BATCHES} \
     --lambdas ${LAMBDAS} --l1 ${L1} --weight-decay ${WD} \
     --ckpt-dir checkpoints_model4 --run-name "$RUN" \
     --resume "checkpoints_model4/${RUN}/last.pt" \

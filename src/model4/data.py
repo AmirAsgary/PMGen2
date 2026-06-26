@@ -297,10 +297,15 @@ class LengthBucketBatchSampler:
         self.mm = megabatch_mult
         self.drop_last = drop_last
         self.epoch = 0
+        self._start = 0                       # batches to skip (mid-epoch resume)
         self._len = len(self._build(0))
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+
+    def set_start(self, start: int) -> None:
+        """Skip the first `start` batches of this epoch (resume mid-epoch)."""
+        self._start = max(0, min(int(start), self._len))
 
     def _build(self, epoch: int):
         n = len(self.lengths)
@@ -322,11 +327,11 @@ class LengthBucketBatchSampler:
         return batches
 
     def __iter__(self):
-        for b in self._build(self.epoch):
+        for b in self._build(self.epoch)[self._start:]:
             yield b.tolist()
 
     def __len__(self) -> int:
-        return self._len
+        return max(0, self._len - self._start)
 
 
 def worker_init_fn(worker_id: int) -> None:

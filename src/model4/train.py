@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,10 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup-steps", type=int, default=1000,
                    help="linear LR warmup steps before cosine decay (A3)")
+    p.add_argument("--reset-schedule", action="store_true",
+                   help="on --resume, start a FRESH optimizer + warmup->cosine schedule "
+                        "over the remaining steps using the new --lr/--warmup-steps "
+                        "(default: continue the checkpoint's saved schedule)")
     p.add_argument("--bs", type=int, default=4)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--amp", action="store_true")
@@ -101,7 +106,10 @@ def setup_distributed():
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world = int(os.environ["WORLD_SIZE"])
-        torch.distributed.init_process_group(backend="nccl")
+        # generous timeout so a long collective (e.g. end-of-epoch eval) never
+        # trips the default 10-min NCCL watchdog and aborts the job.
+        torch.distributed.init_process_group(backend="nccl",
+                                             timeout=timedelta(minutes=60))
         torch.cuda.set_device(local_rank)
         return True, rank, local_rank, world
     return False, 0, 0, 1
@@ -272,14 +280,45 @@ def main(argv=None):
                                  args.seed, shuffle=True)
     steps_per_epoch = len(train_sampler)
     total_steps = max(1, steps_per_epoch * args.epochs)
-    # linear warmup -> cosine decay (A3)
-    warmup = max(1, min(args.warmup_steps, total_steps // 10))
-    sched_warm = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-2, total_iters=warmup)
-    sched_cos = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup))
+
+    # ---- resume: load weights + figure out exactly where we left off -------- #
+    start_epoch, global_step, best, resume_skip = 0, 0, float("inf"), 0
+    resume_ck = None
+    if args.resume and Path(args.resume).exists():
+        resume_ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        model.load_state_dict(resume_ck["model"], strict=False)
+        ck_epoch = int(resume_ck["epoch"])
+        global_step = int(resume_ck.get("global_step", 0))
+        best = float(resume_ck.get("best", best))
+        if "step_in_epoch" in resume_ck:                 # new-format ckpt: exact position
+            step_in_epoch = int(resume_ck["step_in_epoch"])
+            epoch_completed = bool(resume_ck.get("epoch_completed", False))
+        else:                                            # old ckpt: infer (assumes same world*bs)
+            step_in_epoch = max(0, global_step - ck_epoch * steps_per_epoch)
+            epoch_completed = step_in_epoch == 0
+        if epoch_completed or step_in_epoch >= steps_per_epoch:
+            start_epoch, resume_skip = ck_epoch + 1, 0    # epoch done -> next epoch
+        else:
+            start_epoch, resume_skip = ck_epoch, step_in_epoch  # continue mid-epoch
+
+    # ---- LR schedule: continue the saved one, or start fresh over remaining -- #
+    remaining = max(1, steps_per_epoch * (args.epochs - start_epoch) - resume_skip)
+    fresh_sched = (resume_ck is None) or args.reset_schedule
+    horizon = remaining if (resume_ck is not None and args.reset_schedule) else total_steps
+    warmup = max(1, min(args.warmup_steps, horizon // 10))
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [sched_warm, sched_cos], milestones=[warmup])
+        optimizer,
+        [torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-2, total_iters=warmup),
+         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, horizon - warmup))],
+        milestones=[warmup])
+    if resume_ck is not None and not args.reset_schedule:
+        optimizer.load_state_dict(resume_ck["optimizer"])
+        scheduler.load_state_dict(resume_ck["scheduler"])
+    if resume_ck is not None and is_main:
+        msg = (f"FRESH schedule (lr={args.lr}, warmup {warmup} -> cosine over {horizon} steps)"
+               if args.reset_schedule else "continued saved LR schedule")
+        print(f"resumed from {args.resume}: start_epoch={start_epoch} skip={resume_skip} "
+              f"global_step={global_step} | {msg}")
 
     if is_main:
         summary = M.summarize_model(model)
@@ -289,18 +328,6 @@ def main(argv=None):
         (run_dir / "architecture.txt").write_text(
             summary + f"\n\n{args.epochs} epochs x {steps_per_epoch} steps = "
             f"{total_steps} total steps\n")
-
-    start_epoch, global_step, best = 0, 0, float("inf")
-    if args.resume and Path(args.resume).exists():
-        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(ck["model"], strict=False)
-        optimizer.load_state_dict(ck["optimizer"])
-        scheduler.load_state_dict(ck["scheduler"])
-        start_epoch = int(ck["epoch"]) + 1
-        global_step = int(ck.get("global_step", 0))
-        best = float(ck.get("best", best))
-        if is_main:
-            print(f"resumed from {args.resume} @ epoch {start_epoch}")
 
     log_path = run_dir / "metrics.csv"
     log_cols = ["wall", "split", "epoch", "step", "lr", "total", "plddt_ce", "mlm_ce",
@@ -342,9 +369,13 @@ def main(argv=None):
                   f"{unfrozen if unfrozen else 'NONE (frozen)'}")
         net.train()
         train_sampler.set_epoch(epoch)
+        # resume mid-epoch only on the first resumed epoch; later epochs run in full
+        skip = resume_skip if epoch == start_epoch else 0
+        train_sampler.set_start(skip)
         loader = make_loader(train_ds, train_sampler, args.num_workers)
         t0 = time.time()
         for it, batch in enumerate(loader):
+            step_in_epoch = skip + it + 1                  # true position within the epoch
             batch = to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx:
@@ -369,22 +400,25 @@ def main(argv=None):
                 log_row("train", epoch, global_step, scheduler.get_last_lr()[0], losses, metr)
             if is_main and global_step % args.ckpt_every == 0:
                 save_ckpt(run_dir / "last.pt", model, optimizer, scheduler,
-                          epoch, global_step, best, vars(args))
+                          epoch, global_step, best, vars(args),
+                          step_in_epoch=step_in_epoch, epoch_completed=False)
 
-        # validation (rank 0)
+        # validation — ALL ranks (sharded + all-reduced); only rank 0 logs/saves
+        vmetr, vloss = evaluate(net, val_ds, args, device, amp_ctx,
+                                distributed, rank, world)
         if is_main:
-            vmetr, vloss = evaluate(net, val_ds, args, device, amp_ctx)
             print(f"[val] e{epoch} plddt_ce={vloss['plddt_ce']:.3f} "
                   f"spear={vmetr.get('plddt_spear',0):.3f} mae={vmetr.get('plddt_mae',0):.2f} "
                   f"mlm_acc={vmetr.get('mlm_acc',0):.3f} anch_acc={vmetr.get('anchor_acc',0):.3f} "
                   f"disto_acc={vmetr.get('disto_acc',0):.3f}")
             log_row("val", epoch, global_step, scheduler.get_last_lr()[0], vloss, vmetr)
+            # epoch fully done -> mark completed so a resume starts the NEXT epoch
             save_ckpt(run_dir / "last.pt", model, optimizer, scheduler,
-                      epoch, global_step, best, vars(args))
+                      epoch, global_step, best, vars(args), epoch_completed=True)
             if vloss["plddt_ce"] < best:
                 best = vloss["plddt_ce"]
                 save_ckpt(run_dir / "best.pt", model, optimizer, scheduler,
-                          epoch, global_step, best, vars(args))
+                          epoch, global_step, best, vars(args), epoch_completed=True)
         if distributed:
             torch.distributed.barrier()
 
@@ -392,14 +426,25 @@ def main(argv=None):
         torch.distributed.destroy_process_group()
 
 
+_EVAL_L = ["plddt_ce", "mlm_ce", "anchor_bce", "disto_ce"]
+_EVAL_M = ["plddt_mae", "plddt_pear", "plddt_spear", "mlm_acc", "anchor_acc", "disto_acc"]
+
+
 @torch.no_grad()
-def evaluate(net, ds, args, device, amp_ctx):
+def evaluate(net, ds, args, device, amp_ctx, distributed, rank, world):
+    """Distributed validation: every rank evaluates its shard, then sums are
+    all-reduced. Keeps ranks in lockstep (no lone-rank divergence -> no barrier
+    timeout) and is ~world x faster than rank-0-only eval. drop_last under DDP
+    guarantees equal per-rank batch counts so all ranks reach the all-reduce."""
     net.eval()
-    sampler = LengthBucketBatchSampler(ds.lengths, args.bs, num_replicas=1, rank=0,
-                                       shuffle=False, drop_last=False)
+    sampler = LengthBucketBatchSampler(
+        ds.lengths, args.bs, num_replicas=(world if distributed else 1),
+        rank=(rank if distributed else 0), shuffle=False, drop_last=distributed)
     loader = DataLoader(ds, batch_sampler=sampler, num_workers=args.num_workers,
                         worker_init_fn=worker_init_fn, collate_fn=collate_varlen)
-    agg_l, agg_m, n = {}, {}, 0
+    keys = _EVAL_L + _EVAL_M
+    sums = {k: 0.0 for k in keys}
+    n = 0
     for it, batch in enumerate(loader):
         if args.eval_batches and it >= args.eval_batches:
             break
@@ -408,18 +453,24 @@ def evaluate(net, ds, args, device, amp_ctx):
             out = net(batch)
             _, losses = compute_loss(out, batch, args.lambdas, args.neg_ratio)
         metr = batch_metrics(out, batch)
-        for k, v in losses.items():
-            agg_l[k] = agg_l.get(k, 0.0) + v
-        for k, v in metr.items():
-            agg_m[k] = agg_m.get(k, 0.0) + v
+        for k in _EVAL_L:
+            sums[k] += losses.get(k, 0.0)
+        for k in _EVAL_M:
+            sums[k] += metr.get(k, 0.0)
         n += 1
     net.train()
-    n = max(1, n)
-    return {k: v / n for k, v in agg_m.items()}, {k: v / n for k, v in agg_l.items()}
+    vec = torch.tensor([sums[k] for k in keys] + [float(n)], device=device)
+    if distributed:
+        torch.distributed.all_reduce(vec, op=torch.distributed.ReduceOp.SUM)
+    n_tot = max(1.0, vec[-1].item())
+    vals = {k: vec[i].item() / n_tot for i, k in enumerate(keys)}
+    return {k: vals[k] for k in _EVAL_M}, {k: vals[k] for k in _EVAL_L}
 
 
-def save_ckpt(path, model, optimizer, scheduler, epoch, step, best, config):
+def save_ckpt(path, model, optimizer, scheduler, epoch, step, best, config,
+              step_in_epoch=0, epoch_completed=False):
     torch.save({"epoch": epoch, "global_step": step, "best": best,
+                "step_in_epoch": step_in_epoch, "epoch_completed": epoch_completed,
                 "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(), "config": config}, path)
 
