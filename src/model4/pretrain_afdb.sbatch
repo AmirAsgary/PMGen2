@@ -11,12 +11,12 @@
 #SBATCH --job-name=pmgen2_m4
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=240G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/m4/%j.out
-#SBATCH --error=logs/m4/%j.err
+#SBATCH --output=logs/m4_2/%j.out
+#SBATCH --error=logs/m4_2/%j.err
 
 # Env-overridable knobs (no file edit for a parallel variant).
 BLOCKS=${BLOCKS:-1}
@@ -41,7 +41,7 @@ LAMBDAS=${LAMBDAS:-"1.0 0.1 0.1 0.1"}    # plddt mlm anchor distogram
 GRADCKPT=${GRADCKPT:-0}
 GC_FLAG=""; [[ "${GRADCKPT}" == "1" ]] && GC_FLAG="--grad-checkpoint"
 
-RUN="afdb_b${BLOCKS}_crop${CROP}"
+RUN="afdb_b${BLOCKS}_crop${CROP}_2"
 [[ "${L1}" != "0" ]] && RUN="${RUN}_l1${L1}"
 DATE=$(date +%Y%m%d_%H%M%S)
 mkdir -p logs/m4 "checkpoints_model4/${RUN}"
