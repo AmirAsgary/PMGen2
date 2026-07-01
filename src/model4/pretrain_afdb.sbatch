@@ -53,7 +53,7 @@ LAMBDAS=${LAMBDAS:-"1.0 0.1 0.1 0.1"}    # plddt mlm anchor distogram
 GRADCKPT=${GRADCKPT:-0}
 GC_FLAG=""; [[ "${GRADCKPT}" == "1" ]] && GC_FLAG="--grad-checkpoint"
 
-RUN="afdb_b${BLOCKS}_crop${CROP}_2"
+RUN="afdb_b${BLOCKS}_crop${CROP}"
 [[ "${L1}" != "0" ]] && RUN="${RUN}_l1${L1}"
 DATE=$(date +%Y%m%d_%H%M%S)
 mkdir -p logs/m4 "checkpoints_model4/${RUN}"
