@@ -71,3 +71,4 @@ analysis/
 
 # --- training checkpoints ---
 checkpoints/
+data/hasmig_mhc
