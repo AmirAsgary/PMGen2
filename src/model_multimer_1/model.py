@@ -190,7 +190,7 @@ class MultimerModel(nn.Module):
         cfg = model_config(MM)
         ie = cfg["model"]["input_embedder"]
         self.embedder = InputEmbedderMultimer(
-            tf_dim=21, msa_dim=49, c_z=C_Z, c_m=C_M,
+            tf_dim=21, msa_dim=49, c_z=C_Z_EMB, c_m=C_M,
             max_relative_idx=ie["max_relative_idx"],
             use_chain_relative=ie["use_chain_relative"],
             max_relative_chain=ie["max_relative_chain"])
