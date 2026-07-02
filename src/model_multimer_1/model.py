@@ -51,7 +51,13 @@ from openfold.utils.geometry.rigid_matrix_vector import Rigid3Array   # noqa: E4
 
 PARAMS = _ROOT / "params" / "alphafold"
 MM = "model_1_multimer_v3"
-C_M, C_Z, C_S = 256, 128, 384        # multimer embedder single/pair widths; SM single
+# pretrained AF-multimer widths (fixed by the loaded embedder / SM / pLDDT head):
+C_M, C_Z_EMB = 256, 128              # InputEmbedderMultimer single / pair outputs
+SM_C_S, SM_C_Z = 384, 128           # frozen StructureModule + pLDDT head single / pair
+# our SMALL internal working width for head-2 / the trunk (single AND pair); we only
+# widen back to the SM/pLDDT dims in the final projections.
+D = 64
+IPA_HEADS = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +113,7 @@ class MHCStructEncoder(nn.Module):
     """MHC backbone -> distogram + relative-orientation pair feats + torsion single
     feats -> 1 multimer IPA -> Linear -> 10-d per residue."""
 
-    def __init__(self, d_out=10, n_dist_bins=22, c_s=C_S, c_z=C_Z):
+    def __init__(self, d_out=10, n_dist_bins=22, c_s=D, c_z=D):
         super().__init__()
         self.n_dist_bins = n_dist_bins
         self.register_buffer("dist_bins", torch.linspace(3.0, 22.0, n_dist_bins - 1))
@@ -115,7 +121,8 @@ class MHCStructEncoder(nn.Module):
         self.pair_in = nn.Linear(n_dist_bins + 3, c_z)
         self.single_in = nn.Linear(3, c_s)                 # 3 torsion-ish placeholders
         self.ipa = InvariantPointAttentionMultimer(
-            c_s=c_s, c_z=c_z, c_hidden=16, no_heads=12, no_qk_points=4, no_v_points=8)
+            c_s=c_s, c_z=c_z, c_hidden=16, no_heads=IPA_HEADS,
+            no_qk_points=4, no_v_points=8)
         self.out = nn.Linear(c_s, d_out)
 
     def forward(self, teacher_bb, mhc_mask, frames):
@@ -138,11 +145,12 @@ class MHCStructEncoder(nn.Module):
 # trunk block: 2x (IPA -> single ; OPM single->pair) + single self-attention
 # --------------------------------------------------------------------------- #
 class TrunkBlock(nn.Module):
-    def __init__(self, c_s=C_S, c_z=C_Z, n_ipa=2, n_heads=8):
+    def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS):
         super().__init__()
         self.ipas = nn.ModuleList([
-            InvariantPointAttentionMultimer(c_s=c_s, c_z=c_z, c_hidden=16, no_heads=12,
-                                            no_qk_points=4, no_v_points=8)
+            InvariantPointAttentionMultimer(c_s=c_s, c_z=c_z, c_hidden=16,
+                                            no_heads=IPA_HEADS, no_qk_points=4,
+                                            no_v_points=8)
             for _ in range(n_ipa)])
         self.opms = nn.ModuleList([OuterProductMean(c_s, c_z, c_hidden=32)
                                    for _ in range(n_ipa)])
@@ -169,16 +177,16 @@ class MultimerModel(nn.Module):
             max_relative_idx=ie["max_relative_idx"],
             use_chain_relative=ie["use_chain_relative"],
             max_relative_chain=ie["max_relative_chain"])
-        self.head2 = MHCStructEncoder()
+        self.head2 = MHCStructEncoder()                    # works at D
         self.mhc_noise = mhc_noise
-        # concat dims: single = c_m + 10 + 2 ; pair = c_z + 10 + 2
-        self.s_proj = nn.Linear(C_M + 10 + 2, C_S)
-        self.z_proj = nn.Linear(C_Z + 10 + 2, C_Z)
-        self.trunk = nn.ModuleList([TrunkBlock() for _ in range(n_trunk)])
-        # projections into the frozen heads
-        self.sm_s = nn.Linear(C_S, C_S)
-        self.sm_z = nn.Linear(C_Z, C_Z)
-        self.plddt_proj = nn.Linear(C_S, C_S)
+        # concat (embedder single 256 / pair 128) + head-2 10-d + anchor 2-d -> D
+        self.s_proj = nn.Linear(C_M + 10 + 2, D)
+        self.z_proj = nn.Linear(C_Z_EMB + 10 + 2, D)
+        self.trunk = nn.ModuleList([TrunkBlock() for _ in range(n_trunk)])  # at D
+        # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
+        self.sm_s = nn.Linear(D, SM_C_S)
+        self.sm_z = nn.Linear(D, SM_C_Z)
+        self.plddt_proj = nn.Linear(D, SM_C_S)
         # frozen AF-multimer structure module + pLDDT head
         sm_cfg = {**dict(cfg["model"]["structure_module"]), "is_multimer": True}
         self.sm = StructureModule(**sm_cfg)
@@ -192,14 +200,11 @@ class MultimerModel(nn.Module):
     def _load_frozen(self):
         self.embedder.load_state_dict(torch.load(PARAMS / "input_embedder_mm.pt",
                                                  weights_only=True))
-        sm_sd = torch.load(PARAMS / "sm_mm.pt", weights_only=True)
-        self.sm.load_state_dict(sm_sd)
+        self.sm.load_state_dict(torch.load(PARAMS / "sm_mm.pt", weights_only=True))
         self.plddt.load_state_dict(torch.load(PARAMS / "plddt_mm.pt", weights_only=True))
-        # seed the head-2 + trunk IPAs from the SM's (multimer) IPA weights
-        ipa_sd = {k[len("ipa."):]: v for k, v in sm_sd.items() if k.startswith("ipa.")}
-        if ipa_sd:
-            for ipa in [self.head2.ipa, *(i for b in self.trunk for i in b.ipas)]:
-                ipa.load_state_dict(ipa_sd, strict=False)
+        # NB: our IPAs run at D=64 / 4 heads, so they can't be seeded from the SM's
+        # 384/12-head multimer-IPA weights — they train from scratch. (The embedder,
+        # SM and pLDDT head are the pretrained pieces.)
         for mod in (self.sm, self.plddt):                # frozen structure + confidence
             mod.requires_grad_(False)
 

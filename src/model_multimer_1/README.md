@@ -12,11 +12,17 @@ head-2  MHC backbone (+Gaussian noise) -> distogram + relative-orientation pair 
         + torsion single feats -> 1 multimer IPA -> Linear -> 10-d per MHC residue;
         pair<-broadcast, single<-mean-pool
 anchor  2-d one-hot (peptide anchor) -> single & pair
-trunk   project to (384,128); n x [ 2 multimer-IPA -> single ; OPM single->pair ]
-        + single self-attention; frames = noised-MHC + peptide-identity (fixed)
-out     single -> plddt_proj -> FROZEN pLDDT head        (confidence)
-        (single,pair) -> FROZEN multimer StructureModule -> Ca/frames  (FAPE)
+trunk   project to D=64 (single AND pair); n x [ 2 multimer-IPA -> single ;
+        OPM single->pair ] + single self-attention; frames = noised-MHC +
+        peptide-identity (fixed).  IPAs use 4 heads.
+out     WIDEN 64 -> {single 384 -> plddt_proj -> FROZEN pLDDT head (confidence);
+        (single 384, pair 128) -> FROZEN multimer StructureModule -> Ca/frames (FAPE)}
 ```
+Internal working width is **D=64** (single & pair), IPAs at **4 heads**; dims are only
+widened to the frozen-module sizes (384/128) at the final projections. That makes the
+trainable stack **~0.44 M params** (embedder + head-2 + trunk + projections; SM &
+pLDDT head frozen and excluded). Because 64/4-head ≠ AF-multimer's 384/12-head IPA,
+the IPAs train **from scratch** (only the embedder / SM / pLDDT head are pretrained).
 `forward -> (ca, plddt_logits, zeros_pae, frames)` = the `DistillModel` contract, so it
 reuses model_1's `DistillLoss` (`lambda_pae=0`) + `train_one_epoch` + DDP.
 
