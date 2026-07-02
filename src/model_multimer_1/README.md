@@ -46,11 +46,32 @@ $PY src/model_multimer_1/extract_multimer_weights.py       # -> input_embedder_m
 # 2. SMOKE TEST FIRST (validates the openfold wiring on one synthetic pMHC)
 $PY src/model_multimer_1/model.py                          # prints "OK shapes ..."
 
-# 3. train (three stages)
+# 3. MULTI-GPU SMOKE (10 random structures, 2 epochs, 2 GPUs) — do this first
+sbatch src/model_multimer_1/smoke_mm1.sbatch     # confirms DDP train + sharded val
+
+# 4. train (three stages)
 STAGE=1 sbatch src/model_multimer_1/train_mm1.sbatch
 STAGE=2 RESUME=checkpoints_mm1/mm1_stage1/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
 STAGE=3 RESUME=checkpoints_mm1/mm1_stage2/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
 ```
+
+## Multi-GPU (train + validation)
+Training shards the epoch loader across ranks (`make_epoch_loader(rank, world)`).
+**Validation is also distributed**: each rank evaluates an equal, disjoint shard and
+the loss/metric terms are all-reduced example-weighted, so rank 0 logs the true global
+means (no more rank-0-only eval that made the other ranks idle). `smoke_mm1.sbatch`
+exercises both on 2×A100 with 10 random structures for 2 epochs — run it before a full
+job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the first N.
+
+## Defaults worth knowing
+- `--n-trunk 3` (was 1) — local overfit showed the trunk is the capacity lever; n-trunk 3
+  reached ~0.05 Å peptide-RMSD on a 20-structure overfit vs 0.55 Å at n-trunk 1.
+- `--mhc-noise 0.1` (was 0.5) — 0.5 over-regularized (capped even train-set fit at ~1.7 Å);
+  0.1 keeps robustness to imperfect input MHC without blocking a tight fit. Noise is only
+  applied while `.training` (eval/validation always uses the clean MHC).
+- `--unfreeze-sm-pct P --unfreeze-sm-at E` — optionally fine-tune the last P% of the frozen
+  StructureModule from epoch E (rebuilds opt/sched + re-wraps DDP). Tested: at 10%/ep10 it
+  barely helped (0.52 vs 0.55 Å), so the SM freeze is a fine default.
 
 ## Three-stage schedule
 - **Stage 1** — trunk **+ SM** trainable (pLDDT head frozen). Structure-first: pLDDT

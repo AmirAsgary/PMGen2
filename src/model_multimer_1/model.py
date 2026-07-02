@@ -246,6 +246,23 @@ class MultimerModel(nn.Module):
             self.detach_plddt = True
         self.plddt.requires_grad_(False)                 # AF pLDDT head always frozen
 
+    def unfreeze_sm_pct(self, pct: float):
+        """Unfreeze the LAST `pct`% of the StructureModule's parameters — a light-touch
+        fine-tune of the (otherwise frozen) structure decoder, e.g. after N warmup
+        epochs of trunk-only training. The pLDDT head stays frozen. Params are counted
+        from the last tensor backward (closest to the output). Returns
+        (unfrozen_params, total_sm_params)."""
+        sm_params = list(self.sm.parameters())
+        total = sum(p.numel() for p in sm_params)
+        target = total * pct / 100.0
+        unfrozen = 0
+        for p in reversed(sm_params):
+            if unfrozen >= target:
+                break
+            p.requires_grad_(True)
+            unfrozen += p.numel()
+        return unfrozen, total
+
     def trainable_parameters(self):
         return (p for p in self.parameters() if p.requires_grad)
 

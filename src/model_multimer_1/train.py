@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -115,8 +116,12 @@ def parse_args(argv=None):
     p.add_argument("--no-filter", action="store_true", help="disable the stage-1 filter")
     p.add_argument("--max-train", type=int, default=0, help="cap #train examples (overfit)")
     p.add_argument("--peptide-weight", type=float, default=5.0)
-    p.add_argument("--mhc-noise", type=float, default=0.5)
-    p.add_argument("--n-trunk", type=int, default=1)
+    p.add_argument("--mhc-noise", type=float, default=0.1)
+    p.add_argument("--unfreeze-sm-pct", type=float, default=0.0,
+                   help="unfreeze the last N%% of the StructureModule (0 = keep frozen)")
+    p.add_argument("--unfreeze-sm-at", type=int, default=0,
+                   help="epoch at which to apply --unfreeze-sm-pct (rebuilds opt/sched)")
+    p.add_argument("--n-trunk", type=int, default=3)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
@@ -148,7 +153,10 @@ def main(argv=None):
     train_ds, val_ds = build_datasets(args, filt=filt)
     if args.max_train > 0:                                      # overfit / subset
         from torch.utils.data import Subset
-        train_ds = Subset(train_ds, list(range(min(args.max_train, len(train_ds)))))
+        idx = list(range(len(train_ds)))
+        random.Random(args.seed).shuffle(idx)                  # RANDOM subset (not first-N)
+        idx = sorted(idx[:min(args.max_train, len(idx))])
+        train_ds = Subset(train_ds, idx)
         val_ds = train_ds                                      # watch it fit the same few
     shard_n = len(train_ds) // world if world > 1 else len(train_ds)
     steps_per_epoch = max(1, (shard_n + args.bs - 1) // args.bs)
@@ -161,9 +169,14 @@ def main(argv=None):
     lam = {1: (1.0, 0.0, 0.0), 2: (1.0, args.plddt_w, 0.0),
            3: (0.0, args.stage3_plddt_w, 0.0)}[args.stage]
     loss_mod = m1.DistillLoss(*lam, peptide_weight=args.peptide_weight).to(device)
-    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
-                                  weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    def build_opt_sched(t_max):
+        opt = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
+                                weight_decay=1e-4)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, t_max))
+        return opt, sch
+
+    optimizer, scheduler = build_opt_sched(total_steps)
     scaler = torch.amp.GradScaler(device="cuda", enabled=False)
 
     run_dir = None
@@ -206,10 +219,44 @@ def main(argv=None):
     net = (torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[local_rank], output_device=local_rank,
         find_unused_parameters=True) if distributed else model)
-    val_loader = m1.make_dataloader(val_ds, args.bs, shuffle=False,
-                                    num_workers=args.num_workers) if len(val_ds) else None
+
+    def validate():
+        """Multi-GPU validation: every rank evaluates a disjoint, equal-size shard of
+        the val set, then the loss/metric terms are all-reduced (example-weighted) so
+        every rank ends up with the same global means. ALL ranks must call this (the
+        all-reduce is a collective). Single-GPU falls back to a plain pass."""
+        if not len(val_ds):
+            return None
+        if not distributed:
+            loader = m1.make_dataloader(val_ds, args.bs, shuffle=False,
+                                        num_workers=args.num_workers)
+            return m1.evaluate(model, loader, loss_mod, device, num_recycles=None)
+        loader = m1.make_epoch_loader(val_ds, args.bs, args.num_workers, args.seed,
+                                      epoch=0, rank=rank, world_size=world)
+        local, n = m1.evaluate(model, loader, loss_mod, device,
+                               num_recycles=None, return_n=True)
+        keys = sorted(local.keys())          # identical on all ranks (equal shards)
+        buf = torch.tensor([local[k] * n for k in keys] + [float(n)],
+                           device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        tot = float(buf[-1].item())
+        return {k: float(buf[i].item()) / max(tot, 1.0) for i, k in enumerate(keys)}
 
     for epoch in range(start_epoch, args.epochs + 1):
+        # optionally unfreeze a slice of the StructureModule partway through, then
+        # rebuild opt+sched over the new trainable set (fresh cosine over the rest)
+        # and re-wrap DDP so the newly-trainable params are reduced.
+        if args.unfreeze_sm_pct > 0 and epoch == args.unfreeze_sm_at:
+            n_unf, n_tot = model.unfreeze_sm_pct(args.unfreeze_sm_pct)
+            optimizer, scheduler = build_opt_sched(
+                steps_per_epoch * (args.epochs - epoch + 1))
+            if distributed:
+                net = torch.nn.parallel.DistributedDataParallel(
+                    model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
+            n_tr = sum(p.numel() for p in model.trainable_parameters())
+            log(f"[mm1] epoch {epoch}: unfroze {n_unf:,}/{n_tot:,} SM params "
+                f"({args.unfreeze_sm_pct}%); trainable now {n_tr:,}; rebuilt opt/sched")
         # pLDDT-weight schedule (stage 1): 0 for epoch 1, then --plddt-w
         if args.stage == 1:
             loss_mod.l_plddt = 0.0 if epoch == 1 else args.plddt_w
@@ -222,12 +269,12 @@ def main(argv=None):
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
                      if (run_dir is not None and is_main) else None))
+        ev = validate()                      # collective: every rank participates
         if is_main:
             log(f"[mm1] epoch {epoch:3d} | train total {tr['total']:.3f} "
                 f"fape {tr['fape']:.3f} plddt_ce {tr.get('plddt_ce', 0):.3f} "
                 f"(lam_plddt={loss_mod.l_plddt})")
-            if val_loader is not None:
-                ev = m1.evaluate(model, val_loader, loss_mod, device, num_recycles=None)
+            if ev is not None:
                 mlog.log("val", epoch, global_step, None, ev)
                 log(f"[mm1]   val total {ev['total']:.3f} pep-pLDDT-MAE "
                     f"{ev.get('pep_plddt_mae', 0):.2f} pep-RMSD {ev.get('pep_ca_rmsd', 0):.2f}")

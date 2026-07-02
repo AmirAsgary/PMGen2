@@ -1205,9 +1205,11 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
 @torch.no_grad()
 def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
              device: str, max_batches: Optional[int] = None,
-             num_recycles: Optional[int] = None) -> Dict[str, float]:
+             num_recycles: Optional[int] = None, return_n: bool = False):
     """Example-weighted mean loss terms + metrics over (part of) a loader.
-    ``num_recycles`` overrides the model's default recycle count at eval."""
+    ``num_recycles`` overrides the model's default recycle count at eval.
+    With ``return_n=True`` also returns the #examples seen, so callers can do an
+    example-weighted all-reduce across ranks (distributed validation)."""
     model.eval()
     agg: Dict[str, float] = defaultdict(float)
     n = 0
@@ -1225,7 +1227,8 @@ def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
         if max_batches is not None and i + 1 >= max_batches:
             break
     model.train()
-    return {k: v / max(n, 1) for k, v in agg.items()}
+    means = {k: v / max(n, 1) for k, v in agg.items()}
+    return (means, n) if return_n else means
 
 
 def setup_distributed():
