@@ -298,10 +298,22 @@ def _smoke():
         "teacher_bb": torch.randn(B, N, 3, 3, device=dev) * 10,
         "teacher_ca": torch.randn(B, N, 3, device=dev) * 10,
     }
+    batch["teacher_plddt"] = torch.rand(B, N, device=dev) * 100
+    batch["teacher_pae"] = torch.zeros(B, N, N, device=dev)
     net.train()
     ca, pl, pae, fr = net(batch, return_frames=True)
-    print("OK shapes:", tuple(ca.shape), tuple(pl.shape), tuple(pae.shape),
-          "trainable params:", sum(p.numel() for p in net.trainable_parameters()))
+    print("OK forward:", tuple(ca.shape), tuple(pl.shape), tuple(pae.shape),
+          "| trainable params:", sum(p.numel() for p in net.trainable_parameters()))
+    # ---- validate the LOSS + BACKWARD path (FAPE on the multimer SM frames) ----
+    loss_mod = m1.DistillLoss(1.0, 0.01, 0.0, peptide_weight=5.0).to(dev)
+    total, terms = loss_mod(ca, pl, pae, fr, batch)
+    total.backward()
+    n_grad = sum(1 for p in net.trainable_parameters()
+                 if p.grad is not None and torch.isfinite(p.grad).all())
+    n_tot = sum(1 for _ in net.trainable_parameters())
+    print(f"OK loss: total={float(total):.3f} fape={terms['fape']:.3f} "
+          f"plddt_ce={terms['plddt_ce']:.3f} finite={torch.isfinite(total).item()} "
+          f"| grads on {n_grad}/{n_tot} trainable tensors")
 
 
 if __name__ == "__main__":
