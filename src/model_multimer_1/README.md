@@ -46,22 +46,32 @@ $PY src/model_multimer_1/extract_multimer_weights.py       # -> input_embedder_m
 # 2. SMOKE TEST FIRST (validates the openfold wiring on one synthetic pMHC)
 $PY src/model_multimer_1/model.py                          # prints "OK shapes ..."
 
-# 3. train
+# 3. train (three stages)
 STAGE=1 sbatch src/model_multimer_1/train_mm1.sbatch
 STAGE=2 RESUME=checkpoints_mm1/mm1_stage1/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
+STAGE=3 RESUME=checkpoints_mm1/mm1_stage2/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
 ```
 
-## Confidence / burial filter (stage 1)
+## Three-stage schedule
+- **Stage 1** — trunk **+ SM** trainable (pLDDT head frozen). Structure-first: pLDDT
+  weight 0 on epoch 1, then `--plddt-w` (0.01). Trained on the high-confidence subset.
+- **Stage 2** — ALL structures, SM stays trainable, pLDDT weight 0.01 (`lam=(1,0.01,0)`).
+- **Stage 3** — freeze the **whole model except `plddt_proj`** (pLDDT head always frozen);
+  `s` is detached into the pLDDT path so confidence learning can't move the structure.
+  Confidence-only, pLDDT weight 1.0 (`--stage3-plddt-w`). Resume from stage-2.
+
+`set_stage(stage)` in `model.py` applies the freezing; `train.py` picks `lam` per stage.
+
+## Confidence / burial filter (stage 1 only)
 `burial >= 0.65 AND peptide pLDDT > 0.70`. Old store: `burial_score` + `mean_peptide_plddt`
 (0–100, so threshold ×100) from `outputs/data_exploration/per_structure.csv`. New store:
-`docking_score` (= burial) + `pep_mean_plddt` (0–1) from its `index.csv`. Stage 2 uses
-ALL structures (no filter).
+`docking_score` (= burial) + `pep_mean_plddt` (0–1) from its `index.csv`. Stages 2/3 use
+ALL structures. `--no-filter` disables it; `--max-train N` caps the train set (overfit).
 
-## IMPORTANT: first run is a wiring-validation pass
-This wires several OpenFold-multimer internals (Rigid3Array frames for the multimer
-IPA, `StructureModule(is_multimer=True)` I/O, `InputEmbedderMultimer`). It compiles and
-the feature layout is confirmed, but it has **not** been run end-to-end (no local
-GPU/openfold). **Run the `--smoke` (step 2) first**; the most likely spots to need a fix
-are (a) `_frames_from_bb` Rigid→Rigid3Array construction, (b) the multimer IPA/SM tensor
-dims, (c) the frozen `sm_mm.pt`/`plddt_mm.pt` key names from extraction. Report the smoke
-output/traceback and I'll fix the seam.
+## Status: validated end-to-end locally
+Smoke + a 20-structure overfit were run locally (pmgen2 env, one GPU, bf16 AMP): the
+full path (real hasmig zips → H5 → dataset → `InputEmbedderMultimer` → head-2 →
+trunk → frozen multimer SM → FAPE → backward → DDP) runs clean at ~11 it/s. Overfit
+drove FAPE from ~2.46 (init) to ~0.26 and peptide Cα-RMSD to ~1.6 Å, confirming the
+Rigid3Array frames, `StructureModule(is_multimer=True)` I/O, and `*_mm.pt` weight keys
+are all wired correctly. Run the `--smoke` (step 2) before any full training anyway.

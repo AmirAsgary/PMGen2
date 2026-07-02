@@ -1,13 +1,16 @@
 #!/bin/bash -l
 # ============================================================================
-# Train model_multimer_1. Two stages (set STAGE):
-#   STAGE=1 : high-confidence + high-burial subset, full model trainable (SM+pLDDT
-#             frozen). pLDDT weight 0 (epoch 1) then --plddt-w.
-#   STAGE=2 : ALL structures, freeze all but the pLDDT projection, pLDDT-only loss.
+# Train model_multimer_1. Three stages (set STAGE):
+#   STAGE=1 : high-confidence + high-burial subset, trunk+SM trainable (pLDDT head
+#             frozen). Structure-first: pLDDT weight 0 (epoch 1) then --plddt-w (0.01).
+#   STAGE=2 : ALL structures, SM stays trainable, pLDDT weight 0.01 (structure+conf).
 #             point RESUME at stage-1's last.pt to carry the structure over.
+#   STAGE=3 : freeze the WHOLE model except the pLDDT projection (pLDDT head always
+#             frozen); confidence-only, pLDDT weight 1.0. RESUME from stage-2.
 #
 #   STAGE=1 sbatch src/model_multimer_1/train_mm1.sbatch
 #   STAGE=2 RESUME=checkpoints_mm1/mm1_stage1/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
+#   STAGE=3 RESUME=checkpoints_mm1/mm1_stage2/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
 # ============================================================================
 #SBATCH --job-name=mm1
 #SBATCH --nodes=1
@@ -43,9 +46,12 @@ done
 
 RESUME_FLAG=""
 [[ -n "$RESUME" ]] && RESUME_FLAG="--resume $RESUME"
-# stage 2 with no explicit resume: default to stage-1's checkpoint
+# stage 2/3 with no explicit resume: default to the previous stage's checkpoint
 if [[ "$STAGE" == "2" && -z "$RESUME" && -f "checkpoints_mm1/mm1_stage1/last.pt" ]]; then
     RESUME_FLAG="--resume checkpoints_mm1/mm1_stage1/last.pt"
+fi
+if [[ "$STAGE" == "3" && -z "$RESUME" && -f "checkpoints_mm1/mm1_stage2/last.pt" ]]; then
+    RESUME_FLAG="--resume checkpoints_mm1/mm1_stage2/last.pt"
 fi
 
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); NGPU=${NGPU:-1}

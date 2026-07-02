@@ -48,6 +48,8 @@ def _store_ids(h5_dir):
 
 
 def old_ids(h5_dir, data_exp_csv, burial_min, plddt_min, filt):
+    if not (Path(h5_dir) / "index.csv").exists():        # old store optional (e.g. local)
+        return [], {}
     idx, id2shard = _store_ids(h5_dir)
     if not filt:
         return idx["id"].tolist(), id2shard
@@ -81,7 +83,8 @@ def build_datasets(args, filt: bool):
     o_ids, o_shard = old_ids(args.h5_dir, args.data_exp_csv, args.burial_min,
                              args.plddt_min, filt)
     o_tr, o_va = _split(o_ids, args.val_frac, args.seed)
-    train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
+    if o_tr:
+        train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
     if o_va:
         val_parts.append(m1.H5DistillDataset(o_va, o_shard, args.h5_dir))
     if args.hasmig_dir and (Path(args.hasmig_dir) / "index.csv").exists():
@@ -97,7 +100,7 @@ def build_datasets(args, filt: bool):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", type=int, choices=[1, 2], required=True)
+    p.add_argument("--stage", type=int, choices=[1, 2, 3], required=True)
     p.add_argument("--h5-dir", default="data/processed/h5_store")
     p.add_argument("--hasmig-dir", default="data/processed/h5_store_hasmig")
     p.add_argument("--data-exp-csv", default="outputs/data_exploration/per_structure.csv")
@@ -107,7 +110,10 @@ def parse_args(argv=None):
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--bs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--plddt-w", type=float, default=0.01)        # stage-1 pLDDT weight (epoch>=2)
+    p.add_argument("--plddt-w", type=float, default=0.01)        # stage-1/2 pLDDT weight
+    p.add_argument("--stage3-plddt-w", type=float, default=1.0)  # stage-3 pLDDT weight
+    p.add_argument("--no-filter", action="store_true", help="disable the stage-1 filter")
+    p.add_argument("--max-train", type=int, default=0, help="cap #train examples (overfit)")
     p.add_argument("--peptide-weight", type=float, default=5.0)
     p.add_argument("--mhc-noise", type=float, default=0.5)
     p.add_argument("--n-trunk", type=int, default=1)
@@ -138,18 +144,22 @@ def main(argv=None):
     log = print if is_main else (lambda *a, **k: None)
     amp_dtype = torch.bfloat16 if args.amp else None            # AF-multimer needs bf16
 
-    filt = (args.stage == 1)                                    # stage 1 filters
+    filt = (args.stage == 1) and not args.no_filter            # only stage 1 filters
     train_ds, val_ds = build_datasets(args, filt=filt)
+    if args.max_train > 0:                                      # overfit / subset
+        from torch.utils.data import Subset
+        train_ds = Subset(train_ds, list(range(min(args.max_train, len(train_ds)))))
+        val_ds = train_ds                                      # watch it fit the same few
     shard_n = len(train_ds) // world if world > 1 else len(train_ds)
     steps_per_epoch = max(1, (shard_n + args.bs - 1) // args.bs)
     total_steps = steps_per_epoch * args.epochs
 
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
                              device=device)
-    if args.stage == 2:
-        model.set_stage2()
-    # stage-1 lambdas start with pLDDT off (set per-epoch below); stage-2 = pLDDT only
-    lam = (0.0, 1.0, 0.0) if args.stage == 2 else (1.0, 0.0, 0.0)
+    model.set_stage(args.stage)
+    # stage 1: FAPE only (pLDDT set per-epoch below); 2: FAPE + pLDDT; 3: pLDDT only
+    lam = {1: (1.0, 0.0, 0.0), 2: (1.0, args.plddt_w, 0.0),
+           3: (0.0, args.stage3_plddt_w, 0.0)}[args.stage]
     loss_mod = m1.DistillLoss(*lam, peptide_weight=args.peptide_weight).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
                                   weight_decay=1e-4)

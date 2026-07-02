@@ -211,7 +211,7 @@ class MultimerModel(nn.Module):
         self.plddt = PerResidueLDDTCaPredictor(**cfg["model"]["heads"]["lddt"])
         self._load_frozen()
         self.recycles = 0
-        self.stage2 = False
+        self.detach_plddt = False
         self.to(device)
         self.train(False)
 
@@ -232,13 +232,19 @@ class MultimerModel(nn.Module):
         self.plddt.eval()
         return self
 
-    def set_stage2(self):
-        """Stage-2: freeze EVERYTHING except the pLDDT projection (structure fixed);
-        the forward also detaches the trunk output before the pLDDT projection so the
-        structure representation cannot move — only the confidence head learns."""
-        self.requires_grad_(False)
-        self.plddt_proj.requires_grad_(True)
-        self.stage2 = True
+    def set_stage(self, stage: int):
+        """Configure trainable params per stage (pLDDT HEAD is ALWAYS frozen):
+          1: embedder + head-2 + trunk + projections trainable; SM frozen.
+          2: same as 1 PLUS the multimer StructureModule becomes trainable.
+          3: freeze EVERYTHING except the pLDDT projection; the forward also detaches
+             the trunk output before it, so the structure can't move (confidence only)."""
+        if stage == 2:
+            self.sm.requires_grad_(True)                 # fine-tune the structure module
+        elif stage == 3:
+            self.requires_grad_(False)
+            self.plddt_proj.requires_grad_(True)
+            self.detach_plddt = True
+        self.plddt.requires_grad_(False)                 # AF pLDDT head always frozen
 
     def trainable_parameters(self):
         return (p for p in self.parameters() if p.requires_grad)
@@ -274,7 +280,7 @@ class MultimerModel(nn.Module):
         out = self.sm({"single": self.sm_s(s), "pair": self.sm_z(z)},
                       batch["aatype"], mask=mask)
         ca = out["positions"][-1][..., 1, :]
-        s_plddt = s.detach() if self.stage2 else s     # stage-2: confidence only
+        s_plddt = s.detach() if self.detach_plddt else s   # stage-3: confidence only
         plddt_logits = self.plddt(self.plddt_proj(s_plddt))
         B, N = mask.shape
         pae_logits = ca.new_zeros(B, N, N, 64)           # no PAE; DistillLoss lambda_pae=0
