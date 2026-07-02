@@ -1,14 +1,18 @@
 """
-model_multimer_1 training — two stages.
+model_multimer_1 training — three stages.
 
-  stage 1 (high-confidence): train the whole model (embedder + head-2 + trunk +
-    projections; SM & pLDDT head FROZEN) on ONLY confident, well-buried complexes
-    (burial >= --burial-min AND peptide pLDDT > --plddt-min), from BOTH the old store
-    (scores from outputs/data_exploration/per_structure.csv) and the new hasmig store
-    (scores in its index.csv). pLDDT loss weight = 0 for epoch 1, then --plddt-w.
+Data: TRAIN = old-store two_axis TRAIN ids (confidence-filtered in stage 1) + ALL
+hasmig ids. VAL/TEST = old-store two_axis VAL/TEST ids ONLY (the HLA two-axis split
+lives only on the old data; hasmig is a training-only, low-diversity augmentation).
+Pick the split with --scheme/--fold. Validation is multi-GPU (sharded + all-reduced).
 
-  stage 2 (confidence only): load stage-1 weights, freeze EVERYTHING except the pLDDT
-    projection, train on ALL structures with pLDDT-only loss (structure detached).
+  stage 1 (structure, high-confidence): embedder + head-2 + trunk + projections trainable
+    (SM & pLDDT head FROZEN), on confident/well-buried complexes only. pLDDT weight = 0
+    for epoch 1, then --plddt-w. hasmig at full weight.
+  stage 2 (structure + confidence): SM ALSO trainable; ALL structures; pLDDT weight
+    --plddt-w. hasmig down-weighted (--hasmig-weight, default 0.1) in FAPE + pLDDT.
+  stage 3 (confidence only): freeze EVERYTHING except the pLDDT projection (structure
+    detached); pLDDT-only loss at --stage3-plddt-w. hasmig down-weighted.
 
 Reuses model_1's DistillLoss / train_one_epoch / DDP / metric logging. AF-multimer
 runs in bf16 (fp16 overflows). forward returns (ca, plddt, zeros_pae, frames), so
@@ -69,33 +73,57 @@ def hasmig_ids(h5_dir, burial_min, plddt_min, filt):
     return idx["id"].tolist(), id2shard
 
 
-def _split(ids, val_frac, seed):
-    import random
-    r = random.Random(seed)
-    ids = list(ids)
-    r.shuffle(ids)
-    n_val = max(1, int(len(ids) * val_frac)) if ids else 0
-    return ids[n_val:], ids[:n_val]
+class _WeightedDataset(torch.utils.data.Dataset):
+    """Wrap a dataset so every example carries a scalar ``sample_weight`` — used to
+    down-weight the hasmig source (high quality but low MHC-sequence diversity, so
+    it over-fits) in the loss for stages 2/3. Weight 1.0 is a no-op."""
+
+    def __init__(self, base, w: float):
+        self.base, self.w = base, float(w)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        ex = self.base[i]
+        ex["sample_weight"] = self.w
+        return ex
 
 
-def build_datasets(args, filt: bool):
-    """(train_concat, val_concat) over old + hasmig stores (filtered iff `filt`)."""
+def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
+    """Train = OLD-store two_axis TRAIN ids (confidence-filtered iff `filt`) + ALL
+    hasmig ids (tagged with `hasmig_w`). Val = OLD-store two_axis VAL ids ONLY
+    (the HLA two-axis split lives only on the old data; hasmig is never validated
+    on). Returns (train_concat, val_concat_or_None)."""
     train_parts, val_parts = [], []
-    o_ids, o_shard = old_ids(args.h5_dir, args.data_exp_csv, args.burial_min,
-                             args.plddt_min, filt)
-    o_tr, o_va = _split(o_ids, args.val_frac, args.seed)
-    if o_tr:
-        train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
-    if o_va:
-        val_parts.append(m1.H5DistillDataset(o_va, o_shard, args.h5_dir))
+
+    # ---- OLD store: HLA two-axis split (the only source of val/test) ----
+    if (Path(args.h5_dir) / "index.csv").exists():
+        splits = m1.read_split_ids(args.scheme, args.fold)          # base-id lists
+        train_base, val_base = set(splits["train"]), set(splits["val"])
+        o_ids, o_shard = old_ids(args.h5_dir, args.data_exp_csv, args.burial_min,
+                                 args.plddt_min, filt)              # confident (or all)
+        o_tr = [i for i in o_ids if m1.base_id(i) in train_base]
+        if o_tr:
+            train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
+        # val is UNFILTERED (real held-out distribution), old store only
+        all_idx, all_shard = _store_ids(args.h5_dir)
+        o_va = [i for i in all_idx["id"] if m1.base_id(i) in val_base]
+        if o_va:
+            val_parts.append(m1.H5DistillDataset(o_va, all_shard, args.h5_dir))
+
+    # ---- hasmig store: ALL ids -> TRAIN ONLY, down-weighted in the loss ----
     if args.hasmig_dir and (Path(args.hasmig_dir) / "index.csv").exists():
         h_ids, h_shard = hasmig_ids(args.hasmig_dir, args.burial_min,
                                     args.plddt_min, filt)
-        h_tr, h_va = _split(h_ids, args.val_frac, args.seed)
-        train_parts.append(m1.H5DistillDataset(h_tr, h_shard, args.hasmig_dir))
-        if h_va:
-            val_parts.append(m1.H5DistillDataset(h_va, h_shard, args.hasmig_dir))
-    return ConcatDataset(train_parts), ConcatDataset(val_parts)
+        if h_ids:
+            hds = m1.H5DistillDataset(h_ids, h_shard, args.hasmig_dir)
+            train_parts.append(_WeightedDataset(hds, hasmig_w) if hasmig_w != 1.0
+                               else hds)
+
+    train_ds = ConcatDataset(train_parts) if train_parts else None
+    val_ds = ConcatDataset(val_parts) if val_parts else None
+    return train_ds, val_ds
 
 
 def parse_args(argv=None):
@@ -105,6 +133,13 @@ def parse_args(argv=None):
     p.add_argument("--h5-dir", default="data/processed/h5_store")
     p.add_argument("--hasmig-dir", default="data/processed/h5_store_hasmig")
     p.add_argument("--data-exp-csv", default="outputs/data_exploration/per_structure.csv")
+    p.add_argument("--scheme", default="two_axis", choices=["two_axis", "hla_only"],
+                   help="HLA split scheme for the OLD store's train/val/test partition")
+    p.add_argument("--fold", type=int, default=1, help="CV fold (1..5) for val")
+    p.add_argument("--hasmig-weight", type=float, default=0.1,
+                   help="per-example loss weight for hasmig data in stages 2/3 "
+                        "(low-diversity, high-quality -> down-weight to curb overfit); "
+                        "stage 1 always uses 1.0")
     p.add_argument("--burial-min", type=float, default=0.65)
     p.add_argument("--plddt-min", type=float, default=0.70)      # 0-1 (x100 for old store)
     p.add_argument("--val-frac", type=float, default=0.02)
@@ -150,7 +185,8 @@ def main(argv=None):
     amp_dtype = torch.bfloat16 if args.amp else None            # AF-multimer needs bf16
 
     filt = (args.stage == 1) and not args.no_filter            # only stage 1 filters
-    train_ds, val_ds = build_datasets(args, filt=filt)
+    hasmig_w = 1.0 if args.stage == 1 else args.hasmig_weight   # down-weight in 2/3
+    train_ds, val_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
     if args.max_train > 0:                                      # overfit / subset
         from torch.utils.data import Subset
         idx = list(range(len(train_ds)))
@@ -213,7 +249,8 @@ def main(argv=None):
 
     n_tr = sum(p.numel() for p in model.trainable_parameters())
     log(f"[mm1] stage {args.stage} | trainable {n_tr:,} params | train={len(train_ds)} "
-        f"val={len(val_ds)} bs={args.bs} world={world} steps/epoch={steps_per_epoch} "
+        f"val={len(val_ds) if val_ds is not None else 0} bs={args.bs} world={world} "
+        f"steps/epoch={steps_per_epoch} "
         f"filter={filt} amp_bf16={args.amp}" + (f" | ckpt={run_dir}" if run_dir else ""))
 
     net = (torch.nn.parallel.DistributedDataParallel(
@@ -225,7 +262,7 @@ def main(argv=None):
         the val set, then the loss/metric terms are all-reduced (example-weighted) so
         every rank ends up with the same global means. ALL ranks must call this (the
         all-reduce is a collective). Single-GPU falls back to a plain pass."""
-        if not len(val_ds):
+        if val_ds is None or not len(val_ds):
             return None
         if not distributed:
             loader = m1.make_dataloader(val_ds, args.bs, shuffle=False,

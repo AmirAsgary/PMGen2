@@ -61,6 +61,7 @@ SM_C_S, SM_C_Z = 384, 128           # frozen StructureModule + pLDDT head single
 # widen back to the SM/pLDDT dims in the final projections.
 D = 64
 IPA_HEADS = 4
+DROPOUT = 0.1                        # applied on the TRAINABLE layers for robustness
 
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +117,7 @@ class MHCStructEncoder(nn.Module):
     """MHC backbone -> distogram + relative-orientation pair feats + torsion single
     feats -> 1 multimer IPA -> Linear -> 10-d per residue."""
 
-    def __init__(self, d_out=10, n_dist_bins=22, c_s=D, c_z=D):
+    def __init__(self, d_out=10, n_dist_bins=22, c_s=D, c_z=D, p_drop=DROPOUT):
         super().__init__()
         self.n_dist_bins = n_dist_bins
         self.register_buffer("dist_bins", torch.linspace(3.0, 22.0, n_dist_bins - 1))
@@ -126,6 +127,7 @@ class MHCStructEncoder(nn.Module):
         self.ipa = InvariantPointAttentionMultimer(
             c_s=c_s, c_z=c_z, c_hidden=16, no_heads=IPA_HEADS,
             no_qk_points=4, no_v_points=8)
+        self.drop = nn.Dropout(p_drop)
         self.out = nn.Linear(c_s, d_out)
 
     def forward(self, teacher_bb, mhc_mask, frames):
@@ -146,7 +148,7 @@ class MHCStructEncoder(nn.Module):
         z = self.pair_in(feat)                                        # [B,N,N,c_z] (IPA bias)
         s = self.single_in(ca * 0.0)  # placeholder torsion feats (zeros) -> c_s
         upd = self.ipa(s, z, frames, mhc_mask)                        # [B,N,c_s]
-        h2_single = self.out(upd) * mhc_mask[..., None]               # [B,N,10]
+        h2_single = self.out(self.drop(upd)) * mhc_mask[..., None]    # [B,N,10]
         return h2_single, feat                                        # feat=[B,N,N,25]
 
 
@@ -154,7 +156,7 @@ class MHCStructEncoder(nn.Module):
 # trunk block: 2x (IPA -> single ; OPM single->pair) + single self-attention
 # --------------------------------------------------------------------------- #
 class TrunkBlock(nn.Module):
-    def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS):
+    def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS, p_drop=DROPOUT):
         super().__init__()
         self.ipas = nn.ModuleList([
             InvariantPointAttentionMultimer(c_s=c_s, c_z=c_z, c_hidden=16,
@@ -167,18 +169,22 @@ class TrunkBlock(nn.Module):
         self.tri_in = TriangleMultiplicationIncoming(c_z, c_hidden=c_z)
         self.pair_trans = PairTransition(c_z, n=2)
         self.s_norm = nn.LayerNorm(c_s)
-        self.self_attn = nn.MultiheadAttention(c_s, n_heads, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(c_s, n_heads, dropout=p_drop,
+                                               batch_first=True)
+        # dropout on each residual branch (single & pair) for regularization
+        self.drop_s = nn.Dropout(p_drop)
+        self.drop_z = nn.Dropout(p_drop)
 
     def forward(self, s, z, frames, mask):
         pair_mask = mask[:, :, None] * mask[:, None, :]
-        # ---- pair update ----
-        z = z + self.opm(s[:, None], mask=mask[:, None])             # single -> pair
-        z = z + self.tri_out(z, mask=pair_mask)                      # triangle (outgoing)
-        z = z + self.tri_in(z, mask=pair_mask)                       # triangle (incoming)
-        z = z + self.pair_trans(z, mask=pair_mask)                   # pair feed-forward
+        # ---- pair update (dropout on each additive branch) ----
+        z = z + self.drop_z(self.opm(s[:, None], mask=mask[:, None]))  # single -> pair
+        z = z + self.drop_z(self.tri_out(z, mask=pair_mask))          # triangle (outgoing)
+        z = z + self.drop_z(self.tri_in(z, mask=pair_mask))           # triangle (incoming)
+        z = z + self.drop_z(self.pair_trans(z, mask=pair_mask))       # pair feed-forward
         # ---- single update: 2 IPAs (pair+geom -> single) + self-attention ----
         for ipa in self.ipas:
-            s = s + ipa(self.s_norm(s), z, frames, mask)
+            s = s + self.drop_s(ipa(self.s_norm(s), z, frames, mask))
         key_pad = ~mask.bool()
         s = s + self.self_attn(s, s, s, key_padding_mask=key_pad, need_weights=False)[0]
         return s, z
@@ -200,6 +206,8 @@ class MultimerModel(nn.Module):
         # pair  : embedder 128 + head-2 geometry 25 + anchor 2 -> D
         self.s_proj = nn.Linear(C_M + 10 + 2, D)
         self.z_proj = nn.Linear(C_Z_EMB + 25 + 2, D)
+        self.drop_s = nn.Dropout(DROPOUT)                  # on the trunk-input projections
+        self.drop_z = nn.Dropout(DROPOUT)
         self.trunk = nn.ModuleList([TrunkBlock() for _ in range(n_trunk)])  # at D
         # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
         self.sm_s = nn.Linear(D, SM_C_S)
@@ -287,8 +295,8 @@ class MultimerModel(nn.Module):
         anc_pair = torch.maximum(anc[:, :, None], anc[:, None, :])       # [B,N,N,2]
         # concat + project down to D: single gets the pooled head-2 summary; pair gets
         # the raw head-2 distogram/orientation geometry.
-        s = self.s_proj(torch.cat([s, h2_pool, anc], -1))              # [B,N,D]
-        z = self.z_proj(torch.cat([z, h2_pair, anc_pair], -1))         # [B,N,N,D]
+        s = self.drop_s(self.s_proj(torch.cat([s, h2_pool, anc], -1)))   # [B,N,D]
+        z = self.drop_z(self.z_proj(torch.cat([z, h2_pair, anc_pair], -1)))  # [B,N,N,D]
         # trunk (frames as fixed geometric context)
         mask = batch["seq_mask"]
         for blk in self.trunk:

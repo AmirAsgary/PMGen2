@@ -26,6 +26,8 @@ STAGE=${STAGE:-1}
 H5=${H5:-data/processed/h5_store}
 HASMIG=${HASMIG:-data/processed/h5_store_hasmig}
 DATAEXP=${DATAEXP:-outputs/data_exploration/per_structure.csv}
+SCHEME=${SCHEME:-two_axis}                 # old-store HLA split for val/test
+FOLD=${FOLD:-1}                            # CV fold (1..5)
 EPOCHS=${EPOCHS:-8}
 BS=${BS:-1}
 LR=${LR:-1e-4}
@@ -61,6 +63,7 @@ $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --master_addr=127.0.0.1 --master_port=${PORT} \
     src/model_multimer_1/train.py \
     --stage "$STAGE" --h5-dir "$H5" --hasmig-dir "$HASMIG" --data-exp-csv "$DATAEXP" \
+    --scheme "$SCHEME" --fold "$FOLD" \
     --ckpt-dir checkpoints_mm1 --run-name "$RUN" $RESUME_FLAG \
     --epochs ${EPOCHS} --bs ${BS} --lr ${LR} \
     --log-every 50 --ckpt-every 1000 --num-workers 4 --amp

@@ -83,11 +83,33 @@ job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the firs
 
 `set_stage(stage)` in `model.py` applies the freezing; `train.py` picks `lam` per stage.
 
+## Data split (train vs val/test)
+- **Train** = OLD-store `two_axis` **train** ids (confidence-filtered in stage 1) **+ ALL
+  hasmig ids**. Set the split with `--scheme two_axis --fold {1..5}` (defaults two_axis/1).
+- **Val / test** = OLD-store `two_axis` **val / test** ids **only** (unfiltered). The HLA
+  two-axis split lives only on the old data, so **hasmig is never validated/tested on** —
+  it is a training-only, low-diversity augmentation. Validation is multi-GPU (sharded +
+  all-reduced). Test is a separate eval (`two_axis` `test.csv`), not run in the train loop.
+
+## hasmig down-weighting (stages 2/3)
+hasmig is high-quality but very low MHC-sequence diversity, so at full weight it over-fits.
+Each hasmig example carries a `sample_weight` (`--hasmig-weight`, default **0.1**) that scales
+**both** its FAPE and its pLDDT CE in the loss; old-store examples stay at 1.0. **Stage 1
+always uses 1.0** (structure-first on confident data); stages 2/3 apply the 0.1. Implemented
+via `collate_with_teacher` (emits `sample_weight[B]`, default 1.0) + `DistillLoss` (folds it
+into the CE weights and the example-weighted FAPE reduction — fully backward compatible).
+
+## Dropout
+`DROPOUT = 0.1` on the **trainable** layers only (head-2 output, the two trunk-input
+projections, and inside every `TrunkBlock`: each pair-update branch, each IPA residual, and
+the single self-attention). The frozen SM / pLDDT head are forced to `.eval()`, so they never
+see dropout; validation (`model.eval()`) turns it off automatically.
+
 ## Confidence / burial filter (stage 1 only)
 `burial >= 0.65 AND peptide pLDDT > 0.70`. Old store: `burial_score` + `mean_peptide_plddt`
 (0–100, so threshold ×100) from `outputs/data_exploration/per_structure.csv`. New store:
 `docking_score` (= burial) + `pep_mean_plddt` (0–1) from its `index.csv`. Stages 2/3 use
-ALL structures. `--no-filter` disables it; `--max-train N` caps the train set (overfit).
+ALL structures. `--no-filter` disables it; `--max-train N` caps the train set (random subset).
 
 ## Status: validated end-to-end locally
 Smoke + a 20-structure overfit were run locally (pmgen2 env, one GPU, bf16 AMP): the

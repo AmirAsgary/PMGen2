@@ -576,6 +576,11 @@ def collate_with_teacher(examples: Sequence[Dict[str, torch.Tensor]]
         batch["teacher_chi_mask"] = teacher_chi_mask
     if "id" in examples[0]:
         batch["id"] = [e["id"] for e in examples]
+    # per-example loss weight (source down-weighting); default 1.0 -> no-op
+    if any("sample_weight" in e for e in examples):
+        batch["sample_weight"] = torch.tensor(
+            [float(e.get("sample_weight", 1.0)) for e in examples],
+            dtype=torch.float32)
     return batch
 
 
@@ -820,6 +825,14 @@ class DistillLoss(nn.Module):
         else:
             res_w, pair_w, fape_pair = seq_mask, pair_mask, None
 
+        # per-example source weight [B] (e.g. down-weight low-diversity hasmig data);
+        # folds into the CE weights (their ÷Σw normalization then down-weights the
+        # example) and, below, into the FAPE reduction. Absent -> unchanged.
+        sw = batch.get("sample_weight", None)
+        if sw is not None:
+            res_w = res_w * sw[:, None]
+            pair_w = pair_w * sw[:, None, None]
+
         # groove-aware: replace the uniform peptide FAPE weight with a buried-gated
         # one (in-pocket peptide -> full structural weight; out-of-pocket -> ~0) and
         # compute the containment term. res_w/pair_w (pLDDT/PAE) are left covering all
@@ -853,7 +866,11 @@ class DistillLoss(nn.Module):
                 vals = tp[b][pep[b] > 0.5]
                 g[b] = vals.median() if vals.numel() else tp.new_tensor(0.0)
             g = (g / 100.0).clamp(min=self.plddt_weight_floor, max=1.0)
+            if sw is not None:
+                g = g * sw
             fape = (g * fape_be).sum() / g.sum().clamp_min(1e-4)
+        elif sw is not None:
+            fape = (sw * fape_be).sum() / sw.sum().clamp_min(1e-4)
         else:
             fape = fape_be.mean()
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
