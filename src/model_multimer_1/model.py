@@ -46,6 +46,9 @@ from openfold.model.structure_module import (                         # noqa: E4
     StructureModule, InvariantPointAttentionMultimer)
 from openfold.model.heads import PerResidueLDDTCaPredictor            # noqa: E402
 from openfold.model.outer_product_mean import OuterProductMean        # noqa: E402
+from openfold.model.triangular_multiplicative_update import (         # noqa: E402
+    TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming)
+from openfold.model.pair_transition import PairTransition             # noqa: E402
 from openfold.utils.rigid_utils import Rigid                          # noqa: E402
 from openfold.utils.geometry.rigid_matrix_vector import Rigid3Array   # noqa: E402
 
@@ -127,7 +130,9 @@ class MHCStructEncoder(nn.Module):
 
     def forward(self, teacher_bb, mhc_mask, frames):
         """teacher_bb[B,N,3,3], mhc_mask[B,N], frames Rigid3Array[B,N]. Returns
-        [B,N,10] (nonzero only on MHC residues)."""
+        (h2_single[B,N,10], h2_pair[B,N,N,25]) — both nonzero only on the MHC block.
+        h2_single is the per-residue IPA summary; h2_pair is the raw distogram +
+        relative-orientation geometry, kept so it can be injected into the trunk pair."""
         ca = teacher_bb[..., 1, :]                                    # [B,N,3]
         d = torch.cdist(ca, ca)                                       # [B,N,N]
         dist = F.one_hot(torch.bucketize(d, self.dist_bins),
@@ -135,10 +140,14 @@ class MHCStructEncoder(nn.Module):
         # relative orientation: direction to j in i's local frame (unit vector)
         rel = frames[..., None].invert_apply(ca[..., None, :, :])     # [B,N,N,3]
         rel = rel / (rel.norm(dim=-1, keepdim=True) + 1e-6)
-        z = self.pair_in(torch.cat([dist, rel], -1))                  # [B,N,N,c_z]
-        s = self.single_in(ca * 0.0 + 0.0)  # placeholder torsion feats (zeros) -> c_s
+        feat = torch.cat([dist, rel], -1)                            # [B,N,N,25]
+        mhc_pair = (mhc_mask[:, :, None] * mhc_mask[:, None, :])[..., None]
+        feat = feat * mhc_pair                                        # MHC×MHC block only
+        z = self.pair_in(feat)                                        # [B,N,N,c_z] (IPA bias)
+        s = self.single_in(ca * 0.0)  # placeholder torsion feats (zeros) -> c_s
         upd = self.ipa(s, z, frames, mhc_mask)                        # [B,N,c_s]
-        return self.out(upd) * mhc_mask[..., None]                    # [B,N,10]
+        h2_single = self.out(upd) * mhc_mask[..., None]               # [B,N,10]
+        return h2_single, feat                                        # feat=[B,N,N,25]
 
 
 # --------------------------------------------------------------------------- #
@@ -152,16 +161,24 @@ class TrunkBlock(nn.Module):
                                             no_heads=IPA_HEADS, no_qk_points=4,
                                             no_v_points=8)
             for _ in range(n_ipa)])
-        self.opms = nn.ModuleList([OuterProductMean(c_s, c_z, c_hidden=32)
-                                   for _ in range(n_ipa)])
+        # PAIR update path: OPM (single->pair) + triangle mult (pair->pair) + transition
+        self.opm = OuterProductMean(c_s, c_z, c_hidden=32)
+        self.tri_out = TriangleMultiplicationOutgoing(c_z, c_hidden=c_z)
+        self.tri_in = TriangleMultiplicationIncoming(c_z, c_hidden=c_z)
+        self.pair_trans = PairTransition(c_z, n=2)
         self.s_norm = nn.LayerNorm(c_s)
-        self.z_norm = nn.LayerNorm(c_z)
         self.self_attn = nn.MultiheadAttention(c_s, n_heads, batch_first=True)
 
     def forward(self, s, z, frames, mask):
-        for ipa, opm in zip(self.ipas, self.opms):
-            s = s + ipa(self.s_norm(s), z, frames, mask)              # IPA updates single
-            z = z + opm(s[:, None], mask=mask[:, None])               # single -> pair
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+        # ---- pair update ----
+        z = z + self.opm(s[:, None], mask=mask[:, None])             # single -> pair
+        z = z + self.tri_out(z, mask=pair_mask)                      # triangle (outgoing)
+        z = z + self.tri_in(z, mask=pair_mask)                       # triangle (incoming)
+        z = z + self.pair_trans(z, mask=pair_mask)                   # pair feed-forward
+        # ---- single update: 2 IPAs (pair+geom -> single) + self-attention ----
+        for ipa in self.ipas:
+            s = s + ipa(self.s_norm(s), z, frames, mask)
         key_pad = ~mask.bool()
         s = s + self.self_attn(s, s, s, key_padding_mask=key_pad, need_weights=False)[0]
         return s, z
@@ -179,9 +196,10 @@ class MultimerModel(nn.Module):
             max_relative_chain=ie["max_relative_chain"])
         self.head2 = MHCStructEncoder()                    # works at D
         self.mhc_noise = mhc_noise
-        # concat (embedder single 256 / pair 128) + head-2 10-d + anchor 2-d -> D
+        # single: embedder 256 + head-2 pooled-summary 10 + anchor 2 -> D
+        # pair  : embedder 128 + head-2 geometry 25 + anchor 2 -> D
         self.s_proj = nn.Linear(C_M + 10 + 2, D)
-        self.z_proj = nn.Linear(C_Z_EMB + 10 + 2, D)
+        self.z_proj = nn.Linear(C_Z_EMB + 25 + 2, D)
         self.trunk = nn.ModuleList([TrunkBlock() for _ in range(n_trunk)])  # at D
         # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
         self.sm_s = nn.Linear(D, SM_C_S)
@@ -238,17 +256,16 @@ class MultimerModel(nn.Module):
         # head-2 (noised MHC frames)
         frames = _frames_from_bb(batch["teacher_bb"], batch["seq_mask"],
                                  noise=self.mhc_noise if self.training else 0.0)
-        h2 = self.head2(batch["teacher_bb"], f["mhc"], frames)         # [B,N,10]
-        h2_single = (h2 * f["mhc"][..., None]).sum(1, keepdim=True) \
+        h2_single, h2_pair = self.head2(batch["teacher_bb"], f["mhc"], frames)  # [B,N,10],[B,N,N,25]
+        h2_pool = (h2_single * f["mhc"][..., None]).sum(1, keepdim=True) \
             / f["mhc"].sum(1, keepdim=True).clamp_min(1.0)[..., None]  # meanpool [B,1,10]
-        h2_single = h2_single.expand(-1, s.shape[1], -1)
+        h2_pool = h2_pool.expand(-1, s.shape[1], -1)
         anc = F.one_hot(batch["anchor"].clamp(0, 1).long(), 2).float()  # [B,N,2]
         anc_pair = torch.maximum(anc[:, :, None], anc[:, None, :])       # [B,N,N,2]
-        # concat + project
-        s = self.s_proj(torch.cat([s, h2_single, anc], -1))            # [B,N,384]
-        Np = z.shape[1]
-        h2_pair = h2[:, :, None, :].expand(-1, -1, Np, -1)             # row-broadcast [B,N,N,10]
-        z = self.z_proj(torch.cat([z, h2_pair, anc_pair], -1))         # [B,N,N,128]
+        # concat + project down to D: single gets the pooled head-2 summary; pair gets
+        # the raw head-2 distogram/orientation geometry.
+        s = self.s_proj(torch.cat([s, h2_pool, anc], -1))              # [B,N,D]
+        z = self.z_proj(torch.cat([z, h2_pair, anc_pair], -1))         # [B,N,N,D]
         # trunk (frames as fixed geometric context)
         mask = batch["seq_mask"]
         for blk in self.trunk:

@@ -8,13 +8,15 @@ per-chain `residue_index`/`asym_id`. Trained confidence-first, then confidence-o
 ```
 head-1  seq -> AF-multimer InputEmbedder (per-chain residue_index, asym/entity/sym,
         single-row msa_feat[49]) -> s_seq[N,256], z_seq[N,N,128]
-head-2  MHC backbone (+Gaussian noise) -> distogram + relative-orientation pair feats
-        + torsion single feats -> 1 multimer IPA -> Linear -> 10-d per MHC residue;
-        pair<-broadcast, single<-mean-pool
+head-2  MHC backbone (+Gaussian noise) -> distogram(22) + relative-orientation(3) =
+        25-d pair geometry ; 1 multimer IPA -> 10-d per-residue summary.
+        summary -> mean-pool -> single ; the 25-d geometry -> injected into the PAIR
 anchor  2-d one-hot (peptide anchor) -> single & pair
-trunk   project to D=64 (single AND pair); n x [ 2 multimer-IPA -> single ;
-        OPM single->pair ] + single self-attention; frames = noised-MHC +
-        peptide-identity (fixed).  IPAs use 4 heads.
+trunk   project to D=64 (single AND pair). n x block, each:
+          PAIR  : OPM(single->pair) + TriMul-out + TriMul-in + PairTransition
+                  (this is what actually refines the pair)
+          SINGLE: 2 multimer-IPA (4 heads; pair+geom -> single) + self-attention
+        frames = noised-MHC + peptide-identity (fixed geometric context).
 out     WIDEN 64 -> {single 384 -> plddt_proj -> FROZEN pLDDT head (confidence);
         (single 384, pair 128) -> FROZEN multimer StructureModule -> Ca/frames (FAPE)}
 ```
