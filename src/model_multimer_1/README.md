@@ -90,6 +90,12 @@ job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the firs
   two-axis split lives only on the old data, so **hasmig is never validated/tested on** —
   it is a training-only, low-diversity augmentation. Validation is multi-GPU (sharded +
   all-reduced). Test is a separate eval (`two_axis` `test.csv`), not run in the train loop.
+- **`val` vs `val-matched`.** Stage 1 trains on a confidence-**filtered** subset, but ~92%
+  of the held-out val fold is BELOW that filter (median pep-pLDDT ≈ 50), so `val` loss sits
+  well above `train` purely from the train/val distribution shift — not overfitting. Each
+  epoch therefore also logs **`val-matched`**: the val subset passing the SAME filter as
+  stage-1 train. `train ≈ val-matched` ⇒ no overfitting (the `val` gap is data quality);
+  `val-matched ≫ train` ⇒ genuine overfitting. Logged as split `val_matched` in metrics.csv.
 
 ## hasmig down-weighting (stages 2/3)
 hasmig is high-quality but very low MHC-sequence diversity, so at full weight it over-fits.

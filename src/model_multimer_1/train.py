@@ -94,23 +94,33 @@ def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
     """Train = OLD-store two_axis TRAIN ids (confidence-filtered iff `filt`) + ALL
     hasmig ids (tagged with `hasmig_w`). Val = OLD-store two_axis VAL ids ONLY
     (the HLA two-axis split lives only on the old data; hasmig is never validated
-    on). Returns (train_concat, val_concat_or_None)."""
-    train_parts, val_parts = [], []
+    on). Returns (train, val_all, val_matched):
+      * val_all     — the FULL held-out val fold (unfiltered; real distribution).
+      * val_matched — the subset of val that passes the SAME confidence filter as
+        stage-1 train, so train vs val_matched is an apples-to-apples check that
+        isolates overfitting from the train/val distribution shift (most of val is
+        low-confidence and never seen in stage-1 training). None if no filter."""
+    train_parts, val_parts, val_hi_parts = [], [], []
 
     # ---- OLD store: HLA two-axis split (the only source of val/test) ----
     if (Path(args.h5_dir) / "index.csv").exists():
         splits = m1.read_split_ids(args.scheme, args.fold)          # base-id lists
         train_base, val_base = set(splits["train"]), set(splits["val"])
-        o_ids, o_shard = old_ids(args.h5_dir, args.data_exp_csv, args.burial_min,
-                                 args.plddt_min, filt)              # confident (or all)
-        o_tr = [i for i in o_ids if m1.base_id(i) in train_base]
+        conf_ids, o_shard = old_ids(args.h5_dir, args.data_exp_csv, args.burial_min,
+                                    args.plddt_min, filt)           # confident (or all)
+        o_tr = [i for i in conf_ids if m1.base_id(i) in train_base]
         if o_tr:
             train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
-        # val is UNFILTERED (real held-out distribution), old store only
+        # val_all is UNFILTERED (real held-out distribution), old store only
         all_idx, all_shard = _store_ids(args.h5_dir)
         o_va = [i for i in all_idx["id"] if m1.base_id(i) in val_base]
         if o_va:
             val_parts.append(m1.H5DistillDataset(o_va, all_shard, args.h5_dir))
+        # val_matched: val ∩ confidence filter (== stage-1 train distribution)
+        if filt:
+            o_va_hi = [i for i in conf_ids if m1.base_id(i) in val_base]
+            if o_va_hi:
+                val_hi_parts.append(m1.H5DistillDataset(o_va_hi, o_shard, args.h5_dir))
 
     # ---- hasmig store: ALL ids -> TRAIN ONLY, down-weighted in the loss ----
     if args.hasmig_dir and (Path(args.hasmig_dir) / "index.csv").exists():
@@ -123,7 +133,8 @@ def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
 
     train_ds = ConcatDataset(train_parts) if train_parts else None
     val_ds = ConcatDataset(val_parts) if val_parts else None
-    return train_ds, val_ds
+    val_hi_ds = ConcatDataset(val_hi_parts) if val_hi_parts else None
+    return train_ds, val_ds, val_hi_ds
 
 
 def parse_args(argv=None):
@@ -186,7 +197,7 @@ def main(argv=None):
 
     filt = (args.stage == 1) and not args.no_filter            # only stage 1 filters
     hasmig_w = 1.0 if args.stage == 1 else args.hasmig_weight   # down-weight in 2/3
-    train_ds, val_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
+    train_ds, val_ds, val_hi_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
     if args.max_train > 0:                                      # overfit / subset
         from torch.utils.data import Subset
         idx = list(range(len(train_ds)))
@@ -194,6 +205,7 @@ def main(argv=None):
         idx = sorted(idx[:min(args.max_train, len(idx))])
         train_ds = Subset(train_ds, idx)
         val_ds = train_ds                                      # watch it fit the same few
+        val_hi_ds = None
     shard_n = len(train_ds) // world if world > 1 else len(train_ds)
     steps_per_epoch = max(1, (shard_n + args.bs - 1) // args.bs)
     total_steps = steps_per_epoch * args.epochs
@@ -257,18 +269,18 @@ def main(argv=None):
         model, device_ids=[local_rank], output_device=local_rank,
         find_unused_parameters=True) if distributed else model)
 
-    def validate():
+    def validate(ds):
         """Multi-GPU validation: every rank evaluates a disjoint, equal-size shard of
-        the val set, then the loss/metric terms are all-reduced (example-weighted) so
-        every rank ends up with the same global means. ALL ranks must call this (the
+        ``ds``, then the loss/metric terms are all-reduced (example-weighted) so every
+        rank ends up with the same global means. ALL ranks must call this (the
         all-reduce is a collective). Single-GPU falls back to a plain pass."""
-        if val_ds is None or not len(val_ds):
+        if ds is None or not len(ds):
             return None
         if not distributed:
-            loader = m1.make_dataloader(val_ds, args.bs, shuffle=False,
+            loader = m1.make_dataloader(ds, args.bs, shuffle=False,
                                         num_workers=args.num_workers)
             return m1.evaluate(model, loader, loss_mod, device, num_recycles=None)
-        loader = m1.make_epoch_loader(val_ds, args.bs, args.num_workers, args.seed,
+        loader = m1.make_epoch_loader(ds, args.bs, args.num_workers, args.seed,
                                       epoch=0, rank=rank, world_size=world)
         local, n = m1.evaluate(model, loader, loss_mod, device,
                                num_recycles=None, return_n=True)
@@ -306,15 +318,21 @@ def main(argv=None):
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
                      if (run_dir is not None and is_main) else None))
-        ev = validate()                      # collective: every rank participates
+        ev = validate(val_ds)                # collective: every rank participates
+        ev_hi = validate(val_hi_ds)          # confidence-matched subset (== train dist)
         if is_main:
             log(f"[mm1] epoch {epoch:3d} | train total {tr['total']:.3f} "
                 f"fape {tr['fape']:.3f} plddt_ce {tr.get('plddt_ce', 0):.3f} "
                 f"(lam_plddt={loss_mod.l_plddt})")
-            if ev is not None:
+            if ev:
                 mlog.log("val", epoch, global_step, None, ev)
                 log(f"[mm1]   val total {ev['total']:.3f} pep-pLDDT-MAE "
                     f"{ev.get('pep_plddt_mae', 0):.2f} pep-RMSD {ev.get('pep_ca_rmsd', 0):.2f}")
+            if ev_hi:                        # apples-to-apples with train (same filter)
+                mlog.log("val_matched", epoch, global_step, None, ev_hi)
+                log(f"[mm1]   val-matched total {ev_hi['total']:.3f} pep-pLDDT-MAE "
+                    f"{ev_hi.get('pep_plddt_mae', 0):.2f} pep-RMSD "
+                    f"{ev_hi.get('pep_ca_rmsd', 0):.2f}  (confidence-filtered val)")
             save_ckpt(run_dir / "last.pt", global_step, epoch)
     mlog.close()
     if distributed:
