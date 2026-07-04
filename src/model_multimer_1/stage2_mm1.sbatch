@@ -24,7 +24,7 @@
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:4
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=240G
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/mm1/%j.out
