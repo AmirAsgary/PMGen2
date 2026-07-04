@@ -576,11 +576,12 @@ def collate_with_teacher(examples: Sequence[Dict[str, torch.Tensor]]
         batch["teacher_chi_mask"] = teacher_chi_mask
     if "id" in examples[0]:
         batch["id"] = [e["id"] for e in examples]
-    # per-example loss weight (source down-weighting); default 1.0 -> no-op
-    if any("sample_weight" in e for e in examples):
-        batch["sample_weight"] = torch.tensor(
-            [float(e.get("sample_weight", 1.0)) for e in examples],
-            dtype=torch.float32)
+    # per-example loss weights (default 1.0 -> no-op). sample_weight scales FAPE+CE
+    # (source down-weighting); struct_weight scales FAPE only (structure quality w_n).
+    for key in ("sample_weight", "struct_weight"):
+        if any(key in e for e in examples):
+            batch[key] = torch.tensor(
+                [float(e.get(key, 1.0)) for e in examples], dtype=torch.float32)
     return batch
 
 
@@ -856,23 +857,28 @@ class DistillLoss(nn.Module):
                 clamp_distance=self.fape_clamp, loss_unit_distance=self.fape_unit)
 
         fape_be = _fape_be(fape_pair)                     # [B]
+        # Per-example FAPE weight = product of any enabled example weightings, then a
+        # weighted mean (÷Σw keeps the FAPE scale stable). Three composable sources:
+        #   plddt_weight_struct — teacher median peptide pLDDT/100 (floored)
+        #   sample_weight (sw)  — source weight (also applied to the CE terms)
+        #   struct_weight (stw) — precomputed structure-quality weight w_n, FAPE-ONLY
+        #                         (so the pLDDT CE still learns confidence on ALL data)
+        stw = batch.get("struct_weight", None)
+        wfape, weighted = fape_be.new_ones(B), False
         if self.plddt_weight_struct:
-            # weight = teacher median peptide pLDDT / 100, floored. Confidence-
-            # weighted MEAN (÷Σg) keeps the FAPE scale stable while down-weighting
-            # low-confidence examples relative to confident ones.
             tp = batch["teacher_plddt"]
             g = fape_be.new_empty(B)
             for b in range(B):
                 vals = tp[b][pep[b] > 0.5]
                 g[b] = vals.median() if vals.numel() else tp.new_tensor(0.0)
-            g = (g / 100.0).clamp(min=self.plddt_weight_floor, max=1.0)
-            if sw is not None:
-                g = g * sw
-            fape = (g * fape_be).sum() / g.sum().clamp_min(1e-4)
-        elif sw is not None:
-            fape = (sw * fape_be).sum() / sw.sum().clamp_min(1e-4)
-        else:
-            fape = fape_be.mean()
+            wfape = wfape * (g / 100.0).clamp(min=self.plddt_weight_floor, max=1.0)
+            weighted = True
+        if sw is not None:
+            wfape, weighted = wfape * sw, True
+        if stw is not None:
+            wfape, weighted = wfape * stw, True
+        fape = ((wfape * fape_be).sum() / wfape.sum().clamp_min(1e-4)
+                if weighted else fape_be.mean())
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
         pae_bins = torch.bucketize(batch["teacher_pae"], self.pae_breaks)
         ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)

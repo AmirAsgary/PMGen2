@@ -73,20 +73,61 @@ def hasmig_ids(h5_dir, burial_min, plddt_min, filt):
     return idx["id"].tolist(), id2shard
 
 
-class _WeightedDataset(torch.utils.data.Dataset):
-    """Wrap a dataset so every example carries a scalar ``sample_weight`` — used to
-    down-weight the hasmig source (high quality but low MHC-sequence diversity, so
-    it over-fits) in the loss for stages 2/3. Weight 1.0 is a no-op."""
+def quality_weight(p: float, b: float, w_min: float = 0.05) -> float:
+    """Structure-quality weight  w_n = w_min + (1-w_min)·q_plddt(p)·q_burial(b).
+    p,b in [0,1]; low-quality structures still contribute weakly (>= w_min) instead
+    of being removed. Used by Approach B to weight the structural (FAPE) loss."""
+    if   p >= 0.9: qp = 1.00
+    elif p >= 0.8: qp = 0.85
+    elif p >= 0.7: qp = 0.70
+    elif p >= 0.6: qp = 0.50
+    elif p >= 0.5: qp = 0.25
+    else:          qp = 0.10
+    qb = min(b / 0.65, 1.0)
+    return w_min + (1.0 - w_min) * qp * qb
 
-    def __init__(self, base, w: float):
-        self.base, self.w = base, float(w)
+
+def _quality_map(args) -> dict:
+    """id -> w_n for every store id, from the per-store score files. Old store:
+    per_structure.csv (mean_peptide_plddt 0-100, burial_score). hasmig: index.csv
+    (pep_mean_plddt 0-1, docking_score 0-1)."""
+    m = {}
+    if Path(args.data_exp_csv).exists():
+        exp = pd.read_csv(args.data_exp_csv)
+        for i, p, b in zip(exp["id"].astype(str),
+                           exp["mean_peptide_plddt"].astype(float) / 100.0,
+                           exp["burial_score"].astype(float)):
+            m[i] = quality_weight(p, b, args.w_min)
+    if args.hasmig_dir and (Path(args.hasmig_dir) / "index.csv").exists():
+        idx = pd.read_csv(Path(args.hasmig_dir) / "index.csv")
+        for i, p, b in zip(idx["id"].astype(str),
+                           idx["pep_mean_plddt"].astype(float),
+                           idx["docking_score"].astype(float)):
+            m[i] = quality_weight(p, b, args.w_min)
+    return m
+
+
+class _WeightAnnotator(torch.utils.data.Dataset):
+    """Annotate each example (by its `id`) with per-example loss weights:
+      * sample_weight — source weight (scales FAPE + pLDDT CE); down-weights hasmig.
+      * struct_weight — structure-quality w_n (scales FAPE ONLY, so the pLDDT CE still
+        learns confidence on ALL structures). Missing id -> weight 1.0 in the loss."""
+
+    def __init__(self, base, id2sw=None, id2stw=None):
+        self.base = base
+        self.id2sw = id2sw or {}
+        self.id2stw = id2stw or {}
 
     def __len__(self):
         return len(self.base)
 
     def __getitem__(self, i):
         ex = self.base[i]
-        ex["sample_weight"] = self.w
+        iid = ex.get("id")
+        if self.id2sw:
+            ex["sample_weight"] = float(self.id2sw.get(iid, 1.0))
+        if self.id2stw:
+            ex["struct_weight"] = float(self.id2stw.get(iid, 1.0))
         return ex
 
 
@@ -101,6 +142,7 @@ def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
         isolates overfitting from the train/val distribution shift (most of val is
         low-confidence and never seen in stage-1 training). None if no filter."""
     train_parts, val_parts, val_hi_parts = [], [], []
+    hasmig_id_set = set()
 
     # ---- OLD store: HLA two-axis split (the only source of val/test) ----
     if (Path(args.h5_dir) / "index.csv").exists():
@@ -111,27 +153,33 @@ def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
         o_tr = [i for i in conf_ids if m1.base_id(i) in train_base]
         if o_tr:
             train_parts.append(m1.H5DistillDataset(o_tr, o_shard, args.h5_dir))
-        # val_all is UNFILTERED (real held-out distribution), old store only
         all_idx, all_shard = _store_ids(args.h5_dir)
-        o_va = [i for i in all_idx["id"] if m1.base_id(i) in val_base]
-        if o_va:
-            val_parts.append(m1.H5DistillDataset(o_va, all_shard, args.h5_dir))
-        # val_matched: val ∩ confidence filter (== stage-1 train distribution)
-        if filt:
-            o_va_hi = [i for i in conf_ids if m1.base_id(i) in val_base]
-            if o_va_hi:
-                val_hi_parts.append(m1.H5DistillDataset(o_va_hi, o_shard, args.h5_dir))
+        full_va = [i for i in all_idx["id"] if m1.base_id(i) in val_base]
+        conf_va = [i for i in conf_ids if m1.base_id(i) in val_base] if filt else []
+        if args.filter_val and conf_va:                             # Approach A: val = filtered
+            val_parts.append(m1.H5DistillDataset(conf_va, o_shard, args.h5_dir))
+        elif full_va:                                               # val = full (real dist)
+            val_parts.append(m1.H5DistillDataset(full_va, all_shard, args.h5_dir))
+            if filt and conf_va:                                    # + val_matched diagnostic
+                val_hi_parts.append(m1.H5DistillDataset(conf_va, o_shard, args.h5_dir))
 
-    # ---- hasmig store: ALL ids -> TRAIN ONLY, down-weighted in the loss ----
+    # ---- hasmig store: ALL ids -> TRAIN ONLY ----
     if args.hasmig_dir and (Path(args.hasmig_dir) / "index.csv").exists():
         h_ids, h_shard = hasmig_ids(args.hasmig_dir, args.burial_min,
                                     args.plddt_min, filt)
         if h_ids:
-            hds = m1.H5DistillDataset(h_ids, h_shard, args.hasmig_dir)
-            train_parts.append(_WeightedDataset(hds, hasmig_w) if hasmig_w != 1.0
-                               else hds)
+            train_parts.append(m1.H5DistillDataset(h_ids, h_shard, args.hasmig_dir))
+            hasmig_id_set = set(h_ids)
 
     train_ds = ConcatDataset(train_parts) if train_parts else None
+    # per-example loss weights on the train concat: source (hasmig down-weight) and/or
+    # structure-quality w_n (Approach B). No-op when both maps are empty.
+    if train_ds is not None:
+        id2sw = {i: hasmig_w for i in hasmig_id_set} if hasmig_w != 1.0 else {}
+        id2stw = _quality_map(args) if args.struct_quality_weight else {}
+        if id2sw or id2stw:
+            train_ds = _WeightAnnotator(train_ds, id2sw, id2stw)
+
     val_ds = ConcatDataset(val_parts) if val_parts else None
     val_hi_ds = ConcatDataset(val_hi_parts) if val_hi_parts else None
     return train_ds, val_ds, val_hi_ds
@@ -160,6 +208,14 @@ def parse_args(argv=None):
     p.add_argument("--plddt-w", type=float, default=0.01)        # stage-1/2 pLDDT weight
     p.add_argument("--stage3-plddt-w", type=float, default=1.0)  # stage-3 pLDDT weight
     p.add_argument("--no-filter", action="store_true", help="disable the stage-1 filter")
+    p.add_argument("--force-filter", action="store_true",
+                   help="apply the confidence filter in ANY stage (Approach A stage 2)")
+    p.add_argument("--filter-val", action="store_true",
+                   help="validate on the filtered val subset only (Approach A)")
+    p.add_argument("--struct-quality-weight", action="store_true",
+                   help="weight the structural (FAPE) loss per structure by w_n "
+                        "(Approach B); full dataset, no filter")
+    p.add_argument("--w-min", type=float, default=0.05, help="w_n floor (Approach B)")
     p.add_argument("--max-train", type=int, default=0, help="cap #train examples (overfit)")
     p.add_argument("--peptide-weight", type=float, default=5.0)
     p.add_argument("--mhc-noise", type=float, default=0.1)
@@ -195,7 +251,8 @@ def main(argv=None):
     log = print if is_main else (lambda *a, **k: None)
     amp_dtype = torch.bfloat16 if args.amp else None            # AF-multimer needs bf16
 
-    filt = (args.stage == 1) and not args.no_filter            # only stage 1 filters
+    # filter train iff stage 1 (default) or explicitly forced (Approach A); --no-filter wins
+    filt = ((args.stage == 1) or args.force_filter) and not args.no_filter
     hasmig_w = 1.0 if args.stage == 1 else args.hasmig_weight   # down-weight in 2/3
     train_ds, val_ds, val_hi_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
     if args.max_train > 0:                                      # overfit / subset

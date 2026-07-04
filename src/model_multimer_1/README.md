@@ -83,6 +83,30 @@ job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the firs
 
 `set_stage(stage)` in `model.py` applies the freezing; `train.py` picks `lam` per stage.
 
+### Stage 2 — two alternative approaches (run in parallel)
+Both resume from a frozen copy of stage-1's **LAST** checkpoint (`stage2_mm1.sbatch`
+copies `mm1_stage1/last.pt` → `checkpoints_mm1/pretrained_stage1_last.pt` once, so A and B
+share the exact same init). Both: SM trainable, pLDDT weight 0.01, hasmig down-weighted 0.1,
+2 epochs.
+```bash
+APPROACH=A sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> mm1_stage2_A
+APPROACH=B sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> mm1_stage2_B
+```
+- **A (`--force-filter --filter-val`)** — keep training AND validating on the confidence-
+  **filtered** structures (same filter as stage 1). Clean, in-distribution; ignores the
+  low-quality tail.
+- **B (`--struct-quality-weight`)** — FULL dataset, **no** filter. The structural (FAPE)
+  loss of each structure is scaled by a quality weight
+  `w_n = w_min + (1-w_min)·q_plddt(pₙ)·q_burial(bₙ)` (`--w-min`, default 0.05;
+  `q_burial=min(b/0.65,1)`; `q_plddt` a 6-step ramp 0.10→1.00). Low-quality structures
+  still contribute weakly instead of being dropped. **Only FAPE is quality-weighted** — the
+  pLDDT CE stays at full weight on ALL structures, so the model still learns to predict LOW
+  confidence for the low-quality/non-binder tail. Validation is on ALL structures.
+
+Per-example weights are carried as `sample_weight` (source; scales FAPE+CE) and `struct_weight`
+(quality w_n; scales FAPE only) through `collate_with_teacher` → `DistillLoss` (both default
+1.0 → no-op, backward compatible).
+
 ## Data split (train vs val/test)
 - **Train** = OLD-store `two_axis` **train** ids (confidence-filtered in stage 1) **+ ALL
   hasmig ids**. Set the split with `--scheme two_axis --fold {1..5}` (defaults two_axis/1).
