@@ -9,7 +9,8 @@ Pick the split with --scheme/--fold. Validation is multi-GPU (sharded + all-redu
   stage 1 (structure, high-confidence): embedder + head-2 + trunk + projections trainable
     (SM & pLDDT head FROZEN), on confident/well-buried complexes only. pLDDT weight = 0
     for epoch 1, then --plddt-w. hasmig at full weight.
-  stage 2 (structure + confidence): SM ALSO trainable; ALL structures; pLDDT weight
+  stage 2 (broader data + confidence): SAME trainable set as stage 1 (SM stays FROZEN);
+    broader data regime (Approach A filtered / B quality-weighted full); pLDDT weight
     --plddt-w. hasmig down-weighted (--hasmig-weight, default 0.1) in FAPE + pLDDT.
   stage 3 (confidence only): freeze EVERYTHING except the pLDDT projection (structure
     detached); pLDDT-only loss at --stage3-plddt-w. hasmig down-weighted.

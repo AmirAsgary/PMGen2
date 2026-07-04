@@ -10,7 +10,7 @@
 #      contribute weakly instead of being dropped); validate on ALL structures.
 #      (--struct-quality-weight)                            -> run mm1_stage2_B
 #
-# Both: SM trainable (stage 2), pLDDT weight 0.01, hasmig down-weighted 0.1, 2 epochs,
+# Both: SM FROZEN (as always), pLDDT weight 0.01, hasmig down-weighted 0.1, 2 epochs,
 # resumed from a FROZEN copy of stage-1's LAST checkpoint (so A and B share the exact
 # same initialization). The copy is made once, idempotently.
 #

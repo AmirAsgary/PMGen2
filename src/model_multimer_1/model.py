@@ -241,18 +241,18 @@ class MultimerModel(nn.Module):
         return self
 
     def set_stage(self, stage: int):
-        """Configure trainable params per stage (pLDDT HEAD is ALWAYS frozen):
-          1: embedder + head-2 + trunk + projections trainable; SM frozen.
-          2: same as 1 PLUS the multimer StructureModule becomes trainable.
+        """Configure trainable params per stage. The StructureModule AND the pLDDT
+        head are ALWAYS frozen — only the encoder path is ever trained.
+          1 & 2: embedder + head-2 + trunk + projections trainable (SM + pLDDT frozen).
+                 Stages differ by DATA/loss regime, not by what is unfrozen.
           3: freeze EVERYTHING except the pLDDT projection; the forward also detaches
              the trunk output before it, so the structure can't move (confidence only)."""
-        if stage == 2:
-            self.sm.requires_grad_(True)                 # fine-tune the structure module
-        elif stage == 3:
+        if stage == 3:
             self.requires_grad_(False)
             self.plddt_proj.requires_grad_(True)
             self.detach_plddt = True
-        self.plddt.requires_grad_(False)                 # AF pLDDT head always frozen
+        self.sm.requires_grad_(False)                    # StructureModule ALWAYS frozen
+        self.plddt.requires_grad_(False)                 # AF pLDDT head ALWAYS frozen
 
     def unfreeze_sm_pct(self, pct: float):
         """Unfreeze the LAST `pct`% of the StructureModule's parameters — a light-touch

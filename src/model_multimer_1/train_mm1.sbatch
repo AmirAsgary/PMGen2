@@ -1,10 +1,10 @@
 #!/bin/bash -l
 # ============================================================================
 # Train model_multimer_1. Three stages (set STAGE):
-#   STAGE=1 : high-confidence + high-burial subset, trunk+SM trainable (pLDDT head
+#   STAGE=1 : high-confidence + high-burial subset, encoder+trunk trainable (SM + pLDDT head
 #             frozen). Structure-first: pLDDT weight 0 (epoch 1) then --plddt-w (0.01).
-#   STAGE=2 : ALL structures, SM stays trainable, pLDDT weight 0.01 (structure+conf).
-#             point RESUME at stage-1's last.pt to carry the structure over.
+#   STAGE=2 : broader data regime (see stage2_mm1.sbatch A/B), SAME trainable set as
+#             stage 1 (SM stays FROZEN), pLDDT weight 0.01. RESUME from stage-1's last.pt.
 #   STAGE=3 : freeze the WHOLE model except the pLDDT projection (pLDDT head always
 #             frozen); confidence-only, pLDDT weight 1.0. RESUME from stage-2.
 #

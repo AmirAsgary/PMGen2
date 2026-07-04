@@ -76,7 +76,8 @@ job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the firs
 ## Three-stage schedule
 - **Stage 1** — trunk **+ SM** trainable (pLDDT head frozen). Structure-first: pLDDT
   weight 0 on epoch 1, then `--plddt-w` (0.01). Trained on the high-confidence subset.
-- **Stage 2** — ALL structures, SM stays trainable, pLDDT weight 0.01 (`lam=(1,0.01,0)`).
+- **Stage 2** — broader data regime (Approach A/B below), **SAME trainable set as stage 1
+  (SM stays FROZEN)**, pLDDT weight 0.01 (`lam=(1,0.01,0)`).
 - **Stage 3** — freeze the **whole model except `plddt_proj`** (pLDDT head always frozen);
   `s` is detached into the pLDDT path so confidence learning can't move the structure.
   Confidence-only, pLDDT weight 1.0 (`--stage3-plddt-w`). Resume from stage-2.
@@ -86,8 +87,8 @@ job. `--max-train N` now takes a **random** N (seeded by `--seed`), not the firs
 ### Stage 2 — two alternative approaches (run in parallel)
 Both resume from a frozen copy of stage-1's **LAST** checkpoint (`stage2_mm1.sbatch`
 copies `mm1_stage1/last.pt` → `checkpoints_mm1/pretrained_stage1_last.pt` once, so A and B
-share the exact same init). Both: SM trainable, pLDDT weight 0.01, hasmig down-weighted 0.1,
-2 epochs.
+share the exact same init). Both: SM FROZEN (always), pLDDT weight 0.01, hasmig down-weighted
+0.1, 2 epochs.
 ```bash
 APPROACH=A sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> mm1_stage2_A
 APPROACH=B sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> mm1_stage2_B
