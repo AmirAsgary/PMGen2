@@ -172,16 +172,20 @@ def build_datasets(args, filt: bool, hasmig_w: float = 1.0):
             hasmig_id_set = set(h_ids)
 
     train_ds = ConcatDataset(train_parts) if train_parts else None
-    # per-example loss weights on the train concat: source (hasmig down-weight) and/or
-    # structure-quality w_n (Approach B). No-op when both maps are empty.
-    if train_ds is not None:
-        id2sw = {i: hasmig_w for i in hasmig_id_set} if hasmig_w != 1.0 else {}
-        id2stw = _quality_map(args) if args.struct_quality_weight else {}
-        if id2sw or id2stw:
-            train_ds = _WeightAnnotator(train_ds, id2sw, id2stw)
-
     val_ds = ConcatDataset(val_parts) if val_parts else None
     val_hi_ds = ConcatDataset(val_hi_parts) if val_hi_parts else None
+
+    # Per-example loss weights: source (hasmig down-weight) and/or structure-quality w_n
+    # (Approach B). Applied IDENTICALLY to train AND val(+val_matched) so the reported
+    # validation loss uses the exact same weighting as train and is directly comparable.
+    # (val holds only old ids, so the hasmig source weight is a no-op there; the quality
+    # weight does apply.) No-op when both maps are empty.
+    id2sw = {i: hasmig_w for i in hasmig_id_set} if hasmig_w != 1.0 else {}
+    id2stw = _quality_map(args) if args.struct_quality_weight else {}
+    if id2sw or id2stw:
+        def _wrap(d):
+            return _WeightAnnotator(d, id2sw, id2stw) if d is not None else None
+        train_ds, val_ds, val_hi_ds = _wrap(train_ds), _wrap(val_ds), _wrap(val_hi_ds)
     return train_ds, val_ds, val_hi_ds
 
 
