@@ -8,9 +8,11 @@
 #   STAGE=3 : freeze the WHOLE model except the pLDDT projection (pLDDT head always
 #             frozen); confidence-only, pLDDT weight 1.0. RESUME from stage-2.
 #
-#   STAGE=1 sbatch src/model_multimer_1/train_mm1.sbatch
-#   STAGE=2 RESUME=checkpoints_mm1/mm1_stage1/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
-#   STAGE=3 RESUME=checkpoints_mm1/mm1_stage2/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
+# Pass STAGE (and optional RESUME) as POSITIONAL ARGS — SLURM forwards $1/$2 reliably,
+# whereas `STAGE=.. sbatch ..` env vars are not propagated on every cluster:
+#   sbatch src/model_multimer_1/train_mm1.sbatch 1
+#   sbatch src/model_multimer_1/train_mm1.sbatch 3 checkpoints_mm1/mm1_stage2_A/last.pt
+# (env vars STAGE=/RESUME= still work as a fallback.)
 # ============================================================================
 #SBATCH --job-name=mm1
 #SBATCH --nodes=1
@@ -22,7 +24,8 @@
 #SBATCH --output=logs/mm1/%j.out
 #SBATCH --error=logs/mm1/%j.err
 
-STAGE=${STAGE:-1}
+STAGE=${1:-${STAGE:-1}}                    # positional $1 preferred, then env, then 1
+RESUME=${2:-${RESUME:-}}                   # positional $2 preferred, then env
 H5=${H5:-data/processed/h5_store}
 HASMIG=${HASMIG:-data/processed/h5_store_hasmig}
 DATAEXP=${DATAEXP:-outputs/data_exploration/per_structure.csv}
@@ -31,7 +34,6 @@ FOLD=${FOLD:-1}                            # CV fold (1..5)
 EPOCHS=${EPOCHS:-8}
 BS=${BS:-1}
 LR=${LR:-1e-4}
-RESUME=${RESUME:-}
 RUN="mm1_stage${STAGE}"
 
 export PYTHONUNBUFFERED=1

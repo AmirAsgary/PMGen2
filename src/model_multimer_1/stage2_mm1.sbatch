@@ -14,8 +14,12 @@
 # resumed from a FROZEN copy of stage-1's LAST checkpoint (so A and B share the exact
 # same initialization). The copy is made once, idempotently.
 #
-#   APPROACH=A sbatch src/model_multimer_1/stage2_mm1.sbatch
-#   APPROACH=B sbatch src/model_multimer_1/stage2_mm1.sbatch
+# Pass the approach as the FIRST ARGUMENT (a positional arg SLURM always forwards to the
+# script as $1 — unlike `APPROACH=B sbatch ...`, whose env var is NOT reliably propagated
+# to the batch job on every cluster):
+#
+#   sbatch src/model_multimer_1/stage2_mm1.sbatch A
+#   sbatch src/model_multimer_1/stage2_mm1.sbatch B
 #
 # Two parallel jobs at gpu:a100:4 need 8 GPUs; if your quota is 4, lower --gres to
 # gpu:a100:2 here (2 epochs still fit in 24 h) or submit B after A.
@@ -30,7 +34,9 @@
 #SBATCH --output=logs/mm1/%j.out
 #SBATCH --error=logs/mm1/%j.err
 
-APPROACH=${APPROACH:-A}
+# approach from the FIRST POSITIONAL ARG (preferred), else the APPROACH env var; no
+# silent default — a missing/typo'd approach FAILS instead of quietly running A.
+APPROACH=${1:-${APPROACH:-}}
 H5=${H5:-data/processed/h5_store}
 HASMIG=${HASMIG:-data/processed/h5_store_hasmig}
 DATAEXP=${DATAEXP:-outputs/data_exploration/per_structure.csv}
@@ -63,7 +69,8 @@ fi
 case "$APPROACH" in
   A) FLAGS="--force-filter --filter-val";        RUN=mm1_stage2_A; PORT=29801 ;;
   B) FLAGS="--struct-quality-weight --w-min $WMIN"; RUN=mm1_stage2_B; PORT=29802 ;;
-  *) echo "FATAL: APPROACH must be A or B"; exit 1 ;;
+  *) echo "FATAL: approach must be A or B (got '${APPROACH}'). Pass it as the first"\
+          "argument, e.g.: sbatch src/model_multimer_1/stage2_mm1.sbatch B"; exit 1 ;;
 esac
 
 for f in params/alphafold/input_embedder_mm.pt params/alphafold/sm_mm.pt \

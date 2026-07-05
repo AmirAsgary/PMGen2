@@ -70,10 +70,13 @@ Both resume from a frozen copy of stage-1's **LAST** checkpoint — `stage2_mm1.
 copies `mm1_stage1/last.pt → checkpoints_mm1/pretrained_stage1_last.pt` once, so A and B
 start from the identical init. Both: SM frozen, pLDDT weight 0.01, hasmig down-weighted
 0.1, 2 epochs. Submit as two independent `gpu:a100:4` jobs:
+The approach is the **first positional argument** (`A`/`B`) — pass it as an argument, not
+`APPROACH=B sbatch …`, because SLURM does not reliably propagate that env var to the batch
+job (it silently falls back to A and both jobs clobber `mm1_stage2_A/`).
 ```bash
 cp checkpoints_mm1/mm1_stage1/last.pt checkpoints_mm1/pretrained_stage1_last.pt   # once
-APPROACH=A sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> checkpoints_mm1/mm1_stage2_A
-APPROACH=B sbatch src/model_multimer_1/stage2_mm1.sbatch   # -> checkpoints_mm1/mm1_stage2_B
+sbatch src/model_multimer_1/stage2_mm1.sbatch A   # -> checkpoints_mm1/mm1_stage2_A
+sbatch src/model_multimer_1/stage2_mm1.sbatch B   # -> checkpoints_mm1/mm1_stage2_B
 ```
 - **A (`--force-filter --filter-val`)** — keep training AND validating on the confidence-
   **filtered** structures (same filter as stage 1). Clean, in-distribution; ignores the
@@ -167,16 +170,17 @@ $PY src/model_multimer_1/extract_multimer_weights.py  # -> input_embedder_mm/sm_
 $PY src/model_multimer_1/model.py                     # "OK forward ... OK loss ..."
 sbatch src/model_multimer_1/smoke_mm1.sbatch          # DDP train + sharded val, 10 structs
 
-# 3. stage 1
-STAGE=1 sbatch src/model_multimer_1/train_mm1.sbatch
+# 3. stage 1   (STAGE is the first POSITIONAL ARG — env vars are not reliably
+#               propagated to SLURM batch jobs, so pass it as an argument)
+sbatch src/model_multimer_1/train_mm1.sbatch 1
 
-# 4. stage 2 — two experiments, each its own 4-GPU job
+# 4. stage 2 — two experiments, each its own 4-GPU job (approach = first arg: A or B)
 cp checkpoints_mm1/mm1_stage1/last.pt checkpoints_mm1/pretrained_stage1_last.pt
-APPROACH=A sbatch src/model_multimer_1/stage2_mm1.sbatch
-APPROACH=B sbatch src/model_multimer_1/stage2_mm1.sbatch
+sbatch src/model_multimer_1/stage2_mm1.sbatch A
+sbatch src/model_multimer_1/stage2_mm1.sbatch B
 
-# 5. stage 3 (confidence-only), resuming the chosen stage-2 run
-STAGE=3 RESUME=checkpoints_mm1/mm1_stage2_A/last.pt sbatch src/model_multimer_1/train_mm1.sbatch
+# 5. stage 3 (confidence-only), resuming the chosen stage-2 run:  args = STAGE RESUME
+sbatch src/model_multimer_1/train_mm1.sbatch 3 checkpoints_mm1/mm1_stage2_A/last.pt
 ```
 
 ## Status: validated end-to-end
