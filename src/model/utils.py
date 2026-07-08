@@ -1123,7 +1123,7 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     ckpt_every: int = 0, save_fn=None,
                     recycle_probs: Optional[Sequence[float]] = None,
                     core: Optional[DistillModel] = None, is_main: bool = True,
-                    amp_dtype=None
+                    amp_dtype=None, metrics_every: int = 0
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1131,7 +1131,13 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     Every ``log_every`` steps it prints ALL loss terms (window-averaged since the
     last log) + lr + it/s, and records them to ``mlog`` (TensorBoard + CSV). Every
     ``ckpt_every`` steps it calls ``save_fn(global_step, epoch)`` to checkpoint, so
-    a crash mid-epoch loses at most ``ckpt_every`` steps."""
+    a crash mid-epoch loses at most ``ckpt_every`` steps.
+
+    ``metrics_every`` > 0 additionally computes the geometric metrics (peptide Cα-RMSD,
+    pLDDT Spearman, …) on the TRAINING batch every that-many steps and folds their
+    window-mean into the logged line/CSV — so you can watch pep-RMSD/pLDDT-corr on
+    train, not only the loss. These are on the train-mode forward (dropout + MHC noise
+    on), so read them as a trend, not the clean-input number the val pass reports."""
     import time
     core = core or model                 # unwrapped module (DDP -> .module) for
     model.train()                        # attribute/param access; `model` (maybe DDP)
@@ -1139,8 +1145,10 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     dev_type = "cuda" if str(device).startswith("cuda") else "cpu"
     agg: Dict[str, float] = defaultdict(float)        # whole-epoch (returned)
     wagg: Dict[str, float] = defaultdict(float)       # window since last log
+    mwagg: Dict[str, float] = defaultdict(float)      # geometric-metric window
     n = 0
     wn = 0
+    mwn = 0
     nsteps = len(loader)
     t0 = time.perf_counter()
     tw = t0
@@ -1194,12 +1202,25 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             wagg[k] += fv
         n += bs
         wn += bs
+        # geometric metrics on the training batch (pep RMSD, pLDDT Spearman, …)
+        if metrics_every and (i % metrics_every == 0 or i == nsteps):
+            with torch.no_grad():
+                mets = eval_metrics(ca.detach().float(), plddt.detach().float(),
+                                    pae.detach().float(), batch, loss_mod)
+            for k, v in mets.items():
+                mwagg[k] += float(v) * bs
+            mwn += bs
         if log_every and (i % log_every == 0 or i == nsteps):
             now = time.perf_counter()
             rate = log_every / max(1e-9, now - tw) if i % log_every == 0 \
                 else (i % log_every) / max(1e-9, now - tw)
             lr = optimizer.param_groups[0]["lr"]
             means = {k: wagg[k] / max(wn, 1) for k in wagg}
+            if mwn > 0:                                    # fold in geometric metrics
+                for k in mwagg:
+                    means[k] = mwagg[k] / mwn
+                mwagg.clear()
+                mwn = 0
             if log:
                 log(f"[train]   epoch {epoch} step {i}/{nsteps} "
                     f"(gstep {global_step}) | "
@@ -1210,6 +1231,9 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     f"fape {means.get('pep_fape', 0):.3f} "
                     f"plddt {means.get('pep_plddt_ce', 0):.3f} "
                     f"pae {means.get('pep_pae_ce', 0):.3f}"
+                    + (f" | pep-RMSD {means['pep_ca_rmsd']:.3f} "
+                       f"pLDDT-corr {means.get('plddt_spearman', 0):.3f}"
+                       if 'pep_ca_rmsd' in means else "")
                     + (f" | contain {means.get('contain', 0):.3f} "
                        f"buried {means.get('buried_frac', 0):.2f}"
                        if 'contain' in means else "")

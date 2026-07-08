@@ -236,6 +236,13 @@ def parse_args(argv=None):
     p.add_argument("--run-name", default=None)
     p.add_argument("--resume", default=None)
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--train-metrics-every", type=int, default=0,
+                   help="also compute pep-RMSD/pLDDT-corr on the TRAIN batch every N "
+                        "steps (0=off; e.g. 50). Adds a small Kabsch/Spearman cost.")
+    p.add_argument("--fresh-optim", action="store_true",
+                   help="on --resume, load WEIGHTS ONLY (fresh optimizer + LR schedule "
+                        "+ epoch 0) even if the checkpoint is the same stage — use to "
+                        "CONTINUE a finished/cut-off run with a new longer schedule")
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args(argv)
@@ -312,14 +319,16 @@ def main(argv=None):
     if args.resume and Path(args.resume).exists():
         ck = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ck["trainable"], strict=False)     # only trainable saved
-        if ck.get("stage") == args.stage:                        # same stage -> continue
+        if ck.get("stage") == args.stage and not args.fresh_optim:  # same stage -> continue
             optimizer.load_state_dict(ck["optimizer"])
             scheduler.load_state_dict(ck["scheduler"])
             start_epoch = int(ck["epoch"]) + 1
             global_step = int(ck["epoch"]) * steps_per_epoch
             scheduler.last_epoch = global_step
-        log(f"[mm1] resumed {args.resume} (stage {ck.get('stage')} -> {args.stage}), "
-            f"start epoch {start_epoch}")
+        mode = "weights-only (fresh optim/sched)" if (
+            args.fresh_optim or ck.get("stage") != args.stage) else "continue"
+        log(f"[mm1] resumed {args.resume} (stage {ck.get('stage')} -> {args.stage}, "
+            f"{mode}), start epoch {start_epoch}")
 
     n_tr = sum(p.numel() for p in model.trainable_parameters())
     log(f"[mm1] stage {args.stage} | trainable {n_tr:,} params | train={len(train_ds)} "
@@ -378,6 +387,7 @@ def main(argv=None):
             None, args.grad_clip, log=(log if is_main else None),
             log_every=args.log_every, epoch=epoch, global_step=global_step, mlog=mlog,
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
+            metrics_every=args.train_metrics_every,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
                      if (run_dir is not None and is_main) else None))
         ev = validate(val_ds)                # collective: every rank participates
