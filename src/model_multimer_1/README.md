@@ -66,6 +66,17 @@ Each stage is a separate job; stage k+1 resumes stage k's checkpoint (loads weig
 fresh optimizer/scheduler because the stored `stage` differs).
 
 ### Stage 2 — two alternative experiments (each a separate 4-GPU job)
+
+| | **Approach A** (`mm1_stage2_A`) | **Approach B** (`mm1_stage2_B`) |
+|---|---|---|
+| idea | keep it clean: train only on the good structures | use everything, but trust bad structures less |
+| training data | confidence-**filtered** subset only | **FULL** dataset (no filter) |
+| structural (FAPE) loss | uniform over the filtered set | per-structure **quality-weighted** by `w_n` |
+| pLDDT CE | full weight on the filtered set | full weight on **all** structures |
+| validation | filtered val subset | **all** val structures |
+| flags | `--force-filter --filter-val` | `--struct-quality-weight` |
+| run | `sbatch …/stage2_mm1.sbatch A` | `sbatch …/stage2_mm1.sbatch B` |
+
 Both resume from a frozen copy of stage-1's **LAST** checkpoint — `stage2_mm1.sbatch`
 copies `mm1_stage1/last.pt → checkpoints_mm1/pretrained_stage1_last.pt` once, so A and B
 start from the identical init. Both: SM frozen, pLDDT weight 0.01, hasmig down-weighted
