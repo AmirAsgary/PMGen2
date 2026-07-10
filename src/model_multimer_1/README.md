@@ -233,6 +233,47 @@ sbatch src/model_multimer_1/stage2_mm1.sbatch B
 sbatch src/model_multimer_1/train_mm1.sbatch 3 checkpoints_mm1/mm1_stage2_A/last.pt
 ```
 
+## Side chains (AlphaFold-style) — `--sidechains`
+Previously the side chains were **never supervised**: `DistillLoss` had no chi/torsion term
+and the H5 stored only `teacher_bb` (N,CA,C), so the frozen `sm.angle_resnet` emitted
+torsions from an out-of-distribution `single` (chi1 was 10.8% correct vs a **22% random**
+baseline — *worse than guessing*; all-atom RMSD 2.16 Å while Cα was 0.12 Å).
+
+**Generation** (exactly AF2): a **trainable** `AngleResnet` predicts 7 torsions
+(omega, phi, psi, chi1..4); atom14 is built with the SM's `torsion_angles_to_frames` +
+`frames_and_literature_positions_to_atom14_pos`, which contain **no learned parameters** —
+so the **StructureModule stays 100% frozen**. Bond lengths/angles are ideal constants, so
+side-chain atom error *is* torsion error. Verified: rigid-group 0 (N,CA,C,CB) is bit-identical
+to the SM's own atom14; groups 3..7 (O via psi, chi1..4) follow our torsions.
+
+**Supervision** (AF2's own losses + weights): backbone FAPE 0.5 + `sidechain_loss` FAPE 0.5
+(over the 8 rigid-group frames + atom14, with `compute_renamed_ground_truth` for symmetric
+atoms, Alg. 26) + `supervised_chi_loss` 1.0 (chi_weight 0.5, angle_norm_weight 0.01, with the
+`chi_pi_periodic` min-trick). AF enables the violation loss only in fine-tuning; so do we.
+
+**Data**: preprocess with `--sidechains` -> `teacher_atom14` [N,14,3] fp16 (a *lossless*
+repack of atom37; ≤0.008 Å quantization; 6.3 GB for 333k structures) + `teacher_chi`.
+`sidechain_gt_from_atom14()` derives the rigid-group/alt/renaming tensors batched on-device.
+
+**The pLDDT head had the same bug**: it read `plddt_proj(trunk_single)` where AF feeds it the
+SM's own `single`. Rewired, with an identity-initialised adapter (stage 1 therefore reproduces
+AF's confidence exactly). Peptide pLDDT-MAE fell 62–76 -> 8.0.
+
+### Reading `eval_sidechains.py`
+Report chi **split MHC vs peptide**, each next to its random baseline. The MHC is ~95% of the
+residues, so a **pooled** chi number is near-perfect just by memorising one allele's rotamers.
+Convergence test (48 train / 12 disjoint held-out, one allele — 150 ep):
+
+| | chi1 (% within 40°) | random |
+|---|---|---|
+| untrained | 20.5% | 22.2% |
+| MHC only (same allele as train) | 96.7% | 22.2% |
+| **peptide only** (held-out peptides) | **80.9%** | 22.2% |
+
+This proves the side-chain objective **trains**; it does **not** prove generalisation (those
+peptides are single-residue point mutants of the training peptides). The real read is the
+`two_axis` held-out fold after preprocessing the full store with `--sidechains`.
+
 ## Inference on data/test (full-atom PDB + RMSD)
 `predict_test.py` runs a checkpoint on the 15 class-I examples in `data/test/`, writes a
 **full-atom PDB** per example (atom14 → atom37; chain A = MHC, chain B = peptide;

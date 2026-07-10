@@ -74,6 +74,11 @@ def main():
 
     periodic = torch.tensor(rc.chi_pi_periodic, dtype=torch.float32, device=dev)
     errs = {1: [], 2: [], 3: [], 4: []}
+    # MHC vs PEPTIDE must be reported separately. The MHC is ~95% of the residues and is
+    # often the SAME protein across a store, so a pooled chi number can be near-perfect
+    # purely by memorising one allele's rotamers. Only the peptide chi is a real read.
+    errs_mhc = {1: [], 2: [], 3: [], 4: []}
+    errs_pep = {1: [], 2: [], 3: [], 4: []}
     pep_rmsd = []
     for i in range(len(ds)):
         b = m1.move_batch(m1.collate_with_teacher([ds[i]]), dev)
@@ -88,10 +93,17 @@ def main():
         per = periodic[b["aatype"].long()].bool()          # [B,N,4]
         d = torch.where(per, torch.minimum(d, np.pi - d), d)
         d = d * 180.0 / np.pi
+        is_pep = m1.peptide_mask_from_batch(b["seq_mask"], b["segment_id"]).bool()
         for c in (1, 2, 3, 4):
             m = mask[..., c - 1] > 0.5
             if m.any():
                 errs[c].append(d[..., c - 1][m].cpu().numpy())
+            mm = m & ~is_pep
+            mp = m & is_pep
+            if mm.any():
+                errs_mhc[c].append(d[..., c - 1][mm].cpu().numpy())
+            if mp.any():
+                errs_pep[c].append(d[..., c - 1][mp].cpu().numpy())
         # peptide pose (binding-pose convention: superpose on MHC)
         pep = m1.peptide_mask_from_batch(b["seq_mask"], b["segment_id"]).bool()[0]
         mhc = b["seq_mask"].bool()[0] & ~pep
@@ -101,23 +113,37 @@ def main():
             pep_rmsd.append(r.item())
 
     tag = Path(args.ckpt).parent.name if args.ckpt else "UNTRAINED"
+    n_mhc_seq = len({tuple(ds[i]["aatype"][: ds[i]["n_mhc"]].tolist()) for i in range(len(ds))})
     print(f"\n=== side-chain acceptance test: {tag} | {len(ds)} HELD-OUT structures ===")
-    print(f"{'angle':<7} {'median err':>11} {'% within 40°':>13} {'random':>9}  verdict")
-    ok = True
-    for c in (1, 2, 3, 4):
-        if not errs[c]:
-            continue
-        a = np.concatenate(errs[c])
-        pct = 100.0 * (a < 40).mean()
-        base = RANDOM_BASELINE[c]
-        good = pct > base
-        ok &= good if c == 1 else True          # chi1 is the acceptance criterion
-        print(f"chi{c:<4} {np.median(a):>10.1f}° {pct:>12.1f}% {base:>8.1f}%  "
-              f"{'PASS' if good else 'below baseline'}")
+    if n_mhc_seq < max(2, len(ds) // 4):
+        print(f"!! WARNING: only {n_mhc_seq} distinct MHC sequence(s) in the held-out set.")
+        print("!! The MHC is ~95% of residues, so the POOLED chi number can be near-perfect")
+        print("!! by memorising one allele's rotamers. Read the PEPTIDE column.")
+
+    def table(name, e, crit):
+        print(f"\n-- {name} --")
+        print(f"{'angle':<7} {'median err':>11} {'% within 40°':>13} {'random':>9}  verdict")
+        first = None
+        for c in (1, 2, 3, 4):
+            if not e[c]:
+                continue
+            a = np.concatenate(e[c])
+            pct = 100.0 * (a < 40).mean()
+            base = RANDOM_BASELINE[c]
+            if c == 1:
+                first = pct > base
+            print(f"chi{c:<4} {np.median(a):>10.1f}° {pct:>12.1f}% {base:>8.1f}%  "
+                  f"{'PASS' if pct > base else 'below baseline'}  (n={len(a)})")
+        return first
+
+    table("POOLED (MHC + peptide) — inflated when the MHC repeats", errs, False)
+    table("MHC only", errs_mhc, False)
+    pep_ok = table("PEPTIDE only  <-- the real generalisation read", errs_pep, True)
+
     print(f"\npeptide Cα-RMSD (held-out, superposed on MHC): {np.mean(pep_rmsd):.2f} Å")
-    print(f"\nACCEPTANCE (chi1 > {RANDOM_BASELINE[1]}% random): "
-          f"{'PASS' if ok else 'FAIL — not learning side chains'}")
-    return 0 if ok else 1
+    print(f"\nACCEPTANCE (PEPTIDE chi1 > {RANDOM_BASELINE[1]}% random): "
+          f"{'PASS' if pep_ok else 'FAIL — not learning peptide side chains'}")
+    return 0 if pep_ok else 1
 
 
 if __name__ == "__main__":
