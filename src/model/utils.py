@@ -1682,6 +1682,16 @@ def extract_example_arrays(pdb: Path, plddt_npy: Path, pae_npy: Path,
         "teacher_pae": pae.numpy().astype(np.float16),
     }
     if sidechains:
+        # Parity with model_multimer_1/preprocess_hasmig.py: chi supervises the torsions;
+        # atom14 is REQUIRED for AF2's side-chain FAPE (rigid-group frames + symmetric
+        # atom renaming). atom14 is a lossless repack of atom37 (<=0.008 A in fp16).
+        from openfold.data.data_transforms import (make_atom14_masks,
+                                                   make_atom14_positions)
+        p14 = make_atom14_positions(make_atom14_masks(
+            {"aatype": ex["aatype"], "all_atom_positions": ex["teacher_atom37"],
+             "all_atom_mask": ex["teacher_atom37_mask"]}))
+        arrays["teacher_atom14"] = p14["atom14_gt_positions"].numpy().astype(np.float16)
+        arrays["teacher_atom14_mask"] = p14["atom14_gt_exists"].numpy().astype(np.uint8)
         arrays["teacher_chi"] = ex["teacher_chi"].numpy().astype(np.float16)
         arrays["teacher_chi_mask"] = ex["teacher_chi_mask"].numpy().astype(np.uint8)
     meta = {"n_mhc": int(ex["n_mhc"]), "n_pep": int(ex["n_pep"]),

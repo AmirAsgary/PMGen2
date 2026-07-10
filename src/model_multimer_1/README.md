@@ -220,9 +220,13 @@ $PY src/model_multimer_1/extract_multimer_weights.py  # -> input_embedder_mm/sm_
 $PY src/model_multimer_1/model.py                     # "OK forward ... OK loss ..."
 sbatch src/model_multimer_1/smoke_mm1.sbatch          # DDP train + sharded val, 10 structs
 
-# 3. stage 1   (STAGE is the first POSITIONAL ARG — env vars are not reliably
-#               propagated to SLURM batch jobs, so pass it as an argument)
-sbatch src/model_multimer_1/train_mm1.sbatch 1
+# 2b. side-chain targets for BOTH stores (required by --sidechains; ~6.3 GB total)
+sbatch src/model/reprocess_sidechains.sbatch          # old store  -> teacher_atom14 + chi
+# (hasmig's preprocess_hasmig.sbatch above already passes --sidechains)
+
+# 3. stage 1 RETRAIN: leak-free + AlphaFold side chains (from scratch)
+sbatch src/model_multimer_1/run_stage1_sidechain.sh
+# legacy (leaky, no side chains):  sbatch src/model_multimer_1/train_mm1.sbatch 1
 
 # 4. stage 2 — two experiments, each its own 4-GPU job (approach = first arg: A or B)
 cp checkpoints_mm1/mm1_stage1/last.pt checkpoints_mm1/pretrained_stage1_last.pt

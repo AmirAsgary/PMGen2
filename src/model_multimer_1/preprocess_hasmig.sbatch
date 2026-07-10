@@ -11,6 +11,7 @@
 #     tar -xzf data/hasmig_mhcs/burial_score_output.tar.gz -C data/hasmig_mhcs/
 #   (the dir data/hasmig_mhcs/burial_score_output/ already holds the .zip files)
 #
+# Stores AF2 side-chain targets (--sidechains): teacher_atom14 + teacher_chi.
 # Submit:  sbatch src/model_multimer_1/preprocess_hasmig.sbatch
 # ============================================================================
 #SBATCH --job-name=hasmig_h5
@@ -40,8 +41,12 @@ mkdir -p logs/hasmig "$OUT"
 [[ -d "$ZIPDIR" ]] || { echo "FATAL: $ZIPDIR not found (untar the tarball first)"; exit 1; }
 echo "=== $(date '+%F %T') | hasmig chunk ${SLURM_ARRAY_TASK_ID}/${N_CHUNKS} on $(hostname) ==="
 
+# --sidechains stores the AF2 side-chain targets (teacher_atom14 fp16 + teacher_chi).
+# Costs ~19 KB/structure (~2.5 GB for the whole hasmig store) and is REQUIRED by
+# train.py --sidechains (which refuses to run on a store without them).
 $PY src/model_multimer_1/preprocess_hasmig.py \
     --csv "$CSV" --zip-dir "$ZIPDIR" --out-dir "$OUT" \
-    --chunk "${SLURM_ARRAY_TASK_ID}" --n-chunks "${N_CHUNKS}"
+    --chunk "${SLURM_ARRAY_TASK_ID}" --n-chunks "${N_CHUNKS}" \
+    --sidechains
 
 exit $?

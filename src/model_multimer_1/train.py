@@ -48,6 +48,17 @@ m1 = MM.m1                                                            # model_1 
 # --------------------------------------------------------------------------- #
 # confident-subset id selection (stage 1) / all ids (stage 2)
 # --------------------------------------------------------------------------- #
+def store_has_sidechains(h5_dir) -> bool:
+    """True iff the store's shards carry BOTH AF2 sidechain targets."""
+    import glob, h5py
+    shards = sorted(glob.glob(str(Path(h5_dir) / "*.h5")))
+    if not shards:
+        return False
+    with h5py.File(shards[0], "r") as h:
+        g = h[next(iter(h.keys()))]
+        return ("teacher_atom14" in g) and ("teacher_chi" in g)
+
+
 def _store_ids(h5_dir):
     idx = pd.read_csv(Path(h5_dir) / "index.csv", dtype={"id": str, "shard": str})
     return idx, dict(zip(idx["id"], idx["shard"]))
@@ -360,12 +371,17 @@ def main(argv=None):
 
     # ---- NO SILENT NO-OPS: fail at startup, not after a day of training ----------
     if args.sidechains:
-        probe = train_ds[0]
-        missing = [k for k in ("teacher_atom14", "teacher_chi") if k not in probe]
-        if missing:
+        # check EVERY store actually used (train_ds[0] would only probe the first one;
+        # a hasmig store without targets would have slipped through silently).
+        used = [d for d in (args.h5_dir, args.hasmig_dir)
+                if d and (Path(d) / "index.csv").exists()]
+        bad = [d for d in used if not store_has_sidechains(d)]
+        if bad:
             raise SystemExit(
-                f"FATAL: --sidechains given but the store lacks {missing}. Re-run "
-                f"preprocessing with --sidechains. (Refusing to train a disabled loss.)")
+                f"FATAL: --sidechains given but these stores lack teacher_atom14/"
+                f"teacher_chi: {bad}. Re-run preprocessing with --sidechains. "
+                f"(Refusing to train a silently-disabled loss.)")
+        log(f"[mm1] sidechain targets present in all {len(used)} store(s): {used}")
         if args.stage in (1, 2):
             assert loss_mod.l_sc_fape > 0 and loss_mod.l_chi > 0, \
                 "sidechain loss weights are zero in a structure stage"
