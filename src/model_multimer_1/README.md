@@ -16,9 +16,10 @@
 > ~6.7 Å while the MHC stays put — the prediction follows the input. **All peptide-RMSD
 > numbers reported so far (train ~0.26 Å, val ~0.28 Å) are contaminated**, and the model
 > cannot be deployed (at inference you don't know the peptide backbone).
-> `MultimerModel(pep_frames=...)` / `--pep-frames` now selects the behaviour; the default
-> stays `teacher` so existing checkpoints reproduce bit-for-bit (training with it prints a
-> loud warning). **A correct model needs a retrain from stage 1 with `--pep-frames identity`.**
+> **FIXED.** `--pep-frames identity` is now the **default**; `teacher` reproduces the old
+> checkpoints and prints a loud warning. Every job runs `_leak_check` pre-flight.
+> All pre-fix checkpoints are unusable (their trunk learned to read the answer) — retrain
+> from stage 1: `sbatch src/model_multimer_1/run_stage1_sidechain.sh`.
 >
 > **`identity` is learnable** — 20-structure overfit (lr 5e-4, n_trunk 3, `--mhc-noise 0`,
 > seed 0, 250 epochs, 0 NaN): FAPE 2.16 → 0.114, peptide-RMSD 10.9 → 0.73 Å. The leaky
@@ -58,13 +59,18 @@ trunk   project to D=64 (single AND pair). n_trunk x block, each:
           PAIR  : OPM(single->pair) + TriMul-out + TriMul-in + PairTransition
           SINGLE: 2 multimer-IPA (4 heads; pair+geom -> single) + self-attention
         frames = noised-MHC + peptide-identity (fixed geometric context).
-out     WIDEN 64 -> {single 384 -> plddt_proj -> FROZEN pLDDT head (confidence);
-        (single 384, pair 128) -> FROZEN multimer StructureModule -> Ca/frames (FAPE)}
+out     WIDEN 64 -> (single 384, pair 128) -> FROZEN multimer StructureModule
+          -> backbone frames + sm["single"]
+        sm["single"] -> TRAINABLE AngleResnet -> 7 torsions -> (SM's parameter-free
+          geometry) -> full atom14   [bb-FAPE + sc-FAPE + supervised-chi]
+        sm["single"] -> plddt_proj (identity-init adapter) -> FROZEN pLDDT head
+          (exactly what AlphaFold feeds it)
 ```
 Internal working width is **D=64** (single & pair), IPAs at **4 heads**; dims are only
 widened to the frozen-module sizes (384/128) at the final projections. `forward ->
-(ca, plddt_logits, zeros_pae, frames)` = the `DistillModel` contract, so it reuses
-model_1's `DistillLoss` (`lambda_pae=0`) + `train_one_epoch` + DDP + metric logging.
+(ca, plddt_logits, None, frames, aux)` — the `DistillModel` contract plus a 5th `aux`
+(angles / atom14 / sidechain frames). model_1's 4-tuple still works. PAE is `None`
+(λ_pae=0), which drops a `[B,N,N,64]` zero tensor and an N²×64 cross-entropy per example.
 AF-multimer runs in **bf16** (fp16 overflows the Evoformer/SM).
 
 ## What is frozen vs trainable
@@ -80,26 +86,29 @@ dropout/SM stochasticity). The trunk IPAs run at 64/4-head ≠ AF's 384/12-head,
 | head-2 (MHC encoder) | 56.3k | train | train | frozen |
 | s_proj / z_proj | 27.2k | train | train | frozen |
 | sm_s / sm_z (widen→SM) | 33.3k | train | train | frozen |
-| **plddt_proj** (widen→pLDDT) | 25.0k | train | train | **train** |
+| **angle_head** (torsions) | 166k | train | train | frozen |
 | trunk (n_trunk=3) | 784k | train | train | frozen |
+| **plddt_proj** (adapter, 384→384) | 148k | **frozen** | train | **train** |
 | **sm** (StructureModule) | 2.02M | **frozen** | **frozen** | **frozen** |
 | **plddt** (AF pLDDT head) | 73k | **frozen** | **frozen** | **frozen** |
-| **trainable total** | | **959k** | **959k** | **25k** |
+| **trainable total** | | **1,100,752** | **1,248,592** | **147,840** |
+
+`plddt_proj` is frozen in stage 1 because λ_plddt = 0 there: it would receive no gradient,
+i.e. be a *silent unused parameter* (and force DDP `find_unused_parameters=True`).
 
 `set_stage(stage)` in `model.py` applies this. (The opt-in `--unfreeze-sm-pct P
 --unfreeze-sm-at E` can fine-tune the last P% of the SM from epoch E — tested at 10%/ep10,
 it barely helped (0.52 vs 0.55 Å overfit), so it is OFF by default and the SM stays frozen.)
 
 ## Three-stage schedule
-- **Stage 1 (structure-first)** — encoder + trunk + projections trainable; SM + pLDDT
-  frozen. Trained on the confidence-**filtered** subset. pLDDT weight 0 on epoch 1, then
-  `--plddt-w` (0.01). hasmig at full weight. `lam=(1, plddt-w, 0)`.
-- **Stage 2 (broader data)** — SAME trainable set as stage 1 (SM stays frozen); pLDDT
-  weight 0.01; hasmig down-weighted. Differs from stage 1 only by the DATA/loss regime —
-  see the two approaches below. `lam=(1, 0.01, 0)`.
-- **Stage 3 (confidence-only)** — freeze the whole model except `plddt_proj`; the forward
-  detaches `s` before the pLDDT path so the structure can't move. pLDDT-only loss at
-  `--stage3-plddt-w` (default 1.0). `lam=(0, stage3-plddt-w, 0)`.
+- **Stage 1 (structure ONLY)** — encoder + trunk + projections + `angle_head` trainable.
+  **λ_plddt = 0 for the whole stage** and `plddt_proj` is frozen. Confidence-**filtered**
+  subset; hasmig at full weight. Losses: bb-FAPE 0.5 + sc-FAPE 0.5 + chi 1.0.
+- **Stage 2 (broader data + confidence)** — same trainable set **plus `plddt_proj`**;
+  λ_plddt = 0.01; hasmig down-weighted 0.1. Structure losses unchanged.
+- **Stage 3 (confidence-only)** — freeze everything except `plddt_proj`; the forward
+  detaches the SM `single` so confidence learning cannot move the structure. All structure
+  weights 0; λ_plddt = `--stage3-plddt-w` (1.0).
 
 Each stage is a separate job; stage k+1 resumes stage k's checkpoint (loads weights,
 fresh optimizer/scheduler because the stored `stage` differs).
