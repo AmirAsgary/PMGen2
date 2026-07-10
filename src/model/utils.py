@@ -66,7 +66,9 @@ from openfold.data.data_transforms import (                           # noqa: E4
     atom37_to_frames,
     get_backbone_frames,
 )
-from openfold.utils.loss import backbone_loss, compute_fape           # noqa: E402
+from openfold.utils.loss import (                                     # noqa: E402
+    backbone_loss, compute_fape, sidechain_loss, supervised_chi_loss,
+    compute_renamed_ground_truth)
 from openfold.utils.rigid_utils import Rigid, Rotation                # noqa: E402
 
 
@@ -817,7 +819,10 @@ class DistillLoss(nn.Module):
                  fape_clamp: Optional[float] = None, fape_unit: float = 10.0,
                  peptide_weight: float = 5.0, plddt_weight_struct: bool = False,
                  plddt_weight_floor: float = 0.1, groove_aware: bool = False,
-                 lambda_contain: float = 0.5, groove=(8.0, 1.5, 8.0, 18.0)):
+                 lambda_contain: float = 0.5, groove=(8.0, 1.5, 8.0, 18.0),
+                 lambda_sc_fape: float = 0.0, lambda_chi: float = 0.0,
+                 chi_weight: float = 0.5, angle_norm_weight: float = 0.01,
+                 sc_clamp_distance: float = 10.0, sc_length_scale: float = 10.0):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
@@ -841,6 +846,17 @@ class DistillLoss(nn.Module):
         self.groove_aware = bool(groove_aware)
         self.lambda_contain = float(lambda_contain)
         self.groove = tuple(groove)              # (tau_mid, s_buried, tau_out, tau_far)
+        # AF2 side-chain supervision (Suppl. 1.9.x). Both default OFF so existing models
+        # are bit-identical; they are enabled only when the model returns torsion `aux`
+        # AND the store carries teacher sidechain targets. AF's own weights:
+        #   fape.backbone 0.5, fape.sidechain 0.5, supervised_chi 1.0
+        #   (chi_weight 0.5, angle_norm_weight 0.01)
+        self.l_sc_fape = float(lambda_sc_fape)
+        self.l_chi = float(lambda_chi)
+        self.chi_weight = float(chi_weight)
+        self.angle_norm_weight = float(angle_norm_weight)
+        self.sc_clamp_distance = float(sc_clamp_distance)
+        self.sc_length_scale = float(sc_length_scale)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -849,8 +865,9 @@ class DistillLoss(nn.Module):
             "pae_breaks", torch.linspace(0.0, pae_max, self.pae_no_bins - 1))
 
     def forward(self, ca: torch.Tensor, plddt_logits: torch.Tensor,
-                pae_logits: torch.Tensor, frames: torch.Tensor,
-                batch: Dict[str, torch.Tensor]
+                pae_logits: Optional[torch.Tensor], frames: torch.Tensor,
+                batch: Dict[str, torch.Tensor],
+                aux: Optional[Dict[str, torch.Tensor]] = None
                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         seq_mask = batch["seq_mask"]
         pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]
@@ -921,21 +938,70 @@ class DistillLoss(nn.Module):
         fape = ((wfape * fape_be).sum() / wfape.sum().clamp_min(1e-4)
                 if weighted else fape_be.mean())
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
-        pae_bins = torch.bucketize(batch["teacher_pae"], self.pae_breaks)
         ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
-        ce_pae = _masked_ce(pae_logits, pae_bins, pair_w)
+        # PAE is skipped entirely when lambda_pae == 0 (or the model returns None): the
+        # [B,N,N,64] bucketize + CE is the single most expensive term and was multiplied
+        # by zero. `pae_logits=None` is the model saying "no PAE head".
+        if self.l_pae != 0.0 and pae_logits is not None:
+            pae_bins = torch.bucketize(batch["teacher_pae"], self.pae_breaks)
+            ce_pae = _masked_ce(pae_logits, pae_bins, pair_w)
+        else:
+            ce_pae = fape.new_zeros(())
         total = self.l_fape * fape + self.l_plddt * ce_plddt + self.l_pae * ce_pae
         if self.groove_aware:
             total = total + self.lambda_contain * contain
+
+        # ---- AF2 side-chain supervision -------------------------------------------
+        sc_fape = fape.new_zeros(())
+        chi_loss = fape.new_zeros(())
+        if aux is not None and (self.l_sc_fape != 0.0 or self.l_chi != 0.0):
+            if "teacher_atom14" not in batch or "teacher_chi" not in batch:
+                raise RuntimeError(
+                    "side-chain loss is enabled but the batch has no sidechain targets "
+                    "(teacher_atom14/teacher_chi). Re-run preprocessing with --sidechains. "
+                    "Refusing to train a silently-disabled loss.")
+            if self.l_sc_fape != 0.0:
+                gt = sidechain_gt_from_atom14(batch["aatype"], batch["teacher_atom14"],
+                                              batch["teacher_atom14_mask"])
+                # padded residues give degenerate (N,CA,C) -> non-finite frames; they are
+                # masked out by rigidgroups_gt_exists, but 0*NaN=NaN, so sanitise first.
+                gt["rigidgroups_gt_frames"] = torch.nan_to_num(gt["rigidgroups_gt_frames"])
+                gt["rigidgroups_alt_gt_frames"] = torch.nan_to_num(
+                    gt["rigidgroups_alt_gt_frames"])
+                gt["rigidgroups_gt_exists"] = gt["rigidgroups_gt_exists"] * \
+                    seq_mask[..., None]
+                ren = compute_renamed_ground_truth(gt, aux["atom14"])
+                sc_fape = sidechain_loss(
+                    aux["sidechain_frames"][None], aux["atom14"][None],
+                    rigidgroups_gt_frames=gt["rigidgroups_gt_frames"],
+                    rigidgroups_alt_gt_frames=gt["rigidgroups_alt_gt_frames"],
+                    rigidgroups_gt_exists=gt["rigidgroups_gt_exists"],
+                    renamed_atom14_gt_positions=ren["renamed_atom14_gt_positions"],
+                    renamed_atom14_gt_exists=ren["renamed_atom14_gt_exists"],
+                    alt_naming_is_better=ren["alt_naming_is_better"],
+                    clamp_distance=self.sc_clamp_distance,
+                    length_scale=self.sc_length_scale).mean()
+            if self.l_chi != 0.0:
+                chi_loss = supervised_chi_loss(
+                    aux["angles"][None], aux["unnormalized_angles"][None],
+                    aatype=batch["aatype"], seq_mask=seq_mask,
+                    chi_mask=batch["teacher_chi_mask"] * seq_mask[..., None],
+                    chi_angles_sin_cos=batch["teacher_chi"],
+                    chi_weight=self.chi_weight,
+                    angle_norm_weight=self.angle_norm_weight).mean()
+            total = total + self.l_sc_fape * sc_fape + self.l_chi * chi_loss
 
         # peptide-ONLY loss values, every step (observation; not in `total`).
         with torch.no_grad():
             pep_fape = _fape_be(pep[:, None, :]).mean()        # FAPE at peptide pos
             pep_plddt_ce = _masked_ce(plddt_logits, plddt_bins, pep)
-            pep_pae_ce = _masked_ce(pae_logits, pae_bins, pep_pair * pair_mask)
+            pep_pae_ce = (_masked_ce(pae_logits, pae_bins, pep_pair * pair_mask)
+                          if (self.l_pae != 0.0 and pae_logits is not None)
+                          else fape.new_zeros(()))
 
         terms = {"total": total.detach(), "fape": fape.detach(),
                  "plddt_ce": ce_plddt.detach(), "pae_ce": ce_pae.detach(),
+                 "sc_fape": sc_fape.detach(), "chi_loss": chi_loss.detach(),
                  "pep_fape": pep_fape.detach(), "pep_plddt_ce": pep_plddt_ce.detach(),
                  "pep_pae_ce": pep_pae_ce.detach()}
         if self.groove_aware:
@@ -1027,9 +1093,12 @@ def eval_metrics(ca: torch.Tensor, plddt_logits: torch.Tensor,
     rmsd = kabsch_rmsd(ca, batch["teacher_ca"], seq_mask)
     plddt_pred = plddt_from_logits(plddt_logits, loss_mod.plddt_no_bins)
     spearman = _spearman(plddt_pred[m], batch["teacher_plddt"][m])
-    pae_pred = pae_from_logits(pae_logits, loss_mod.pae_breaks)
-    pae_mae = ((pae_pred - batch["teacher_pae"]).abs() * pair_mask).sum() \
-        / pair_mask.sum().clamp_min(1.0)
+    if pae_logits is None:                       # model has no PAE head
+        pae_mae = ca.new_zeros(())
+    else:
+        pae_pred = pae_from_logits(pae_logits, loss_mod.pae_breaks)
+        pae_mae = ((pae_pred - batch["teacher_pae"]).abs() * pair_mask).sum() \
+            / pair_mask.sum().clamp_min(1.0)
 
     # ---- peptide-only observation metrics (the part that actually matters) ---
     pep = peptide_mask_from_batch(seq_mask, batch["segment_id"])      # [B,N]
@@ -1047,8 +1116,9 @@ def eval_metrics(ca: torch.Tensor, plddt_logits: torch.Tensor,
     pep_plddt_mae = float(((plddt_pred - batch["teacher_plddt"]).abs() * pep).sum()
                           / pep.sum().clamp_min(1.0))
     pep_pair = torch.maximum(pep[:, :, None], pep[:, None, :]) * pair_mask
-    pep_pae_mae = float(((pae_pred - batch["teacher_pae"]).abs() * pep_pair).sum()
-                        / pep_pair.sum().clamp_min(1.0))
+    pep_pae_mae = 0.0 if pae_logits is None else float(
+        ((pae_pred - batch["teacher_pae"]).abs() * pep_pair).sum()
+        / pep_pair.sum().clamp_min(1.0))
     return {"ca_rmsd": float(rmsd), "plddt_spearman": float(spearman),
             "pae_mae": float(pae_mae), "pep_ca_rmsd": pep_ca_rmsd,
             "pep_plddt_mae": pep_plddt_mae, "pep_pae_mae": pep_pae_mae}
@@ -1078,7 +1148,7 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
 
 # --- metric logging (TensorBoard if available, always a flat CSV) ---------- #
 _METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
-                "total", "fape", "plddt_ce", "pae_ce",
+                "total", "fape", "plddt_ce", "pae_ce", "sc_fape", "chi_loss",
                 "pep_fape", "pep_plddt_ce", "pep_pae_ce",
                 "ca_rmsd", "plddt_spearman", "pae_mae",
                 "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae",
@@ -1211,8 +1281,10 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
         with torch.autocast(device_type=dev_type,
                             enabled=(use_amp or amp_dtype is not None),
                             dtype=(amp_dtype or torch.float16)):
-            ca, plddt, pae, frames = model(batch, return_frames=True, num_recycles=nr)
-            total, terms = loss_mod(ca, plddt, pae, frames, batch)
+            o = model(batch, return_frames=True, num_recycles=nr)
+            ca, plddt, pae, frames = o[:4]      # models with a torsion head return a
+            aux = o[4] if len(o) > 4 else None  # 5th `aux` (angles/atom14/sc frames)
+            total, terms = loss_mod(ca, plddt, pae, frames, batch, aux=aux)
         if use_amp:
             scaler.scale(total).backward()
             if grad_clip is not None:
@@ -1303,9 +1375,10 @@ def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
     n = 0
     for i, batch in enumerate(loader):
         batch = move_batch(batch, device)
-        ca, plddt, pae, frames = model(batch, return_frames=True,
-                                       num_recycles=num_recycles)
-        _, terms = loss_mod(ca, plddt, pae, frames, batch)
+        o = model(batch, return_frames=True, num_recycles=num_recycles)
+        ca, plddt, pae, frames = o[:4]
+        aux = o[4] if len(o) > 4 else None
+        _, terms = loss_mod(ca, plddt, pae, frames, batch, aux=aux)
         mets = eval_metrics(ca, plddt, pae, batch, loss_mod)
         bs = int(batch["aatype"].shape[0])
         for d in (terms, mets):

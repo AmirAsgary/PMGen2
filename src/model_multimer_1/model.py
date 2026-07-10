@@ -43,7 +43,7 @@ import utils as m1                                                    # noqa: E4
 from openfold.config import model_config                              # noqa: E402
 from openfold.model.embedders import InputEmbedderMultimer            # noqa: E402
 from openfold.model.structure_module import (                         # noqa: E402
-    StructureModule, InvariantPointAttentionMultimer)
+    StructureModule, InvariantPointAttentionMultimer, AngleResnet)
 from openfold.model.heads import PerResidueLDDTCaPredictor            # noqa: E402
 from openfold.model.outer_product_mean import OuterProductMean        # noqa: E402
 from openfold.model.triangular_multiplicative_update import (         # noqa: E402
@@ -209,7 +209,7 @@ class MultimerModel(nn.Module):
                    Correct/deployable, but requires retraining.
     """
 
-    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="teacher"):
+    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="identity"):
         super().__init__()
         assert pep_frames in ("teacher", "identity")
         self.pep_frames = pep_frames
@@ -232,7 +232,16 @@ class MultimerModel(nn.Module):
         # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
         self.sm_s = nn.Linear(D, SM_C_S)
         self.sm_z = nn.Linear(D, SM_C_Z)
-        self.plddt_proj = nn.Linear(D, SM_C_S)
+        # The frozen pLDDT head was pretrained on the SM's OWN `single`; feeding it a
+        # trunk-derived vector is the same out-of-distribution mistake as the frozen
+        # angle_resnet. It now reads sm["single"] through a trainable adapter (which is
+        # also the only thing stage 3 trains).
+        self.plddt_proj = nn.Linear(SM_C_S, SM_C_S)
+        # TRAINABLE torsion head (AF2's own AngleResnet, freshly initialised). The frozen
+        # sm.angle_resnet is never used: it maps AF-Evoformer `single` -> torsions and is
+        # garbage on our representation (chi1 was 10.8% correct vs a 22% random baseline).
+        self.angle_head = AngleResnet(c_in=SM_C_S, c_hidden=128, no_blocks=2,
+                                      no_angles=7, epsilon=1e-8)
         # frozen AF-multimer structure module + pLDDT head
         sm_cfg = {**dict(cfg["model"]["structure_module"]), "is_multimer": True}
         self.sm = StructureModule(**sm_cfg)
@@ -261,13 +270,22 @@ class MultimerModel(nn.Module):
         return self
 
     def set_stage(self, stage: int):
-        """Configure trainable params per stage. The StructureModule AND the pLDDT
-        head are ALWAYS frozen — only the encoder path is ever trained.
-          1 & 2: embedder + head-2 + trunk + projections trainable (SM + pLDDT frozen).
-                 Stages differ by DATA/loss regime, not by what is unfrozen.
-          3: freeze EVERYTHING except the pLDDT projection; the forward also detaches
-             the trunk output before it, so the structure can't move (confidence only)."""
-        if stage == 3:
+        """Configure trainable params per stage. The StructureModule AND the AF pLDDT
+        head are ALWAYS frozen — only the encoder path + torsion head are ever trained.
+
+          1: structure only (lambda_plddt = 0). embedder + head-2 + trunk + projections
+             + angle_head trainable. `plddt_proj` is FROZEN: with a zero pLDDT weight it
+             would receive no gradient, i.e. be a silent unused parameter (and force
+             DDP find_unused_parameters=True).
+          2: same PLUS `plddt_proj` trainable (lambda_plddt = 0.01).
+          3: freeze EVERYTHING except `plddt_proj`; the forward detaches the SM single
+             before it, so confidence learning cannot move the structure.
+        """
+        self.requires_grad_(True)                        # reset, then re-freeze below
+        self.detach_plddt = False
+        if stage == 1:
+            self.plddt_proj.requires_grad_(False)        # no gradient at lambda_plddt=0
+        elif stage == 3:
             self.requires_grad_(False)
             self.plddt_proj.requires_grad_(True)
             self.detach_plddt = True
@@ -328,29 +346,56 @@ class MultimerModel(nn.Module):
             s, z = blk(s, z, frames, mask)
         return s, z, mask
 
+    def _structure(self, batch):
+        """Encoder -> frozen SM (backbone) -> TRAINABLE torsion head -> full-atom14.
+
+        The SM's own angle_resnet is bypassed. Side-chain atoms are rebuilt from OUR
+        torsions with the SM's `torsion_angles_to_frames` /
+        `frames_and_literature_positions_to_atom14_pos`, which hold **no learned
+        parameters** (only the `default_frames`/`group_idx`/`lit_positions` buffers) —
+        so the StructureModule stays entirely frozen, exactly as AlphaFold's geometry.
+        """
+        s, z, mask = self._encode(batch)
+        sm_in = self.sm_s(s)
+        out = self.sm({"single": sm_in, "pair": self.sm_z(z)},
+                      batch["aatype"], mask=mask)
+        sm_single = out["single"]                                     # [B,N,384]
+        # torsions: (omega, phi, psi, chi1..chi4); unnormalized feeds the angle-norm reg
+        unnorm_angles, angles = self.angle_head(sm_single, sm_in)     # [B,N,7,2] each
+        # rebuild all-atom from the SM's final backbone frames + OUR torsions. The
+        # multimer SM emits `frames` as a Rigid3Array 4x4 array [layers,B,N,4,4],
+        # already scale_translation'd into Å (same rigid it feeds its own angle path).
+        bb_rigid = Rigid3Array.from_array4x4(out["frames"][-1])
+        all_frames = self.sm.torsion_angles_to_frames(bb_rigid, angles, batch["aatype"])
+        atom14 = self.sm.frames_and_literature_positions_to_atom14_pos(
+            all_frames, batch["aatype"])                              # [B,N,14,3]
+        return out, sm_single, unnorm_angles, angles, all_frames, atom14, mask
+
     def predict(self, batch):
-        """Full-atom inference. Returns the frozen SM's final atom14 coords + pLDDT
-        logits (forward() only exposes Cα). No grad; caller should be in eval()."""
+        """Full-atom inference: atom14 (backbone from the frozen SM, side chains from the
+        trained torsion head) + pLDDT logits. No grad; caller should be in eval()."""
         with torch.no_grad():
-            s, z, mask = self._encode(batch)
-            out = self.sm({"single": self.sm_s(s), "pair": self.sm_z(z)},
-                          batch["aatype"], mask=mask)
-            return {"atom14": out["positions"][-1],          # [B,N,14,3]
-                    "ca": out["positions"][-1][..., 1, :],   # [B,N,3]
-                    "plddt_logits": self.plddt(self.plddt_proj(s))}
+            out, sm_single, _, _, _, atom14, _ = self._structure(batch)
+            return {"atom14": atom14,                       # [B,N,14,3]
+                    "ca": atom14[..., 1, :],                # [B,N,3]
+                    "plddt_logits": self.plddt(self.plddt_proj(sm_single))}
 
     def forward(self, batch, return_frames=False, num_recycles=None):
-        s, z, mask = self._encode(batch)
-        # frozen heads
-        out = self.sm({"single": self.sm_s(s), "pair": self.sm_z(z)},
-                      batch["aatype"], mask=mask)
-        ca = out["positions"][-1][..., 1, :]
-        s_plddt = s.detach() if self.detach_plddt else s   # stage-3: confidence only
+        out, sm_single, unnorm_angles, angles, all_frames, atom14, mask = \
+            self._structure(batch)
+        ca = atom14[..., 1, :]                    # CA sits in rigid-group 0 (backbone)
+        # stage-3: confidence only -> no gradient may reach the structure
+        s_plddt = sm_single.detach() if self.detach_plddt else sm_single
         plddt_logits = self.plddt(self.plddt_proj(s_plddt))
-        B, N = mask.shape
-        pae_logits = ca.new_zeros(B, N, N, 64)           # no PAE; DistillLoss lambda_pae=0
+        # PAE is never trained here (teacher PAE is zeros for hasmig; lambda_pae=0).
+        # Returning None instead of a [B,N,N,64] zero tensor saves ~37 MB and an N^2x64
+        # cross-entropy per example; DistillLoss/eval_metrics treat None as "no PAE".
+        pae_logits = None
         if return_frames:
-            return ca, plddt_logits, pae_logits, out["frames"]
+            aux = {"angles": angles, "unnormalized_angles": unnorm_angles,
+                   "sidechain_frames": all_frames.to_tensor_4x4(),   # [B,N,8,4,4]
+                   "atom14": atom14}
+            return ca, plddt_logits, pae_logits, out["frames"], aux
         return ca, plddt_logits, pae_logits
 
 
@@ -366,6 +411,16 @@ def _dummy_batch(dev, B=1, n_mhc=180, n_pep=9):
     }
     batch["teacher_plddt"] = torch.rand(B, N, device=dev) * 100
     batch["teacher_pae"] = torch.zeros(B, N, N, device=dev)
+    # AF2 sidechain targets, so the smoke exercises sc-FAPE + chi (not a silent no-op)
+    from openfold.np import residue_constants as rc
+    aa = batch["aatype"]
+    a14m = torch.tensor(rc.restype_atom14_mask, device=dev, dtype=torch.float32)[aa]
+    chim = torch.tensor(rc.chi_angles_mask, device=dev, dtype=torch.float32)[aa]
+    batch["teacher_atom14"] = torch.randn(B, N, 14, 3, device=dev) * 5 * a14m[..., None]
+    batch["teacher_atom14_mask"] = a14m
+    chi = torch.randn(B, N, 4, 2, device=dev)
+    batch["teacher_chi"] = chi / chi.norm(dim=-1, keepdim=True)   # unit (sin,cos)
+    batch["teacher_chi_mask"] = chim
     return batch
 
 
@@ -421,6 +476,17 @@ def _leak_check(dev=None, ckpt=None, tol=1e-6):
         d = (net.predict(b2)["ca"] - net.predict(batch)["ca"])[pep].norm(dim=-1).mean().item()
         print(f"leak-check (end-to-end, {Path(ckpt).name}): |Δ pred peptide Cα| = {d:.2e} A")
         assert d < 1e-4, f"PEPTIDE POSE LEAK end-to-end: prediction moved {d:.4f} A"
+
+    # --- the SIDE-CHAIN TARGETS are loss-only: they must never reach the model --------
+    net = MultimerModel(device=dev, pep_frames="identity").eval()
+    base = net.predict(batch)["atom14"]
+    for key in ("teacher_atom14", "teacher_chi", "teacher_ca", "teacher_plddt"):
+        b3 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        b3[key] = torch.randn_like(b3[key]) * 10.0          # destroy the target
+        d = (net.predict(b3)["atom14"] - base).abs().max().item()
+        assert d == 0.0, (f"TARGET LEAK: randomising batch['{key}'] moved the prediction "
+                          f"by {d:.3e} A. It is a supervision target, not an input.")
+    print("OK leak-check: sidechain/confidence TARGETS never influence the prediction")
     print("OK leak-check: peptide geometry is withheld under pep_frames='identity'")
 
 
@@ -430,20 +496,31 @@ def _smoke():
     _leak_check(dev)
     net = MultimerModel(device=dev)
     batch = _dummy_batch(dev)
+    net.set_stage(1)
     net.train()
-    ca, pl, pae, fr = net(batch, return_frames=True)
-    print("OK forward:", tuple(ca.shape), tuple(pl.shape), tuple(pae.shape),
-          "| trainable params:", sum(p.numel() for p in net.trainable_parameters()))
-    # ---- validate the LOSS + BACKWARD path (FAPE on the multimer SM frames) ----
-    loss_mod = m1.DistillLoss(1.0, 0.01, 0.0, peptide_weight=5.0).to(dev)
-    total, terms = loss_mod(ca, pl, pae, fr, batch)
+    ca, pl, pae, fr, aux = net(batch, return_frames=True)
+    print("OK forward:", tuple(ca.shape), tuple(pl.shape), "pae=None" if pae is None else
+          tuple(pae.shape), "| atom14:", tuple(aux["atom14"].shape),
+          "| trainable:", sum(p.numel() for p in net.trainable_parameters()))
+    # ---- LOSS + BACKWARD, with AF2's side-chain terms actually ON ----
+    loss_mod = m1.DistillLoss(0.5, 0.0, 0.0, peptide_weight=5.0,
+                              lambda_sc_fape=0.5, lambda_chi=1.0).to(dev)
+    total, terms = loss_mod(ca, pl, pae, fr, batch, aux=aux)
+    assert float(terms["sc_fape"]) > 0 and float(terms["chi_loss"]) > 0, \
+        "side-chain losses are zero -- they are a silent no-op"
     total.backward()
     n_grad = sum(1 for p in net.trainable_parameters()
                  if p.grad is not None and torch.isfinite(p.grad).all())
     n_tot = sum(1 for _ in net.trainable_parameters())
+    ah = sum(p.grad.norm().item() ** 2 for p in net.angle_head.parameters()
+             if p.grad is not None) ** 0.5
+    assert ah > 0, "no gradient reaches the torsion head"
+    assert not any(p.grad is not None and p.grad.abs().sum() > 0
+                   for p in net.sm.parameters()), "StructureModule received gradient"
     print(f"OK loss: total={float(total):.3f} fape={terms['fape']:.3f} "
-          f"plddt_ce={terms['plddt_ce']:.3f} finite={torch.isfinite(total).item()} "
-          f"| grads on {n_grad}/{n_tot} trainable tensors")
+          f"sc_fape={terms['sc_fape']:.3f} chi={terms['chi_loss']:.3f} "
+          f"finite={torch.isfinite(total).item()} | grads {n_grad}/{n_tot} "
+          f"| ||grad angle_head||={ah:.3e} | SM grads: 0")
 
 
 if __name__ == "__main__":
