@@ -501,6 +501,37 @@ def find_teacher_files(af_dir: Path) -> Tuple[Path, Path, Path]:
     return pdb, plddt, pae
 
 
+def sidechain_gt_from_atom14(aatype: torch.Tensor, atom14: torch.Tensor,
+                             atom14_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """AF2's side-chain ground-truth features, derived (batched, on-device) from the
+    stored ``teacher_atom14`` — a lossless, compact repacking of atom37.
+
+    Produces exactly the tensors ``openfold.utils.loss.sidechain_loss`` and
+    ``compute_renamed_ground_truth`` consume:
+      rigidgroups_{gt_frames, alt_gt_frames, gt_exists}   -- the 8 rigid groups/residue
+      atom14_{gt,alt_gt}_{positions,exists}, atom14_atom_is_ambiguous
+    The alt/ambiguous tensors are what let AF2 score symmetric side chains (Asp OD1/OD2,
+    Phe CD1/CD2, ...) without punishing an equivalent atom naming.
+    """
+    from openfold.data.data_transforms import (                      # noqa: E402
+        make_atom14_masks, make_atom14_positions, atom37_to_frames)
+    from openfold.utils.feats import atom14_to_atom37                # noqa: E402
+    from openfold.utils.tensor_utils import batched_gather           # noqa: E402
+
+    p: Dict[str, torch.Tensor] = make_atom14_masks({"aatype": aatype})
+    a37 = atom14_to_atom37(atom14, p)                                # [*, N, 37, 3]
+    nb = len(atom14_mask.shape[:-1])
+    m37 = batched_gather(atom14_mask, p["residx_atom37_to_atom14"],
+                         dim=-1, no_batch_dims=nb) * p["atom37_atom_exists"]
+    prot = {"aatype": aatype, "all_atom_positions": a37, "all_atom_mask": m37, **p}
+    prot = atom37_to_frames(prot)
+    prot = make_atom14_positions(prot)
+    keys = ("rigidgroups_gt_frames", "rigidgroups_alt_gt_frames", "rigidgroups_gt_exists",
+            "atom14_gt_positions", "atom14_alt_gt_positions", "atom14_gt_exists",
+            "atom14_alt_gt_exists", "atom14_atom_is_ambiguous")
+    return {k: prot[k] for k in keys}
+
+
 def load_teacher_arrays(plddt_npy: Path, pae_npy: Path, n: int
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Load + slice the (post-padded) teacher arrays to the true length N.
@@ -582,6 +613,16 @@ def collate_with_teacher(examples: Sequence[Dict[str, torch.Tensor]]
         if any(key in e for e in examples):
             batch[key] = torch.tensor(
                 [float(e.get(key, 1.0)) for e in examples], dtype=torch.float32)
+    # AF2 sidechain targets (side-chain stores only): pad with zeros; the *_mask
+    # tensors mark the padding, and the rigid-group / renaming features are derived
+    # from these on-device in the loss (see sidechain_gt_from_atom14).
+    for key, tail in (("teacher_atom14", (14, 3)), ("teacher_atom14_mask", (14,)),
+                      ("teacher_chi", (4, 2)), ("teacher_chi_mask", (4,))):
+        if key in examples[0]:
+            t = torch.zeros(b, max_n, *tail, dtype=torch.float32)
+            for i, e in enumerate(examples):
+                t[i, : int(e["aatype"].shape[0])] = e[key]
+            batch[key] = t
     return batch
 
 
@@ -1765,6 +1806,11 @@ class H5DistillDataset(Dataset):
                 g["teacher_chi"][()].astype(np.float32))
             ex["teacher_chi_mask"] = torch.from_numpy(
                 g["teacher_chi_mask"][()].astype(np.float32))
+        if "teacher_atom14" in g:                # AF2 sidechain-FAPE targets
+            ex["teacher_atom14"] = torch.from_numpy(
+                g["teacher_atom14"][()].astype(np.float32))
+            ex["teacher_atom14_mask"] = torch.from_numpy(
+                g["teacher_atom14_mask"][()].astype(np.float32))
         return ex
 
 

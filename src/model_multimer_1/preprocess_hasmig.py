@@ -38,6 +38,8 @@ _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC.parent / "openfold"))     # residue_constants for parse
 sys.path.insert(0, str(_SRC / "pdb"))
 from parse import parse_example                        # noqa: E402
+from openfold.data.data_transforms import (            # noqa: E402
+    make_atom14_masks, make_atom14_positions)
 
 
 def _base_id(aid: str) -> str:
@@ -45,7 +47,7 @@ def _base_id(aid: str) -> str:
     return re.sub(r"_\d+$", "", aid)
 
 
-def process_row(r, zip_dir: Path):
+def process_row(r, zip_dir: Path, sidechains: bool = False):
     """One CSV row -> (arrays, meta) mirroring extract_example_arrays, but from a zip,
     with truncated plddt and zero PAE."""
     aid = str(r["id"])
@@ -63,7 +65,8 @@ def process_row(r, zip_dir: Path):
         tf.write(pdb_bytes)
         tf.close()
         ex = parse_example(tf.name, r["peptide"], r["mhc_seq"], r["anchors"],
-                           r["mhc_type"], return_backbone=True)
+                           r["mhc_type"], return_backbone=True,
+                           return_sidechain=sidechains)
     finally:
         os.unlink(tf.name)
 
@@ -83,6 +86,17 @@ def process_row(r, zip_dir: Path):
         "teacher_plddt": plddt,
         "teacher_pae": np.zeros((n, n), np.float16),    # no PAE in this dataset
     }
+    if sidechains:
+        # AF2 sidechain supervision targets. atom14 is a LOSSLESS, compact (2.7x smaller)
+        # re-packing of atom37 -> everything else (alt positions, rigid-group frames,
+        # atom renaming) is derived from it + aatype at load time. fp16 costs <0.008 A.
+        p14 = make_atom14_positions(make_atom14_masks(
+            {"aatype": ex["aatype"], "all_atom_positions": ex["teacher_atom37"],
+             "all_atom_mask": ex["teacher_atom37_mask"]}))
+        arrays["teacher_atom14"] = p14["atom14_gt_positions"].numpy().astype(np.float16)
+        arrays["teacher_atom14_mask"] = p14["atom14_gt_exists"].numpy().astype(np.uint8)
+        arrays["teacher_chi"] = ex["teacher_chi"].numpy().astype(np.float16)
+        arrays["teacher_chi_mask"] = ex["teacher_chi_mask"].numpy().astype(np.uint8)
     meta = {
         "n_mhc": int(ex["n_mhc"]), "n_pep": int(ex["n_pep"]),
         "mhc_type": int(r["mhc_type"]), "mhc_seq": str(r["mhc_seq"]),
@@ -128,6 +142,9 @@ def main(argv=None):
     ap.add_argument("--clevel", type=int, default=4)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--merge", action="store_true", help="just merge *.index.csv")
+    ap.add_argument("--sidechains", action="store_true",
+                    help="also store AF2 sidechain targets: teacher_atom14[N,14,3] + "
+                         "mask (lossless fp16) and teacher_chi[N,4,2] + mask")
     args = ap.parse_args(argv)
 
     out = Path(args.out_dir)
@@ -152,7 +169,7 @@ def main(argv=None):
         for _, r in rows.iterrows():
             aid = str(r["id"])
             try:
-                arrays, meta = process_row(r, zip_dir)
+                arrays, meta = process_row(r, zip_dir, args.sidechains)
             except FileNotFoundError:
                 miss += 1
                 continue

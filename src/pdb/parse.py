@@ -325,6 +325,17 @@ def parse_example(
             raise ValueError(f"{pdb_path}: chi shape {chi.shape} != ({n_total},4,2)")
         out["teacher_chi"] = torch.from_numpy(chi)               # [N,4,2] sin/cos
         out["teacher_chi_mask"] = torch.from_numpy(chi_mask)     # [N,4]
+        # All-atom coords: needed for AF2's *sidechain FAPE* (rigid-group frames + the
+        # symmetric-atom renaming). chi alone only supervises the torsions. Previously
+        # atom37 was collected here and then thrown away.
+        a37 = np.asarray(rec["atom37"], dtype=np.float32)                # [N,37,3]
+        a37m = np.asarray(rec["atom37_mask"], dtype=np.float32)          # [N,37]
+        if a37.shape != (n_total, 37, 3):
+            raise ValueError(f"{pdb_path}: atom37 shape {a37.shape} != ({n_total},37,3)")
+        if not np.isfinite(a37[a37m > 0.5]).all():
+            raise ValueError(f"{pdb_path}: non-finite all-atom coordinates")
+        out["teacher_atom37"] = torch.from_numpy(a37)
+        out["teacher_atom37_mask"] = torch.from_numpy(a37m)
     return out
 
 
