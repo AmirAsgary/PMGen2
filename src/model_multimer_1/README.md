@@ -20,10 +20,16 @@
 > stays `teacher` so existing checkpoints reproduce bit-for-bit (training with it prints a
 > loud warning). **A correct model needs a retrain from stage 1 with `--pep-frames identity`.**
 >
-> **`identity` is learnable** — 20-structure overfit (lr 5e-4, n_trunk 3, `--mhc-noise 0`):
-> FAPE 2.16 → 0.114 and peptide-RMSD 10.9 → **0.73 Å** over 250 epochs, still improving,
-> zero NaN. At a matched 60-epoch budget it beat `teacher` (FAPE 0.28 vs 1.67). **LR matters:
-> 2e-3 diverges to NaN by epoch 15; 5e-4 is stable.** Use lr ≤ 5e-4 for the retrain.
+> **`identity` is learnable** — 20-structure overfit (lr 5e-4, n_trunk 3, `--mhc-noise 0`,
+> seed 0, 250 epochs, 0 NaN): FAPE 2.16 → 0.114, peptide-RMSD 10.9 → 0.73 Å. The leaky
+> `teacher` run at the **same** budget reaches FAPE 0.079 / 0.71 Å — i.e. **the leak helps
+> slightly, as it must** (more information). An earlier 60-epoch comparison appeared to show
+> `identity` *beating* `teacher`; that was an artifact of the cosine schedule (`T_max` =
+> `--epochs`, so LR hit 0 by epoch 60) — `teacher` starts slower because the IPA's
+> zero-initialised output projection must first learn to exploit the frames. Do not read
+> short runs. On a 20-structure overfit both simply memorise, so the leak buys little; its
+> damage shows up on **held-out** data (0.26 Å reading the answer vs 7.6 Å without it).
+> **LR matters: 2e-3 diverges to NaN by epoch 15; 5e-4 is stable.** Use lr ≤ 5e-4.
 >
 > `python src/model_multimer_1/model.py` now runs `_leak_check()` — it asserts on the
 > *frames* (the sole channel by which `teacher_bb` reaches the peptide) that under
