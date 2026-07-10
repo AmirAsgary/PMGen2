@@ -97,16 +97,24 @@ def build_multimer_feats(aatype, segment_id, seq_mask):
             "seq_mask": seq_mask, "pep": pep.float(), "mhc": mhc.float()}
 
 
-def _frames_from_bb(teacher_bb, seq_mask, noise=0.0):
+def _frames_from_bb(teacher_bb, seq_mask, noise=0.0, identity_mask=None):
     """Rigid3Array [B,N] backbone frames from teacher_bb [B,N,3,3]=(N,CA,C); optional
-    Gaussian noise on the coords for robustness; masked/absent residues -> identity."""
+    Gaussian noise on the coords for robustness; masked/absent residues -> identity.
+
+    ``identity_mask`` [B,N] bool: additionally force these residues to the identity
+    frame. Used to withhold the PEPTIDE's true backbone frames (see MultimerModel
+    `pep_frames`) — otherwise the ground-truth peptide pose leaks into the trunk IPAs.
+    """
     bb = teacher_bb
     if noise > 0:
         bb = bb + noise * torch.randn_like(bb)
     r = Rigid.from_3_points(bb[..., 0, :], bb[..., 1, :], bb[..., 2, :])        # [B,N]
     t4 = r.to_tensor_4x4()                                                       # [B,N,4,4]
     ident = torch.eye(4, device=t4.device).expand_as(t4)
-    t4 = torch.where(seq_mask[..., None, None].bool(), t4, ident)
+    keep = seq_mask.bool()
+    if identity_mask is not None:
+        keep = keep & ~identity_mask.bool()
+    t4 = torch.where(keep[..., None, None], t4, ident)
     return Rigid3Array.from_array4x4(t4)
 
 
@@ -191,8 +199,20 @@ class TrunkBlock(nn.Module):
 
 
 class MultimerModel(nn.Module):
-    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu"):
+    """`pep_frames` controls what geometric frames the PEPTIDE residues get:
+      "teacher"  — the peptide's TRUE backbone frames (from teacher_bb) are fed to the
+                   trunk IPAs. This LEAKS the ground-truth peptide pose: the model can
+                   read the answer instead of docking. It is what every checkpoint so
+                   far was trained with, so it stays the default for reproducibility.
+      "identity" — peptide frames are the identity (the DOCUMENTED design). Only the MHC
+                   provides geometry; the peptide pose must actually be predicted.
+                   Correct/deployable, but requires retraining.
+    """
+
+    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="teacher"):
         super().__init__()
+        assert pep_frames in ("teacher", "identity")
+        self.pep_frames = pep_frames
         cfg = model_config(MM)
         ie = cfg["model"]["input_embedder"]
         self.embedder = InputEmbedderMultimer(
@@ -278,15 +298,20 @@ class MultimerModel(nn.Module):
         return {n: p.detach().cpu() for n, p in self.named_parameters()
                 if p.requires_grad}
 
-    def forward(self, batch, return_frames=False, num_recycles=None):
+    def _encode(self, batch):
+        """seq + MHC geometry + anchors -> (single[B,N,D], pair[B,N,N,D], mask)."""
         f = build_multimer_feats(batch["aatype"], batch["segment_id"],
                                  batch["seq_mask"])
         # head-1
         msa_emb, z = self.embedder(f)                    # [B,1,N,c_m], [B,N,N,c_z]
         s = msa_emb[..., 0, :, :]                          # [B,N,c_m]
-        # head-2 (noised MHC frames)
+        # head-2 (noised MHC frames). pep_frames="identity" withholds the peptide's
+        # true backbone frames so the pose is predicted, not read off the input.
+        idm = (m1.peptide_mask_from_batch(batch["seq_mask"], batch["segment_id"])
+               if self.pep_frames == "identity" else None)
         frames = _frames_from_bb(batch["teacher_bb"], batch["seq_mask"],
-                                 noise=self.mhc_noise if self.training else 0.0)
+                                 noise=self.mhc_noise if self.training else 0.0,
+                                 identity_mask=idm)
         h2_single, h2_pair = self.head2(batch["teacher_bb"], f["mhc"], frames)  # [B,N,10],[B,N,N,25]
         h2_pool = (h2_single * f["mhc"][..., None]).sum(1, keepdim=True) \
             / f["mhc"].sum(1, keepdim=True).clamp_min(1.0)[..., None]  # meanpool [B,1,10]
@@ -301,6 +326,21 @@ class MultimerModel(nn.Module):
         mask = batch["seq_mask"]
         for blk in self.trunk:
             s, z = blk(s, z, frames, mask)
+        return s, z, mask
+
+    def predict(self, batch):
+        """Full-atom inference. Returns the frozen SM's final atom14 coords + pLDDT
+        logits (forward() only exposes Cα). No grad; caller should be in eval()."""
+        with torch.no_grad():
+            s, z, mask = self._encode(batch)
+            out = self.sm({"single": self.sm_s(s), "pair": self.sm_z(z)},
+                          batch["aatype"], mask=mask)
+            return {"atom14": out["positions"][-1],          # [B,N,14,3]
+                    "ca": out["positions"][-1][..., 1, :],   # [B,N,3]
+                    "plddt_logits": self.plddt(self.plddt_proj(s))}
+
+    def forward(self, batch, return_frames=False, num_recycles=None):
+        s, z, mask = self._encode(batch)
         # frozen heads
         out = self.sm({"single": self.sm_s(s), "pair": self.sm_z(z)},
                       batch["aatype"], mask=mask)

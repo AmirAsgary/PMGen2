@@ -229,6 +229,12 @@ def parse_args(argv=None):
     p.add_argument("--unfreeze-sm-at", type=int, default=0,
                    help="epoch at which to apply --unfreeze-sm-pct (rebuilds opt/sched)")
     p.add_argument("--n-trunk", type=int, default=3)
+    p.add_argument("--pep-frames", choices=["teacher", "identity"], default="teacher",
+                   help="'teacher' feeds the peptide's TRUE backbone frames to the trunk "
+                        "-> LEAKS the ground-truth pose (what all current checkpoints "
+                        "were trained with; kept as default for reproducibility). "
+                        "'identity' withholds them (documented design) -> the pose must "
+                        "actually be predicted. Use 'identity' for a correct retrain.")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
@@ -280,7 +286,7 @@ def main(argv=None):
     total_steps = steps_per_epoch * args.epochs
 
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
-                             device=device)
+                             device=device, pep_frames=args.pep_frames)
     model.set_stage(args.stage)
     # stage 1: FAPE only (pLDDT set per-epoch below); 2: FAPE + pLDDT; 3: pLDDT only
     lam = {1: (1.0, 0.0, 0.0), 2: (1.0, args.plddt_w, 0.0),

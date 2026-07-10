@@ -1,5 +1,25 @@
 # model_multimer_1
 
+> ## ⚠ KNOWN BUG: the peptide pose leaks into the trunk (`pep_frames`)
+> `_frames_from_bb` only forces the *padding* residues to the identity frame, so the
+> **peptide's TRUE backbone frames** (from `teacher_bb`) are fed to the trunk IPAs —
+> the model can read the answer instead of docking. The pipeline diagram below says
+> "peptide-identity"; the code did not do that. Measured on the 15 `data/test` examples
+> with the stage-2 checkpoints (peptide Cα-RMSD, superposed on MHC):
+>
+> | checkpoint | `pep_frames=teacher` (leaky) | `pep_frames=identity` (honest) |
+> |---|---|---|
+> | A_resume | **0.26 Å** | **7.65 Å** |
+> | B_resume | **0.33 Å** | **9.69 Å** |
+>
+> Translating only the peptide's `teacher_bb` by 10 Å moves the predicted peptide by
+> ~6.7 Å while the MHC stays put — the prediction follows the input. **All peptide-RMSD
+> numbers reported so far (train ~0.26 Å, val ~0.28 Å) are contaminated**, and the model
+> cannot be deployed (at inference you don't know the peptide backbone).
+> `MultimerModel(pep_frames=...)` / `--pep-frames` now selects the behaviour; the default
+> stays `teacher` so existing checkpoints reproduce bit-for-bit. **A correct model needs a
+> retrain from stage 1 with `--pep-frames identity`.**
+
 A slim encoder on top of the **frozen AlphaFold-Multimer** structure module + pLDDT
 head. Single-sequence (no MSA), no templates; anchors via a per-residue one-hot + the
 per-chain `residue_index`/`asym_id` the embedder already understands. The MHC backbone
@@ -193,6 +213,19 @@ sbatch src/model_multimer_1/stage2_mm1.sbatch B
 # 5. stage 3 (confidence-only), resuming the chosen stage-2 run:  args = STAGE RESUME
 sbatch src/model_multimer_1/train_mm1.sbatch 3 checkpoints_mm1/mm1_stage2_A/last.pt
 ```
+
+## Inference on data/test (full-atom PDB + RMSD)
+`predict_test.py` runs a checkpoint on the 15 class-I examples in `data/test/`, writes a
+**full-atom PDB** per example (atom14 → atom37; chain A = MHC, chain B = peptide;
+b-factor = predicted pLDDT), Kabsch-superposes each prediction onto its reference PDB
+**using the MHC Cα** (so the PDB overlays directly), and reports peptide / backbone /
+all-atom RMSDs to `rmsd.csv`.
+```bash
+$PY src/model_multimer_1/predict_test.py --ckpt checkpoints_mm1/mm1_stage2_A/last.pt \
+    --tag A --pep-frames identity --out-dir outputs/mm1_test
+```
+Always report the `--pep-frames identity` number — `teacher` is the leaky one (see the
+warning at the top).
 
 ## Status: validated end-to-end
 Local (pmgen2, 1 GPU, bf16) smoke + overfit: the full path (real hasmig zips → H5 → dataset
