@@ -354,16 +354,11 @@ class MultimerModel(nn.Module):
         return ca, plddt_logits, pae_logits
 
 
-def _smoke():
-    """Build the model + one forward on a synthetic pMHC (run on the cluster)."""
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net = MultimerModel(device=dev)
-    B, n_mhc, n_pep = 1, 180, 9
+def _dummy_batch(dev, B=1, n_mhc=180, n_pep=9):
     N = n_mhc + n_pep
-    seg = torch.tensor([[0] * n_mhc + [1] * n_pep], device=dev)
     batch = {
         "aatype": torch.randint(0, 20, (B, N), device=dev),
-        "segment_id": seg,
+        "segment_id": torch.tensor([[0] * n_mhc + [1] * n_pep] * B, device=dev),
         "seq_mask": torch.ones(B, N, device=dev),
         "anchor": (torch.rand(B, N, device=dev) > 0.8).float(),
         "teacher_bb": torch.randn(B, N, 3, 3, device=dev) * 10,
@@ -371,6 +366,70 @@ def _smoke():
     }
     batch["teacher_plddt"] = torch.rand(B, N, device=dev) * 100
     batch["teacher_pae"] = torch.zeros(B, N, N, device=dev)
+    return batch
+
+
+def _leak_check(dev=None, ckpt=None, tol=1e-6):
+    """REGRESSION GUARD for the peptide-pose leak.
+
+    `frames` is the ONLY channel through which teacher_bb reaches the peptide (head-2's
+    pair/IPA are masked to the MHC block), so the guard asserts on the frames directly.
+    That is exact and weight-independent — unlike an end-to-end check on a fresh model,
+    which is VACUOUS: OpenFold's IPA zero-inits its output projection, so at init the
+    frames have no effect on the prediction at all and any leak would go unnoticed.
+
+      pep_frames="identity" -> peptide frames are exactly the identity AND do not move
+                               when the peptide's teacher_bb is perturbed.
+      pep_frames="teacher"  -> peptide frames DO move (positive control: proves the
+                               test can actually detect a leak).
+
+    Pass ``ckpt`` (a TRAINED checkpoint) to additionally assert end-to-end that the
+    prediction itself is invariant to the peptide's teacher_bb.
+    """
+    dev = dev or ("cuda" if torch.cuda.is_available() else "cpu")
+    batch = _dummy_batch(dev)
+    pep = m1.peptide_mask_from_batch(batch["seq_mask"], batch["segment_id"]).bool()
+    b2 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+    b2["teacher_bb"][pep] += torch.tensor([10.0, 0.0, 0.0], device=dev)
+
+    def pep_frames_t4(bb, idm):
+        return _frames_from_bb(bb, batch["seq_mask"], 0.0, idm).to_tensor_4x4()[pep]
+
+    # --- pep_frames="identity": frames are identity and invariant to the peptide bb
+    f0 = pep_frames_t4(batch["teacher_bb"], pep)
+    f1 = pep_frames_t4(b2["teacher_bb"], pep)
+    d_id = (f1 - f0).abs().max().item()
+    off_ident = (f0 - torch.eye(4, device=dev).expand_as(f0)).abs().max().item()
+    # --- positive control: pep_frames="teacher" DOES follow the perturbation
+    d_te = (pep_frames_t4(b2["teacher_bb"], None)
+            - pep_frames_t4(batch["teacher_bb"], None)).abs().max().item()
+
+    print(f"leak-check: peptide teacher_bb +10A -> max|Δ peptide frame|  "
+          f"identity={d_id:.2e}  teacher={d_te:.3f} | identity-frame err={off_ident:.2e}")
+    assert off_ident < tol, f"pep_frames='identity' frames are not the identity ({off_ident:.2e})"
+    assert d_id < tol, (
+        f"PEPTIDE POSE LEAK: under pep_frames='identity' the peptide frames moved "
+        f"{d_id:.3e} when only the peptide's teacher_bb changed — ground-truth peptide "
+        f"geometry is reaching the trunk.")
+    assert d_te > 1.0, ("positive control failed: pep_frames='teacher' should follow the "
+                        "perturbed input; this test can no longer detect a leak.")
+
+    if ckpt is not None:                       # end-to-end, needs TRAINED weights
+        net = MultimerModel(device=dev, pep_frames="identity").eval()
+        net.load_state_dict(torch.load(ckpt, map_location=dev,
+                                       weights_only=False)["trainable"], strict=False)
+        d = (net.predict(b2)["ca"] - net.predict(batch)["ca"])[pep].norm(dim=-1).mean().item()
+        print(f"leak-check (end-to-end, {Path(ckpt).name}): |Δ pred peptide Cα| = {d:.2e} A")
+        assert d < 1e-4, f"PEPTIDE POSE LEAK end-to-end: prediction moved {d:.4f} A"
+    print("OK leak-check: peptide geometry is withheld under pep_frames='identity'")
+
+
+def _smoke():
+    """Build the model + one forward on a synthetic pMHC (run on the cluster)."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    _leak_check(dev)
+    net = MultimerModel(device=dev)
+    batch = _dummy_batch(dev)
     net.train()
     ca, pl, pae, fr = net(batch, return_frames=True)
     print("OK forward:", tuple(ca.shape), tuple(pl.shape), tuple(pae.shape),
