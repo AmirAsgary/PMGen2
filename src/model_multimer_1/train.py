@@ -337,6 +337,13 @@ def main(argv=None):
             f"{mode}), start epoch {start_epoch}")
 
     n_tr = sum(p.numel() for p in model.trainable_parameters())
+    if args.pep_frames == "teacher":
+        log("[mm1] " + "!" * 72)
+        log("[mm1] !! WARNING: --pep-frames teacher feeds the peptide's TRUE backbone")
+        log("[mm1] !! frames to the trunk. The ground-truth peptide pose LEAKS in and")
+        log("[mm1] !! every peptide metric will be meaningless (~0.3 A instead of ~8 A).")
+        log("[mm1] !! Use --pep-frames identity for a real model. See README.")
+        log("[mm1] " + "!" * 72)
     log(f"[mm1] stage {args.stage} | trainable {n_tr:,} params | train={len(train_ds)} "
         f"val={len(val_ds) if val_ds is not None else 0} bs={args.bs} world={world} "
         f"steps/epoch={steps_per_epoch} "

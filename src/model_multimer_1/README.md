@@ -17,8 +17,21 @@
 > numbers reported so far (train ~0.26 Å, val ~0.28 Å) are contaminated**, and the model
 > cannot be deployed (at inference you don't know the peptide backbone).
 > `MultimerModel(pep_frames=...)` / `--pep-frames` now selects the behaviour; the default
-> stays `teacher` so existing checkpoints reproduce bit-for-bit. **A correct model needs a
-> retrain from stage 1 with `--pep-frames identity`.**
+> stays `teacher` so existing checkpoints reproduce bit-for-bit (training with it prints a
+> loud warning). **A correct model needs a retrain from stage 1 with `--pep-frames identity`.**
+>
+> **`identity` is learnable** — 20-structure overfit (lr 5e-4, n_trunk 3, `--mhc-noise 0`):
+> FAPE 2.16 → 0.114 and peptide-RMSD 10.9 → **0.73 Å** over 250 epochs, still improving,
+> zero NaN. At a matched 60-epoch budget it beat `teacher` (FAPE 0.28 vs 1.67). **LR matters:
+> 2e-3 diverges to NaN by epoch 15; 5e-4 is stable.** Use lr ≤ 5e-4 for the retrain.
+>
+> `python src/model_multimer_1/model.py` now runs `_leak_check()` — it asserts on the
+> *frames* (the sole channel by which `teacher_bb` reaches the peptide) that under
+> `identity` they are exactly the identity and do not move when the peptide's `teacher_bb`
+> is perturbed, plus a positive control that `teacher` does move. Asserting on the frames
+> rather than the prediction is deliberate: OpenFold's IPA zero-inits its output projection,
+> so on a fresh model the frames have **no** effect on the output and an end-to-end check
+> would pass even with the leak present.
 
 A slim encoder on top of the **frozen AlphaFold-Multimer** structure module + pLDDT
 head. Single-sequence (no MSA), no templates; anchors via a per-residue one-hot + the
