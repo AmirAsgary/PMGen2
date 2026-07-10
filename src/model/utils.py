@@ -1340,7 +1340,10 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     f"total {means.get('total', 0):.3f} "
                     f"fape {means.get('fape', 0):.3f} "
                     f"plddt {means.get('plddt_ce', 0):.3f} "
-                    f"pae {means.get('pae_ce', 0):.3f} | pep: "
+                    + (f"sc_fape {means['sc_fape']:.3f} chi {means['chi_loss']:.3f}"
+                       if (means.get('sc_fape') or means.get('chi_loss'))
+                       else f"pae {means.get('pae_ce', 0):.3f}")
+                    + f" | pep: "
                     f"fape {means.get('pep_fape', 0):.3f} "
                     f"plddt {means.get('pep_plddt_ce', 0):.3f} "
                     f"pae {means.get('pep_pae_ce', 0):.3f}"

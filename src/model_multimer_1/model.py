@@ -237,6 +237,11 @@ class MultimerModel(nn.Module):
         # angle_resnet. It now reads sm["single"] through a trainable adapter (which is
         # also the only thing stage 3 trains).
         self.plddt_proj = nn.Linear(SM_C_S, SM_C_S)
+        # identity init => the frozen pLDDT head sees sm["single"] verbatim, exactly as in
+        # AlphaFold. Stage 1 (adapter frozen) therefore reproduces AF's own confidence,
+        # and stage 2/3 fine-tune from that instead of from a random projection.
+        nn.init.eye_(self.plddt_proj.weight)
+        nn.init.zeros_(self.plddt_proj.bias)
         # TRAINABLE torsion head (AF2's own AngleResnet, freshly initialised). The frozen
         # sm.angle_resnet is never used: it maps AF-Evoformer `single` -> torsions and is
         # garbage on our representation (chi1 was 10.8% correct vs a 22% random baseline).

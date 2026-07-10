@@ -221,7 +221,10 @@ def parse_args(argv=None):
                    help="weight the structural (FAPE) loss per structure by w_n "
                         "(Approach B); full dataset, no filter")
     p.add_argument("--w-min", type=float, default=0.05, help="w_n floor (Approach B)")
-    p.add_argument("--max-train", type=int, default=0, help="cap #train examples (overfit)")
+    p.add_argument("--max-train", type=int, default=0,
+                   help="cap the train set to N random examples (smoke/convergence test)")
+    p.add_argument("--subset-val-frac", type=float, default=0.2,
+                   help="with --max-train: fraction held out for validation (disjoint)")
     p.add_argument("--peptide-weight", type=float, default=5.0)
     p.add_argument("--mhc-noise", type=float, default=0.1)
     p.add_argument("--unfreeze-sm-pct", type=float, default=0.0,
@@ -229,7 +232,13 @@ def parse_args(argv=None):
     p.add_argument("--unfreeze-sm-at", type=int, default=0,
                    help="epoch at which to apply --unfreeze-sm-pct (rebuilds opt/sched)")
     p.add_argument("--n-trunk", type=int, default=3)
-    p.add_argument("--pep-frames", choices=["teacher", "identity"], default="teacher",
+    p.add_argument("--sidechains", action="store_true",
+                   help="enable AF2 sidechain supervision (sc-FAPE + supervised chi). "
+                        "Requires a store preprocessed with --sidechains; FAILS otherwise.")
+    p.add_argument("--sc-fape-w", type=float, default=0.5)   # AF: fape.sidechain.weight
+    p.add_argument("--bb-fape-w", type=float, default=0.5)   # AF: fape.backbone.weight
+    p.add_argument("--chi-w", type=float, default=1.0)       # AF: supervised_chi.weight
+    p.add_argument("--pep-frames", choices=["teacher", "identity"], default="identity",
                    help="'teacher' feeds the peptide's TRUE backbone frames to the trunk "
                         "-> LEAKS the ground-truth pose (what all current checkpoints "
                         "were trained with; kept as default for reproducibility). "
@@ -273,13 +282,18 @@ def main(argv=None):
     filt = ((args.stage == 1) or args.force_filter) and not args.no_filter
     hasmig_w = 1.0 if args.stage == 1 else args.hasmig_weight   # down-weight in 2/3
     train_ds, val_ds, val_hi_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
-    if args.max_train > 0:                                      # overfit / subset
+    if args.max_train > 0:                     # small-subset smoke / convergence test
         from torch.utils.data import Subset
         idx = list(range(len(train_ds)))
         random.Random(args.seed).shuffle(idx)                  # RANDOM subset (not first-N)
-        idx = sorted(idx[:min(args.max_train, len(idx))])
-        train_ds = Subset(train_ds, idx)
-        val_ds = train_ds                                      # watch it fit the same few
+        idx = idx[:min(args.max_train, len(idx))]
+        # DISJOINT 80/20 split -- never train == val, so the reported val number is a
+        # real held-out measurement rather than memorisation.
+        n_val = max(1, int(round(len(idx) * args.subset_val_frac)))
+        val_idx, tr_idx = sorted(idx[:n_val]), sorted(idx[n_val:])
+        assert not (set(val_idx) & set(tr_idx)), "subset train/val overlap"
+        val_ds = Subset(train_ds, val_idx)
+        train_ds = Subset(train_ds, tr_idx)
         val_hi_ds = None
     shard_n = len(train_ds) // world if world > 1 else len(train_ds)
     steps_per_epoch = max(1, (shard_n + args.bs - 1) // args.bs)
@@ -288,10 +302,18 @@ def main(argv=None):
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
                              device=device, pep_frames=args.pep_frames)
     model.set_stage(args.stage)
-    # stage 1: FAPE only (pLDDT set per-epoch below); 2: FAPE + pLDDT; 3: pLDDT only
-    lam = {1: (1.0, 0.0, 0.0), 2: (1.0, args.plddt_w, 0.0),
+    # stage 1: structure ONLY (lambda_plddt = 0); 2: structure + pLDDT(0.01);
+    # 3: pLDDT ONLY (all structure terms off, model frozen except plddt_proj).
+    bb_w = args.bb_fape_w if args.sidechains else 1.0   # AF splits FAPE 0.5/0.5
+    lam = {1: (bb_w, 0.0, 0.0),
+           2: (bb_w, args.plddt_w, 0.0),
            3: (0.0, args.stage3_plddt_w, 0.0)}[args.stage]
-    loss_mod = m1.DistillLoss(*lam, peptide_weight=args.peptide_weight).to(device)
+    struct_on = args.stage in (1, 2)
+    loss_mod = m1.DistillLoss(
+        *lam, peptide_weight=args.peptide_weight,
+        lambda_sc_fape=(args.sc_fape_w if (args.sidechains and struct_on) else 0.0),
+        lambda_chi=(args.chi_w if (args.sidechains and struct_on) else 0.0),
+    ).to(device)
 
     def build_opt_sched(t_max):
         opt = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
@@ -336,6 +358,22 @@ def main(argv=None):
         log(f"[mm1] resumed {args.resume} (stage {ck.get('stage')} -> {args.stage}, "
             f"{mode}), start epoch {start_epoch}")
 
+    # ---- NO SILENT NO-OPS: fail at startup, not after a day of training ----------
+    if args.sidechains:
+        probe = train_ds[0]
+        missing = [k for k in ("teacher_atom14", "teacher_chi") if k not in probe]
+        if missing:
+            raise SystemExit(
+                f"FATAL: --sidechains given but the store lacks {missing}. Re-run "
+                f"preprocessing with --sidechains. (Refusing to train a disabled loss.)")
+        if args.stage in (1, 2):
+            assert loss_mod.l_sc_fape > 0 and loss_mod.l_chi > 0, \
+                "sidechain loss weights are zero in a structure stage"
+        log(f"[mm1] sidechains ON: sc_fape_w={loss_mod.l_sc_fape} chi_w={loss_mod.l_chi} "
+            f"(chi={loss_mod.chi_weight}, angle_norm={loss_mod.angle_norm_weight})")
+    if args.pep_frames == "identity":
+        MM._leak_check(dev=device)          # pre-flight: peptide pose cannot leak
+
     n_tr = sum(p.numel() for p in model.trainable_parameters())
     if args.pep_frames == "teacher":
         log("[mm1] " + "!" * 72)
@@ -351,7 +389,7 @@ def main(argv=None):
 
     net = (torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[local_rank], output_device=local_rank,
-        find_unused_parameters=True) if distributed else model)
+        find_unused_parameters=False) if distributed else model)
 
     def validate(ds):
         """Multi-GPU validation: every rank evaluates a disjoint, equal-size shard of
@@ -386,13 +424,12 @@ def main(argv=None):
             if distributed:
                 net = torch.nn.parallel.DistributedDataParallel(
                     model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
             n_tr = sum(p.numel() for p in model.trainable_parameters())
             log(f"[mm1] epoch {epoch}: unfroze {n_unf:,}/{n_tot:,} SM params "
                 f"({args.unfreeze_sm_pct}%); trainable now {n_tr:,}; rebuilt opt/sched")
-        # pLDDT-weight schedule (stage 1): 0 for epoch 1, then --plddt-w
-        if args.stage == 1:
-            loss_mod.l_plddt = 0.0 if epoch == 1 else args.plddt_w
+        # stage 1 is structure-only for its whole duration (lambda_plddt == 0, and
+        # plddt_proj is frozen), so there is no pLDDT ramp any more.
         train_loader = m1.make_epoch_loader(train_ds, args.bs, args.num_workers,
                                             args.seed, epoch, rank=rank, world_size=world)
         tr, global_step = m1.train_one_epoch(
