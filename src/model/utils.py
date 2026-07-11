@@ -1319,7 +1319,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
         if metrics_every and (i % metrics_every == 0 or i == nsteps):
             with torch.no_grad():
                 mets = eval_metrics(ca.detach().float(), plddt.detach().float(),
-                                    pae.detach().float(), batch, loss_mod)
+                                    (pae.detach().float() if pae is not None else None),
+                                    batch, loss_mod)
             for k, v in mets.items():
                 mwagg[k] += float(v) * bs
             mwn += bs

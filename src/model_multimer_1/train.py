@@ -236,6 +236,9 @@ def parse_args(argv=None):
                    help="cap the train set to N random examples (smoke/convergence test)")
     p.add_argument("--subset-val-frac", type=float, default=0.2,
                    help="with --max-train: fraction held out for validation (disjoint)")
+    p.add_argument("--allow-no-val", action="store_true",
+                   help="proceed even if no old (two_axis) store is present -> NO "
+                        "validation (hasmig-only training). Off by default on purpose.")
     p.add_argument("--peptide-weight", type=float, default=5.0)
     p.add_argument("--mhc-noise", type=float, default=0.1)
     p.add_argument("--unfreeze-sm-pct", type=float, default=0.0,
@@ -292,6 +295,17 @@ def main(argv=None):
     # filter train iff stage 1 (default) or explicitly forced (Approach A); --no-filter wins
     filt = ((args.stage == 1) or args.force_filter) and not args.no_filter
     hasmig_w = 1.0 if args.stage == 1 else args.hasmig_weight   # down-weight in 2/3
+    # NO SILENT NO-OP: validation comes ONLY from the OLD (two_axis) store. If --h5-dir
+    # doesn't exist, a real run would train hasmig-only with NO validation and never say
+    # so. Fail loudly (unless --max-train, which builds its own held-out split, or the
+    # explicit --allow-no-val escape hatch).
+    old_store_ok = (Path(args.h5_dir) / "index.csv").exists()
+    if not old_store_ok and args.max_train == 0 and not args.allow_no_val:
+        raise SystemExit(
+            f"FATAL: old (two_axis) store not found at --h5-dir '{args.h5_dir}' "
+            f"(no index.csv). Validation comes ONLY from it, so this run would train on "
+            f"hasmig alone with NO validation. Point --h5-dir at the two_axis store "
+            f"(preprocess it with --sidechains), or pass --allow-no-val to proceed anyway.")
     train_ds, val_ds, val_hi_ds = build_datasets(args, filt=filt, hasmig_w=hasmig_w)
     if args.max_train > 0:                     # small-subset smoke / convergence test
         from torch.utils.data import Subset
