@@ -44,14 +44,19 @@ done
 
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); NGPU=${NGPU:-2}
 echo "=== $(date '+%F %T') | mm1 SMOKE on $(hostname) | ${NGPU} GPU(s) | N=${N} epochs=${EPOCHS} ==="
+# Smokes the REAL path: leak-free peptide frames + AF2 side-chain losses on N random
+# hasmig complexes (needs a --sidechains hasmig store). --max-train makes its own
+# disjoint 80/20 split, so no old two_axis store is required for the smoke.
 $PY -m torch.distributed.run --nnodes=1 --nproc_per_node=${NGPU} \
     --master_addr=127.0.0.1 --master_port=29765 \
     src/model_multimer_1/train.py \
-    --stage 1 --no-filter --max-train ${N} \
+    --stage 1 --no-filter --max-train ${N} --subset-val-frac 0.2 \
+    --pep-frames identity --sidechains --bb-fape-w 0.5 --sc-fape-w 0.5 --chi-w 1.0 \
     --h5-dir "$H5" --hasmig-dir "$HASMIG" --data-exp-csv /nonexistent.csv \
+    --n-trunk 3 --mhc-noise 0.1 \
     --ckpt-dir checkpoints_mm1 --run-name mm1_smoke \
-    --epochs ${EPOCHS} --bs ${BS} --lr 1e-3 --amp \
-    --log-every 1 --ckpt-every 100000 --num-workers 4
+    --epochs ${EPOCHS} --bs ${BS} --lr 5e-4 --amp \
+    --log-every 1 --train-metrics-every 1 --ckpt-every 100000 --num-workers 4
 
 RC=$?
 echo "=== $(date '+%F %T') | mm1 SMOKE exit ${RC} ==="
