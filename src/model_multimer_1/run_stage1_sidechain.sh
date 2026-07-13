@@ -33,10 +33,10 @@
 #SBATCH --job-name=mm1_s1_sc
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=240G
-#SBATCH --time=24:00:00
+#SBATCH --mem=120G
+#SBATCH --time=20:00:00
 #SBATCH --output=logs/mm1/%j.out
 #SBATCH --error=logs/mm1/%j.err
 
