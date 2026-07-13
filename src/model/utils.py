@@ -18,6 +18,7 @@ Env: pmgen2  (~/miniforge3/envs/pmgen2/bin/python).
 from __future__ import annotations
 
 import csv
+import math
 import glob
 import importlib.util
 import json
@@ -822,7 +823,8 @@ class DistillLoss(nn.Module):
                  lambda_contain: float = 0.5, groove=(8.0, 1.5, 8.0, 18.0),
                  lambda_sc_fape: float = 0.0, lambda_chi: float = 0.0,
                  chi_weight: float = 0.5, angle_norm_weight: float = 0.01,
-                 sc_clamp_distance: float = 10.0, sc_length_scale: float = 10.0):
+                 sc_clamp_distance: float = 10.0, sc_length_scale: float = 10.0,
+                 fape_clamp_prob: float = 1.0):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
@@ -836,6 +838,13 @@ class DistillLoss(nn.Module):
         super().__init__()
         self.l_fape, self.l_plddt, self.l_pae = lambda_fape, lambda_plddt, lambda_pae
         self.fape_clamp, self.fape_unit = fape_clamp, fape_unit
+        # AF2 clamps the backbone FAPE at 10 A for ~90% of batches and leaves it UNCLAMPED
+        # for the rest. A hard clamp everywhere zeroes the gradient whenever the error
+        # exceeds the clamp -- which is the case at init (peptide starts >10 A off), so the
+        # model never learns (measured: FAPE stalls at 0.92, pep-RMSD 10.8 A). Unclamped
+        # everywhere makes the loss heavy-tailed. The probabilistic clamp gives both: a
+        # bounded gradient on most steps, and long-range signal on the rest.
+        self.fape_clamp_prob = float(fape_clamp_prob)
         self.peptide_weight = float(peptide_weight)
         self.plddt_weight_struct = bool(plddt_weight_struct)
         self.plddt_weight_floor = float(plddt_weight_floor)
@@ -909,10 +918,16 @@ class DistillLoss(nn.Module):
             batch["aatype"], batch["teacher_bb"], seq_mask)
         B = seq_mask.shape[0]
 
+        # AF2-style probabilistic clamp: clamp on `fape_clamp_prob` of the steps.
+        clamp_now = self.fape_clamp
+        if self.fape_clamp is not None and self.fape_clamp_prob < 1.0:
+            if float(torch.rand(())) >= self.fape_clamp_prob:
+                clamp_now = None                          # this step: unclamped
+
         def _fape_be(pmask):                              # per-example FAPE -> [B]
             return _backbone_fape_per_example(
                 bb_tensor, bb_mask, frames, B, pair_mask=pmask,
-                clamp_distance=self.fape_clamp, loss_unit_distance=self.fape_unit)
+                clamp_distance=clamp_now, loss_unit_distance=self.fape_unit)
 
         fape_be = _fape_be(fape_pair)                     # [B]
         # Per-example FAPE weight = product of any enabled example weightings, then a
@@ -1149,6 +1164,7 @@ def move_batch(batch: Dict[str, object], device: str) -> Dict[str, object]:
 # --- metric logging (TensorBoard if available, always a flat CSV) ---------- #
 _METRIC_COLS = ["wall_time", "split", "epoch", "global_step", "lr",
                 "total", "fape", "plddt_ce", "pae_ce", "sc_fape", "chi_loss",
+               "grad_norm", "grad_norm_max", "skipped",
                 "pep_fape", "pep_plddt_ce", "pep_pae_ce",
                 "ca_rmsd", "plddt_spearman", "pae_mae",
                 "pep_ca_rmsd", "pep_plddt_mae", "pep_pae_mae",
@@ -1234,7 +1250,9 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     ckpt_every: int = 0, save_fn=None,
                     recycle_probs: Optional[Sequence[float]] = None,
                     core: Optional[DistillModel] = None, is_main: bool = True,
-                    amp_dtype=None, metrics_every: int = 0
+                    amp_dtype=None, metrics_every: int = 0,
+                    max_consec_skip: int = 50,
+                    divergence_factor: float = 8.0, best_save_fn=None
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1260,6 +1278,11 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     n = 0
     wn = 0
     mwn = 0
+    n_skipped = 0        # optimizer steps dropped because loss/grad went non-finite
+    consec_skip = 0
+    best_win = float('inf')   # best window-mean loss (divergence reference)
+    diverge_hits = 0
+    gn_sum = 0.0; gn_max = 0.0; gn_n = 0    # gradient-norm telemetry
     nsteps = len(loader)
     t0 = time.perf_counter()
     tw = t0
@@ -1300,21 +1323,51 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
             stepped = scaler.get_scale() >= prev_scale
         else:
             total.backward()
+            # NON-FINITE GUARD. clip_grad_norm_ does NOT contain a bad gradient: with a
+            # single NaN element it computes total_norm=NaN -> clip_coef=NaN -> EVERY
+            # gradient becomes NaN, and optimizer.step() then writes NaN into every
+            # weight AND into Adam's exp_avg/exp_avg_sq (unrecoverable). So check the
+            # norm it returns and DROP the step instead of poisoning the model.
+            # Under DDP the grads are all-reduced, so every rank sees the same norm and
+            # makes the same skip decision -> no rank desync.
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(core.trainable_parameters(),
-                                               grad_clip)
-            optimizer.step()
-            stepped = True
+                gnorm = torch.nn.utils.clip_grad_norm_(core.trainable_parameters(),
+                                                       grad_clip)
+            else:
+                gnorm = torch.sqrt(sum((p.grad.detach() ** 2).sum()
+                                       for p in core.trainable_parameters()
+                                       if p.grad is not None))
+            if torch.isfinite(gnorm) and torch.isfinite(total.detach()):
+                optimizer.step()
+                stepped = True
+                gn_sum += float(gnorm); gn_max = max(gn_max, float(gnorm)); gn_n += 1
+            else:
+                optimizer.zero_grad(set_to_none=True)   # discard the poisoned grads
+                n_skipped += 1
+                consec_skip += 1
+                if log and n_skipped <= 10:
+                    log(f"[train]   !! non-finite step SKIPPED at gstep {global_step+1} "
+                        f"(loss={float(total):.3g}, |grad|={float(gnorm):.3g}) — weights "
+                        f"left untouched")
+                if consec_skip >= max_consec_skip:
+                    raise RuntimeError(
+                        f"{consec_skip} consecutive non-finite steps at gstep "
+                        f"{global_step+1}: the model is diverging, not a one-off bad "
+                        f"batch. Aborting instead of burning the allocation. Lower --lr, "
+                        f"raise --bs, or check --fape-clamp.")
+                stepped = False
         if stepped:
+            consec_skip = 0
             scheduler.step()
         global_step += 1
         bs = int(batch["aatype"].shape[0])
-        for k, v in terms.items():
-            fv = float(v) * bs
-            agg[k] += fv
-            wagg[k] += fv
-        n += bs
-        wn += bs
+        if stepped:                       # a skipped step's terms are NaN -> would
+            for k, v in terms.items():    # poison the epoch/window means
+                fv = float(v) * bs
+                agg[k] += fv
+                wagg[k] += fv
+            n += bs
+            wn += bs
         # geometric metrics on the training batch (pep RMSD, pLDDT Spearman, …)
         if metrics_every and (i % metrics_every == 0 or i == nsteps):
             with torch.no_grad():
@@ -1330,6 +1383,12 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                 else (i % log_every) / max(1e-9, now - tw)
             lr = optimizer.param_groups[0]["lr"]
             means = {k: wagg[k] / max(wn, 1) for k in wagg}
+            # |grad| is the signal that tells a runaway apart from a bad batch; the
+            # 13_08 blow-up had no gradient telemetry at all.
+            if gn_n:
+                means["grad_norm"] = gn_sum / gn_n
+                means["grad_norm_max"] = gn_max
+                gn_sum = 0.0; gn_max = 0.0; gn_n = 0
             if mwn > 0:                                    # fold in geometric metrics
                 for k in mwagg:
                     means[k] = mwagg[k] / mwn
@@ -1354,16 +1413,49 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     + (f" | contain {means.get('contain', 0):.3f} "
                        f"buried {means.get('buried_frac', 0):.2f}"
                        if 'contain' in means else "")
+                    + (f" | |g| {means['grad_norm']:.2f}/{means['grad_norm_max']:.2f}"
+                       if 'grad_norm' in means else "")
                     + f" | lr {lr:.2e} | {rate:.1f} it/s")
             if mlog is not None:
                 mlog.log("train", epoch, global_step, lr, means, it_per_s=rate)
+            # ---- DIVERGENCE GUARD -------------------------------------------------
+            # A runaway shows up as the window-mean loss climbing far above the best
+            # we have seen (the 13_08 run went 0.20 -> 2.15 over ~300 steps, then sat
+            # dead for 8k steps before NaN). Snapshot the best model, and abort once
+            # the loss is `divergence_factor`x the best for 3 consecutive windows.
+            cur = means.get('total', float('inf'))
+            if math.isfinite(cur):
+                if cur < best_win:
+                    best_win = cur
+                    diverge_hits = 0
+                    if best_save_fn is not None and is_main:
+                        best_save_fn(global_step, epoch)
+                elif best_win < float('inf') and cur > divergence_factor * best_win:
+                    diverge_hits += 1
+                    if log:
+                        log(f"[train]   !! loss {cur:.3f} is {cur/best_win:.1f}x the best "
+                            f"({best_win:.3f}) — divergence {diverge_hits}/3")
+                    if diverge_hits >= 3:
+                        raise RuntimeError(
+                            f"DIVERGED at gstep {global_step}: window loss {cur:.3f} vs "
+                            f"best {best_win:.3f} ({cur/best_win:.1f}x) for 3 consecutive "
+                            f"windows. Aborting rather than burning the allocation; the "
+                            f"best weights are in best.pt. Lower --lr, raise --bs, or keep "
+                            f"--fape-clamp on.")
+                else:
+                    diverge_hits = 0
             wagg.clear()
             wn = 0
             tw = now
         if is_main and ckpt_every and save_fn is not None \
                 and global_step % ckpt_every == 0:
             save_fn(global_step, epoch)
-    return {k: v / max(n, 1) for k, v in agg.items()}, global_step
+    if n_skipped and log:
+        log(f"[train]   epoch {epoch}: {n_skipped} non-finite step(s) skipped "
+            f"(weights protected)")
+    out = {k: v / max(n, 1) for k, v in agg.items()}
+    out["skipped"] = float(n_skipped)
+    return out, global_step
 
 
 @torch.no_grad()

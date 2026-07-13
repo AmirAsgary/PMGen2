@@ -259,6 +259,21 @@ def parse_args(argv=None):
                         "'identity' withholds them (documented design) -> the pose must "
                         "actually be predicted. Use 'identity' for a correct retrain.")
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--fape-clamp", type=float, default=0.0,
+                   help="clamp the backbone FAPE at this distance (A). DEFAULT OFF: a 10 A "
+                        "clamp starves the gradient at init (the peptide starts >10 A off) "
+                        "and the model does not learn -- measured: pep-RMSD 10.8 A clamped "
+                        "vs 7.2 A unclamped; AF2's 0.9-probability clamp is no better "
+                        "(10.1 A). Only enable once the model already fits (<10 A errors).")
+    p.add_argument("--fape-clamp-prob", type=float, default=0.9,
+                   help="fraction of steps on which the backbone FAPE is clamped (AF2 uses "
+                        "~0.9). 1.0 = always clamp -> the gradient dies at init and the "
+                        "model does not learn (measured). Lower = more long-range signal.")
+    p.add_argument("--warmup-steps", type=int, default=1000,
+                   help="linear LR warmup before the cosine decay (0 = none)")
+    p.add_argument("--divergence-factor", type=float, default=8.0,
+                   help="abort if the window loss exceeds this x the best for "
+                        "3 consecutive windows (0 = never abort)")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--ckpt-dir", default="checkpoints_mm1")
@@ -336,6 +351,8 @@ def main(argv=None):
     struct_on = args.stage in (1, 2)
     loss_mod = m1.DistillLoss(
         *lam, peptide_weight=args.peptide_weight,
+        fape_clamp=(args.fape_clamp if args.fape_clamp > 0 else None),
+        fape_clamp_prob=args.fape_clamp_prob,
         lambda_sc_fape=(args.sc_fape_w if (args.sidechains and struct_on) else 0.0),
         lambda_chi=(args.chi_w if (args.sidechains and struct_on) else 0.0),
     ).to(device)
@@ -343,7 +360,15 @@ def main(argv=None):
     def build_opt_sched(t_max):
         opt = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
                                 weight_decay=1e-4)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, t_max))
+        t_max = max(1, t_max)
+        warm = min(int(args.warmup_steps), max(0, t_max - 1))
+        cos = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, t_max - warm))
+        if warm <= 0:
+            return opt, cos
+        # linear warmup then cosine: a cold start straight at the peak LR is a classic
+        # way to walk into a bad region early.
+        wu = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=warm)
+        sch = torch.optim.lr_scheduler.SequentialLR(opt, [wu, cos], milestones=[warm])
         return opt, sch
 
     optimizer, scheduler = build_opt_sched(total_steps)
@@ -362,8 +387,16 @@ def main(argv=None):
     def save_ckpt(path, gs, ep):
         if run_dir is None or not is_main:
             return
+        sd = model.trainable_state()
+        # REFUSE to persist a poisoned model. The 13_08 run wrote NaN weights over
+        # last.pt every 1000 steps, destroying the healthy weights from ~23k steps and
+        # making the whole run unrecoverable.
+        if not all(torch.isfinite(v).all() for v in sd.values()):
+            log(f"[mm1] !! REFUSING to save non-finite weights to {Path(path).name} "
+                f"at gstep {gs} — keeping the last good checkpoint")
+            return
         tmp = Path(str(path) + ".tmp")
-        torch.save({"epoch": ep, "global_step": gs, "trainable": model.trainable_state(),
+        torch.save({"epoch": ep, "global_step": gs, "trainable": sd,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "stage": args.stage}, tmp)
         tmp.replace(path)
@@ -468,8 +501,12 @@ def main(argv=None):
             log_every=args.log_every, epoch=epoch, global_step=global_step, mlog=mlog,
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
             metrics_every=args.train_metrics_every,
+            divergence_factor=args.divergence_factor,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
-                     if (run_dir is not None and is_main) else None))
+                     if (run_dir is not None and is_main) else None),
+            # snapshot the BEST model so a later blow-up cannot cost us the good weights
+            best_save_fn=((lambda gs, ep: save_ckpt(run_dir / "best.pt", gs, ep))
+                          if (run_dir is not None and is_main) else None))
         ev = validate(val_ds)                # collective: every rank participates
         ev_hi = validate(val_hi_ds)          # confidence-matched subset (== train dist)
         if is_main:
