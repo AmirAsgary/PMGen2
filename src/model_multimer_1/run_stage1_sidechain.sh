@@ -40,7 +40,7 @@
 #SBATCH --output=logs/mm1/%j.out
 #SBATCH --error=logs/mm1/%j.err
 
-H5=${H5:-data/processed/h5_store}
+H5=${H5:-data/processed/h5_store_sc}
 HASMIG=${HASMIG:-data/processed/h5_store_hasmig}
 DATAEXP=${DATAEXP:-outputs/data_exploration/per_structure.csv}
 SCHEME=two_axis
