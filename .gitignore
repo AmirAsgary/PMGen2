@@ -71,4 +71,9 @@ analysis/
 
 # --- training checkpoints ---
 checkpoints/
-data/hasmig_mhc
+checkpoints_mm1/
+
+# --- hasmig_mhcs dataset (5.2 GB: 40k per-id zips + the tarball + scores csv) ---
+# NB: the old rule said "data/hasmig_mhc" (missing the trailing 's'), so it matched
+# nothing and the whole 5.2 GB folder was showing up as untracked.
+data/hasmig_mhcs/
