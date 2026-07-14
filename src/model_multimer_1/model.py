@@ -163,9 +163,22 @@ class MHCStructEncoder(nn.Module):
 # --------------------------------------------------------------------------- #
 # trunk block: 2x (IPA -> single ; OPM single->pair) + single self-attention
 # --------------------------------------------------------------------------- #
+def _fp32(fn, *args, **kw):
+    """Run `fn` OUTSIDE autocast, in fp32. bf16 keeps only ~3 decimal digits; the trunk's
+    N^2 triangle products and the IPA amplify that rounding error into huge SPURIOUS
+    gradients (measured: same loss, but max |grad| 2122 in bf16 vs 250 in fp32). Casting
+    just these ops to fp32 removes the spikes at a fraction of the cost of full fp32."""
+    with torch.autocast("cuda", enabled=False):
+        args = tuple(a.float() if torch.is_tensor(a) else a for a in args)
+        kw = {k: (v.float() if torch.is_tensor(v) else v) for k, v in kw.items()}
+        return fn(*args, **kw)
+
+
 class TrunkBlock(nn.Module):
-    def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS, p_drop=DROPOUT):
+    def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS, p_drop=DROPOUT,
+                 fp32_ops=()):
         super().__init__()
+        self.fp32_ops = set(fp32_ops)
         self.ipas = nn.ModuleList([
             InvariantPointAttentionMultimer(c_s=c_s, c_z=c_z, c_hidden=16,
                                             no_heads=IPA_HEADS, no_qk_points=4,
@@ -183,15 +196,24 @@ class TrunkBlock(nn.Module):
         self.drop_s = nn.Dropout(p_drop)
         self.drop_z = nn.Dropout(p_drop)
 
+    def _run(self, name, fn, *args, **kw):
+        """Run op `name` in fp32 if it is in `fp32_ops`, else at the ambient precision."""
+        if name in self.fp32_ops:
+            return _fp32(fn, *args, **kw)
+        return fn(*args, **kw)
+
     def forward(self, s, z, frames, mask):
         pair_mask = mask[:, :, None] * mask[:, None, :]
         # ---- pair update (dropout on each additive branch) ----
-        z = z + self.drop_z(self.opm(s[:, None], mask=mask[:, None]))  # single -> pair
-        z = z + self.drop_z(self.tri_out(z, mask=pair_mask))          # triangle (outgoing)
-        z = z + self.drop_z(self.tri_in(z, mask=pair_mask))           # triangle (incoming)
-        z = z + self.drop_z(self.pair_trans(z, mask=pair_mask))       # pair feed-forward
+        z = z + self.drop_z(self._run("opm", self.opm, s[:, None], mask=mask[:, None]))
+        z = z + self.drop_z(self._run("tri", self.tri_out, z, mask=pair_mask))
+        z = z + self.drop_z(self._run("tri", self.tri_in, z, mask=pair_mask))
+        z = z + self.drop_z(self._run("tri", self.pair_trans, z, mask=pair_mask))
         # ---- single update: 2 IPAs (pair+geom -> single) + self-attention ----
         for ipa in self.ipas:
+            # The IPA is left at the ambient precision: the ABLATION showed the triangle
+            # ops are the culprit, and forcing the IPA to fp32 buys nothing (and its
+            # Rigid3Array frames make a clean fp32 cast awkward).
             s = s + self.drop_s(ipa(self.s_norm(s), z, frames, mask))
         key_pad = ~mask.bool()
         s = s + self.self_attn(s, s, s, key_padding_mask=key_pad, need_weights=False)[0]
@@ -209,10 +231,20 @@ class MultimerModel(nn.Module):
                    Correct/deployable, but requires retraining.
     """
 
-    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="identity"):
+    def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="identity",
+                 trunk_fp32=("tri",)):
         super().__init__()
         assert pep_frames in ("teacher", "identity")
         self.pep_frames = pep_frames
+        # Ops inside the trunk to run in fp32 (see _fp32). MEASURED on a frozen model
+        # over 120 structures (max |grad|, median unchanged at ~2.7 in every case):
+        #     all bf16        967.0     <- what killed the 13_08 run
+        #     tri in fp32      29.4     <- DEFAULT: 33x smaller spikes
+        #     opm in fp32     116.8
+        #     everything fp32  68.3     <- slower AND worse than tri-only
+        # The N^2 triangle products are where bf16's ~3 decimal digits get amplified into
+        # huge SPURIOUS gradients (the loss is fine; the gradient is numerical garbage).
+        self.trunk_fp32 = tuple(trunk_fp32 or ())
         cfg = model_config(MM)
         ie = cfg["model"]["input_embedder"]
         self.embedder = InputEmbedderMultimer(
@@ -228,7 +260,8 @@ class MultimerModel(nn.Module):
         self.z_proj = nn.Linear(C_Z_EMB + 25 + 2, D)
         self.drop_s = nn.Dropout(DROPOUT)                  # on the trunk-input projections
         self.drop_z = nn.Dropout(DROPOUT)
-        self.trunk = nn.ModuleList([TrunkBlock() for _ in range(n_trunk)])  # at D
+        self.trunk = nn.ModuleList([TrunkBlock(fp32_ops=self.trunk_fp32)
+                                    for _ in range(n_trunk)])   # at D
         # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
         self.sm_s = nn.Linear(D, SM_C_S)
         self.sm_z = nn.Linear(D, SM_C_Z)

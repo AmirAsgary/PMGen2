@@ -258,6 +258,11 @@ def parse_args(argv=None):
                         "were trained with; kept as default for reproducibility). "
                         "'identity' withholds them (documented design) -> the pose must "
                         "actually be predicted. Use 'identity' for a correct retrain.")
+    p.add_argument("--trunk-fp32", default="tri",
+                   help="comma-list of trunk ops to run in fp32 ('' = all bf16). The N^2 "
+                        "triangle products amplify bf16 rounding into spurious gradient "
+                        "spikes (max |g| 967 in bf16 vs 29 with tri in fp32; the loss is "
+                        "identical). This is what killed the 13_08 run.")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--fape-clamp", type=float, default=0.0,
                    help="clamp the backbone FAPE at this distance (A). DEFAULT OFF: a 10 A "
@@ -340,7 +345,8 @@ def main(argv=None):
     total_steps = steps_per_epoch * args.epochs
 
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
-                             device=device, pep_frames=args.pep_frames)
+                             device=device, pep_frames=args.pep_frames,
+                             trunk_fp32=tuple(x for x in args.trunk_fp32.split(",") if x))
     model.set_stage(args.stage)
     # stage 1: structure ONLY (lambda_plddt = 0); 2: structure + pLDDT(0.01);
     # 3: pLDDT ONLY (all structure terms off, model frozen except plddt_proj).

@@ -52,15 +52,22 @@ def main():
     p.add_argument("--resume", default=None, help="optional trained ckpt")
     p.add_argument("--out", default="outputs/mm1_graddiag")
     p.add_argument("--dtype", choices=["bf16","fp32"], default="bf16")
+    p.add_argument("--trunk-fp32", default="", help="comma list: tri,ipa,opm")
+    p.add_argument("--no-step", action="store_true",
+                   help="FREEZE the model: measure gradients only, never update. "
+                        "Makes precision variants exactly comparable (no drift).")
     args = p.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     idx = pd.read_csv(Path(args.hasmig_dir) / "index.csv", dtype=str)
     ds = m1.H5DistillDataset(idx["id"].tolist(), dict(zip(idx["id"], idx["shard"])),
                              args.hasmig_dir)
-    loader = m1.make_dataloader(ds, args.bs, shuffle=True, num_workers=2)
+    torch.manual_seed(0)
+    loader = m1.make_dataloader(ds, args.bs, shuffle=False, num_workers=2)
 
-    net = MM.MultimerModel(n_trunk=args.n_trunk, device=dev, pep_frames="identity")
+    tf32 = tuple(x for x in args.trunk_fp32.split(",") if x)
+    net = MM.MultimerModel(n_trunk=args.n_trunk, device=dev,
+                           pep_frames="identity", trunk_fp32=tf32)
     net.set_stage(1)
     if args.resume:
         net.load_state_dict(torch.load(args.resume, map_location=dev,
@@ -111,9 +118,11 @@ def main():
                 batch["seq_mask"], batch["segment_id"]).sum())
             rows.append(rec)
 
-            if args.grad_clip:
-                torch.nn.utils.clip_grad_norm_(net.trainable_parameters(), args.grad_clip)
-            opt.step()
+            if not args.no_step:
+                if args.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(net.trainable_parameters(),
+                                                   args.grad_clip)
+                opt.step()
             step += 1
 
     df = pd.DataFrame(rows)
