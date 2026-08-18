@@ -236,6 +236,19 @@ def parse_args(argv=None):
                    help="cap the train set to N random examples (smoke/convergence test)")
     p.add_argument("--subset-val-frac", type=float, default=0.2,
                    help="with --max-train: fraction held out for validation (disjoint)")
+    p.add_argument("--cap-train", type=int, default=0,
+                   help="cap the train set to N random examples but KEEP the real "
+                        "two_axis val / val-matched sets. Unlike --max-train (which "
+                        "REPLACES val with a random 20%% slice of the train pool, so val "
+                        "shares alleles and peptides with train and reads optimistically), "
+                        "this leaves validation on the held-out HLA fold — use it for a "
+                        "short run whose val number is still an honest generalisation "
+                        "measurement.")
+    p.add_argument("--max-val", type=int, default=0,
+                   help="cap val (and val-matched) to N random examples, seeded so the "
+                        "SAME subset is used every epoch and across runs. 0 = full set. "
+                        "The full val fold is ~30k structures, which costs more than the "
+                        "training it follows in a short run.")
     p.add_argument("--allow-no-val", action="store_true",
                    help="proceed even if no old (two_axis) store is present -> NO "
                         "validation (hasmig-only training). Off by default on purpose.")
@@ -252,6 +265,13 @@ def parse_args(argv=None):
     p.add_argument("--sc-fape-w", type=float, default=0.5)   # AF: fape.sidechain.weight
     p.add_argument("--bb-fape-w", type=float, default=0.5)   # AF: fape.backbone.weight
     p.add_argument("--chi-w", type=float, default=1.0)       # AF: supervised_chi.weight
+    p.add_argument("--unweighted-sidechain-losses", action="store_true",
+                   help="restore the OLD (buggy) side-chain reduction: sc-FAPE and chi "
+                        "as plain means over every residue of every example, escaping "
+                        "--peptide-weight, --hasmig-weight and --struct-quality-weight. "
+                        "Those two terms are ~71%% of the total loss and ~95%% MHC, so "
+                        "the default (weighted) is the fix; this flag exists only to "
+                        "A/B against the old behaviour.")
     p.add_argument("--pep-frames", choices=["teacher", "identity"], default="identity",
                    help="'teacher' feeds the peptide's TRUE backbone frames to the trunk "
                         "-> LEAKS the ground-truth pose (what all current checkpoints "
@@ -276,6 +296,16 @@ def parse_args(argv=None):
                         "model does not learn (measured). Lower = more long-range signal.")
     p.add_argument("--warmup-steps", type=int, default=1000,
                    help="linear LR warmup before the cosine decay (0 = none)")
+    p.add_argument("--grad-spike-factor", type=float, default=10.0,
+                   help="reject an optimizer step whose gradient norm exceeds this "
+                        "multiple of the RUNNING MEDIAN norm (0 = off). grad_clip bounds "
+                        "a spike's magnitude but keeps its DIRECTION, so a garbage "
+                        "gradient still takes a full-size wrong step and compounds; job "
+                        "29377637 died that way (max |g| 1-2 -> 9 -> 44 -> 186 -> 5.5e14 "
+                        "over 1k steps). The non-finite guard only fires once the weights "
+                        "have ALREADY collapsed; this catches the precursor.")
+    p.add_argument("--grad-spike-warmup", type=int, default=200,
+                   help="steps of history before spike rejection activates")
     p.add_argument("--divergence-factor", type=float, default=8.0,
                    help="abort if the window loss exceeds this x the best for "
                         "3 consecutive windows (0 = never abort)")
@@ -340,6 +370,26 @@ def main(argv=None):
         val_ds = Subset(train_ds, val_idx)
         train_ds = Subset(train_ds, tr_idx)
         val_hi_ds = None
+    if args.cap_train > 0:
+        if args.max_train > 0:
+            raise SystemExit("--cap-train and --max-train are mutually exclusive: "
+                             "--max-train builds its own val split from the train pool, "
+                             "--cap-train keeps the real two_axis val fold.")
+        from torch.utils.data import Subset
+        idx = list(range(len(train_ds)))
+        random.Random(args.seed).shuffle(idx)                  # RANDOM subset
+        train_ds = Subset(train_ds, sorted(idx[:min(args.cap_train, len(idx))]))
+    if args.max_val > 0:
+        from torch.utils.data import Subset
+
+        def _cap_val(ds, seed):
+            if ds is None or len(ds) <= args.max_val:
+                return ds
+            j = list(range(len(ds)))
+            random.Random(seed).shuffle(j)
+            return Subset(ds, sorted(j[:args.max_val]))
+        val_ds = _cap_val(val_ds, args.seed + 1)
+        val_hi_ds = _cap_val(val_hi_ds, args.seed + 2)
     shard_n = len(train_ds) // world if world > 1 else len(train_ds)
     steps_per_epoch = max(1, (shard_n + args.bs - 1) // args.bs)
     total_steps = steps_per_epoch * args.epochs
@@ -361,6 +411,7 @@ def main(argv=None):
         fape_clamp_prob=args.fape_clamp_prob,
         lambda_sc_fape=(args.sc_fape_w if (args.sidechains and struct_on) else 0.0),
         lambda_chi=(args.chi_w if (args.sidechains and struct_on) else 0.0),
+        weight_sidechain_losses=not args.unweighted_sidechain_losses,
     ).to(device)
 
     def build_opt_sched(t_max):
@@ -440,6 +491,8 @@ def main(argv=None):
                 "sidechain loss weights are zero in a structure stage"
         log(f"[mm1] sidechains ON: sc_fape_w={loss_mod.l_sc_fape} chi_w={loss_mod.l_chi} "
             f"(chi={loss_mod.chi_weight}, angle_norm={loss_mod.angle_norm_weight})")
+        log(f"[mm1] sidechain-loss weighting: "
+            f"{'WEIGHTED (peptide/sample/struct apply)' if loss_mod.weight_sidechain_losses else 'UNWEIGHTED (old behaviour)'}")
     if args.pep_frames == "identity":
         MM._leak_check(dev=device)          # pre-flight: peptide pose cannot leak
 
@@ -508,6 +561,8 @@ def main(argv=None):
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
             metrics_every=args.train_metrics_every,
             divergence_factor=args.divergence_factor,
+            grad_spike_factor=args.grad_spike_factor,
+            grad_spike_warmup=args.grad_spike_warmup,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
                      if (run_dir is not None and is_main) else None),
             # snapshot the BEST model so a later blow-up cannot cost us the good weights

@@ -518,7 +518,8 @@ def _leak_check(dev=None, ckpt=None, tol=1e-6):
     # --- the SIDE-CHAIN TARGETS are loss-only: they must never reach the model --------
     net = MultimerModel(device=dev, pep_frames="identity").eval()
     base = net.predict(batch)["atom14"]
-    for key in ("teacher_atom14", "teacher_chi", "teacher_ca", "teacher_plddt"):
+    for key in ("teacher_atom14", "teacher_chi", "teacher_ca", "teacher_plddt",
+                "teacher_pae"):
         b3 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
         b3[key] = torch.randn_like(b3[key]) * 10.0          # destroy the target
         d = (net.predict(b3)["atom14"] - base).abs().max().item()

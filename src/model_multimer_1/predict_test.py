@@ -56,10 +56,18 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", required=True)
     p.add_argument("--tag", required=True, help="label for outputs, e.g. A / B")
-    p.add_argument("--pep-frames", choices=["teacher", "identity"], default="teacher")
+    p.add_argument("--pep-frames", choices=["teacher", "identity"], default="identity",
+                   help="'identity' (DEFAULT, leak-free) withholds the peptide's true "
+                        "backbone frames. 'teacher' LEAKS the ground-truth pose and only "
+                        "exists to reproduce the pre-fix checkpoints.")
     p.add_argument("--out-dir", default="outputs/mm1_test")
     p.add_argument("--n-trunk", type=int, default=3)
-    p.add_argument("--stage", type=int, default=2)
+    p.add_argument("--stage", type=int, default=1)
+    p.add_argument("--leak-test", action="store_true",
+                   help="per example, ALSO predict with the peptide's teacher_bb shifted "
+                        "+10 A and the side-chain/confidence targets randomised, and report "
+                        "the max change in the predicted peptide atoms. 0.0 == no leakage "
+                        "on these actual test structures (not just synthetic ones).")
     args = p.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,6 +92,20 @@ def main():
 
         out = net.predict(b)
         aatype = b["aatype"]
+        if args.leak_test:
+            # `frames` is the only path from teacher_bb to the peptide; the targets must
+            # never reach the model at all. Perturb both and require a bit-identical
+            # peptide prediction.
+            b2 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b.items()}
+            b2["teacher_bb"][0][pep_t] += torch.tensor([10.0, 0.0, 0.0], device=dev)
+            for key in ("teacher_atom14", "teacher_chi", "teacher_ca", "teacher_plddt",
+                        "teacher_pae"):
+                if key in b2 and torch.is_tensor(b2[key]):
+                    b2[key] = torch.randn_like(b2[key]) * 10.0
+            d = (net.predict(b2)["atom14"] - out["atom14"])[0][pep_t]
+            leak_delta = float(d.abs().max()) if d.numel() else 0.0
+        else:
+            leak_delta = float("nan")
         masks = make_atom14_masks({"aatype": aatype})
         atom37 = atom14_to_atom37(out["atom14"], masks)[0].float().cpu().numpy()  # [N,37,3]
         pred_mask = masks["atom37_atom_exists"][0].cpu().numpy()                  # [N,37]
@@ -122,6 +144,8 @@ def main():
         rec["all_atom_rmsd"] = rmsd(*sel(np.ones_like(pep, bool)))
         rec["pep_plddt_pred"] = float(plddt[pep].mean())
         rec["pep_plddt_teacher"] = float(b["teacher_plddt"][0][pep_t].mean())
+        rec["anchors"] = r.get("anchors", "")
+        rec["leak_delta_A"] = leak_delta
         recs.append(rec)
 
         # ---- write the superposed full-atom prediction
@@ -143,6 +167,15 @@ def main():
         f"{c}={df[c].mean():.3f}" for c in
         ["pep_ca_rmsd", "pep_bb_rmsd", "pep_allatom_rmsd", "mhc_ca_rmsd",
          "all_ca_rmsd", "all_atom_rmsd", "pep_plddt_pred", "pep_plddt_teacher"]))
+    if args.leak_test:
+        mx = float(df["leak_delta_A"].max())
+        print(f"\nLEAK TEST on these {len(df)} structures: max |Δ predicted peptide atom| "
+              f"when the peptide's teacher_bb is shifted +10 A and every target is "
+              f"randomised = {mx:.3e} A")
+        print("  PASS: no leakage — the peptide pose is predicted, not read."
+              if mx == 0.0 else
+              f"  *** FAIL: the prediction moved {mx:.4f} A — ground-truth peptide "
+              f"information is reaching the model. ***")
     print(f"\nPDBs + {csv.name} -> {out_dir}")
 
 

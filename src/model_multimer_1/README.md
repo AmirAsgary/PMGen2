@@ -1,5 +1,55 @@
 # model_multimer_1
 
+> ## ⚠ CURRENT STATE (2026-08-18): there is NO usable checkpoint
+> **`checkpoints_mm1/mm1_stage1_sc/last.pt` is 292/292 NaN tensors** (plus 584 NaN Adam
+> states). `checkpoints_mm1_bk/*` are all pre-leak-fix and unusable per the warning below.
+> Nothing in this directory can currently be evaluated or deployed.
+>
+> The only leak-free run ever attempted (job `28811055`, 13 Jul, logs/mm1/28811055.out):
+>
+> | steps | what happened |
+> |---|---|
+> | 1 – 24,800 | healthy — FAPE 2.14 → 0.11, chi 0.36 → 0.059, Cα-RMSD ~0.25 Å |
+> | 24,850 – 25,050 | exponential runaway (0.20 → 0.26 → 0.33 → 0.49 → 0.98 → 2.15) |
+> | 25,050 – 33,000 | **dead** at random-init loss, Cα-RMSD 17–20 Å, for 8,000 steps |
+> | 33,050 | NaN; cancelled at 15:04 |
+>
+> It reached **35% of epoch 1 of 6** and therefore **never ran a validation pass**. Every
+> held-out number quoted anywhere in this README comes either from the leaky checkpoints
+> or from 20–40 structure probes. **No honest generalisation number exists for this model.**
+>
+> The stability guards added afterwards (`93a9f74`, `29f5bbc`, `00e4e79` — non-finite step
+> skip, NaN-safe save, `best.pt`, divergence abort, `|g|` telemetry, LR warmup,
+> `--trunk-fp32`) were committed but **never exercised by a real job**: the last mm1 log
+> predates them. Treat them as untested until a run confirms otherwise.
+>
+> Restart path: `sbatch src/model_multimer_1/run_stage1_short.sh` (≈1 h, 4 GPUs) — proves
+> the harness trains/validates/checkpoints honestly and yields the first held-out number;
+> then the full `run_stage1_sidechain.sh`.
+
+> ## ⚠ FIXED BUG: side-chain losses escaped every weighting
+> `sc_fape` and `chi_loss` were plain `.mean()`s over every residue of every example, so
+> they bypassed **all three** weightings the rest of the loss applies:
+> `--peptide-weight` (they were ~95% MHC — 181 residues vs a 9-mer — i.e. mostly
+> re-scoring rotamers of a backbone handed in as INPUT), `--hasmig-weight`, and
+> `--struct-quality-weight`. At the magnitudes actually logged,
+> `0.5·sc_fape + 1.0·chi` is **~71% of the total loss**, so **Approach B's entire premise
+> failed silently**: low-confidence structures kept full influence over most of the
+> objective, and the "very important" peptide side chains were drowned out.
+>
+> Fixed in `DistillLoss` via `_sidechain_fape_per_example` (routes the per-residue weight
+> through `compute_fape`'s `pair_mask`, which enters the normaliser, so it is a correct
+> weighted mean) and `_supervised_chi_loss_per_example` (openfold's `supervised_chi_loss`
+> reduces the batch to a **scalar** internally, so no per-example weight could reach it at
+> all). Verified: unweighted path reproduces openfold to 4e-7 (sc-FAPE) and bit-exactly
+> (chi, B=1); at `peptide_weight=5` the peptide's share of the side-chain signal rises
+> 13% → 43% and both terms respond to `struct_weight` for the first time.
+> `--unweighted-sidechain-losses` restores the old behaviour for A/B comparison.
+>
+> Also fixed: `evaluate()` ran **without `torch.no_grad()`**, building and retaining the
+> full autograd graph through the frozen AF stack on every validation batch.
+
+
 > ## ⚠ KNOWN BUG: the peptide pose leaks into the trunk (`pep_frames`)
 > `_frames_from_bb` only forces the *padding* residues to the identity frame, so the
 > **peptide's TRUE backbone frames** (from `teacher_bb`) are fed to the trunk IPAs —
@@ -46,6 +96,36 @@ per-chain `residue_index`/`asym_id` the embedder already understands. The MHC ba
 is given as an INPUT (head-2), so the task is "given noisy MHC + sequences + anchors,
 dock the peptide", not de-novo folding. Trained in three stages: structure-first, then
 a broader-data structure+confidence stage, then confidence-only.
+
+## ⚠ The multiple structures per complex are ANCHOR VARIANTS, not replicates
+
+Store ids are `ALLELE_PEPTIDE_LENGTH_INDEX` (e.g. `HLAA01138_FTGRFPGYVV_10_3`). The
+873,749 structures cover 264,009 distinct `ALLELE_PEPTIDE_LENGTH` complexes — about 3.3
+structures each — and it is tempting to read those as AlphaFold replicates of one
+prediction. **They are not.** PMGen hands AlphaFold a different **anchor** for each one,
+and the structure changes accordingly. Measured over all 225,616 multi-structure
+complexes: **100.0% have all-distinct anchors** (0.0% repeat one).
+
+```
+HLAA01138_FTGRFPGYVV_10_3   anchor 1;10   pep-pLDDT 47.1
+HLAA01138_FTGRFPGYVV_10_5   anchor  2;9   pep-pLDDT 45.8      MHC differs by 0.19 A
+HLAA01138_FTGRFPGYVV_10_7   anchor  3;9   pep-pLDDT 47.0      PEPTIDE by up to 5.30 A
+HLAA01138_FTGRFPGYVV_10_9   anchor 4;10   pep-pLDDT 54.9
+```
+
+So the several-Angstrom spread between structures of one complex is **the training
+signal, not noise**: `anchor` is a model INPUT, and learning anchor -> structure is the
+task. Consequences, all of which are easy to get wrong:
+
+* **Never deduplicate by `base_id`.** Collapsing a complex to one structure (medoid or
+  otherwise) deletes exactly what the model is supposed to learn.
+* **Inter-structure spread is NOT a teacher-noise estimate.** The store contains no
+  same-anchor repeats at all, so AlphaFold's run-to-run noise cannot be measured from
+  it, and the spread must not be used as a target-reliability weight.
+* **A model that ignores the anchor still gets a mediocre score** by predicting one
+  average pose per sequence — so aggregate RMSD alone cannot tell you the conditioning
+  was learned. `anchor_sensitivity.py` is the check that can: it holds sequence and MHC
+  fixed, changes only the anchor, and compares the model's response to AlphaFold's.
 
 ## Pipeline
 ```
@@ -300,7 +380,7 @@ $PY src/model_multimer_1/predict_test.py --ckpt checkpoints_mm1/mm1_stage2_A/las
 Always report the `--pep-frames identity` number — `teacher` is the leaky one (see the
 warning at the top).
 
-## Status: validated end-to-end
+## Status: wiring validated end-to-end; TRAINING never completed (see the top of this file)
 Local (pmgen2, 1 GPU, bf16) smoke + overfit: the full path (real hasmig zips → H5 → dataset
 → `InputEmbedderMultimer` → head-2 → trunk → frozen multimer SM → FAPE → backward → DDP) runs
 clean. A clean 20-structure overfit at n_trunk 3 drove peptide Cα-RMSD to **~0.05 Å**,
@@ -308,3 +388,9 @@ confirming the Rigid3Array frames, `StructureModule(is_multimer=True)` I/O, and 
 weight keys are wired correctly and that the frozen-SM design has ample capacity. The 2-GPU
 `smoke_mm1.sbatch` passed on Raven (sharded DDP train + all-reduced val). Run the smokes
 (step 2) before any full training.
+
+**What this does NOT show.** Every number above is either a 20-structure overfit or a
+smoke. The one full-scale leak-free attempt diverged and NaN'd before its first validation
+pass (see CURRENT STATE at the top). "Ample capacity on a 20-structure overfit" is a
+statement about memorisation, not generalisation — the held-out `two_axis` fold has never
+been measured for this model.

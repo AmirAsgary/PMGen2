@@ -71,6 +71,7 @@ from openfold.utils.loss import (                                     # noqa: E4
     backbone_loss, compute_fape, sidechain_loss, supervised_chi_loss,
     compute_renamed_ground_truth)
 from openfold.utils.rigid_utils import Rigid, Rotation                # noqa: E402
+from openfold.utils.tensor_utils import masked_mean                   # noqa: E402
 
 
 def _load_module(name: str, rel_path: str):
@@ -807,6 +808,83 @@ def _groove_terms(ca_teacher, ca_pred, pep, seq_mask, tau_mid=8.0, s_buried=1.5,
     return buried, wout, contain
 
 
+def _supervised_chi_loss_per_example(angles_sin_cos, unnormalized_angles_sin_cos,
+                                     aatype, seq_mask, chi_mask, chi_angles_sin_cos,
+                                     chi_weight: float, angle_norm_weight: float,
+                                     eps: float = 1e-6):
+    """Per-example chi loss **[B]** — openfold's ``supervised_chi_loss`` (Alg. 27)
+    without its final ``torch.mean`` over the batch.
+
+    Upstream reduces to a SCALAR inside the function, so no per-example weight
+    (sample_weight / struct_weight) can be applied to the chi term from outside at all
+    — keeping the [B] vector is the only way Approach B's quality weighting can reach
+    it. Per-RESIDUE weighting still rides on ``chi_mask``, which is the weight in the
+    masked_mean, exactly as upstream.
+
+    One deliberate difference: upstream's ``einsum("...ij,jk->ik")`` for chi_pi_periodic
+    DROPS the leading batch dim (it sums over it). That is invisible at batch size 1 —
+    which is all this project has ever trained at — but wrong for B>1, so this uses
+    ``"...ij,jk->...ik"``. At B=1 the two are identical.
+
+    Shapes: angles [B,N,7,2], chi_mask [B,N,4], chi_angles_sin_cos [B,N,4,2].
+    """
+    pred_angles = angles_sin_cos[..., 3:, :]                            # [B,N,4,2]
+    one_hot = F.one_hot(aatype.long(), rc.restype_num + 1)
+    chi_pi_periodic = torch.einsum(
+        "...ij,jk->...ik", one_hot.type(angles_sin_cos.dtype),
+        angles_sin_cos.new_tensor(rc.chi_pi_periodic))                  # [B,N,4]
+    true_chi = chi_angles_sin_cos
+    shifted = (1 - 2 * chi_pi_periodic).unsqueeze(-1) * true_chi        # [B,N,4,2]
+    sq = torch.sum((true_chi - pred_angles) ** 2, dim=-1)
+    sq = torch.minimum(sq, torch.sum((shifted - pred_angles) ** 2, dim=-1))   # [B,N,4]
+    sq_chi_loss = masked_mean(chi_mask, sq, dim=(-1, -2))               # [B]
+    angle_norm = torch.sqrt(
+        torch.sum(unnormalized_angles_sin_cos ** 2, dim=-1) + eps)      # [B,N,7]
+    angle_norm_loss = masked_mean(seq_mask[..., None],
+                                  torch.abs(angle_norm - 1.0), dim=(-1, -2))   # [B]
+    return chi_weight * sq_chi_loss + angle_norm_weight * angle_norm_loss
+
+
+def _sidechain_fape_per_example(sidechain_frames, sidechain_atom_pos, gt, ren,
+                                pos_weight=None, clamp_distance: float = 10.0,
+                                length_scale: float = 10.0, eps: float = 1e-4):
+    """Per-example side-chain FAPE **[B]** — openfold's ``sidechain_loss`` plus an
+    optional per-residue weight on the atom positions.
+
+    openfold's version reduces to ONE number over every residue. On a pMHC that means
+    ~95% of the side-chain signal is the MHC (181 residues vs a 9-mer peptide), i.e. the
+    term is dominated by re-emitting the rotamers of a backbone we were GIVEN as input,
+    while the peptide side chains we actually have to predict are drowned out.
+
+    ``compute_fape`` already supports a ``pair_mask`` that multiplies the error AND
+    enters the normaliser, so routing the per-residue weight through it yields a correct
+    weighted mean. ``pos_weight`` [B,N] weights the atom14 POSITIONS — the same
+    convention the backbone FAPE uses (it weights position j, not the frame).
+
+    Returns [B] rather than a scalar so the caller can apply per-EXAMPLE weights
+    (sample_weight / struct_weight) afterwards: folding those in here would CANCEL,
+    because compute_fape divides by the same mask sum it multiplies by.
+    """
+    alt = ren["alt_naming_is_better"][..., None, None, None]
+    renamed_gt_frames = ((1.0 - alt) * gt["rigidgroups_gt_frames"]
+                         + alt * gt["rigidgroups_alt_gt_frames"])
+    B = sidechain_frames.shape[0]
+    pred_frames = Rigid.from_tensor_4x4(sidechain_frames.reshape(B, -1, 4, 4))
+    tgt_frames = Rigid.from_tensor_4x4(renamed_gt_frames.reshape(B, -1, 4, 4))
+    frames_mask = gt["rigidgroups_gt_exists"].reshape(B, -1)               # [B, N*8]
+    pred_pos = sidechain_atom_pos.reshape(B, -1, 3)                        # [B, N*14, 3]
+    tgt_pos = ren["renamed_atom14_gt_positions"].reshape(B, -1, 3)
+    pos_mask = ren["renamed_atom14_gt_exists"].reshape(B, -1)              # [B, N*14]
+    pair_mask = None
+    if pos_weight is not None:
+        # [B,N] -> per-atom14 [B,N*14] -> broadcast over the frame axis as [B,1,N*14]
+        pair_mask = pos_weight[..., None].expand(-1, -1, 14).reshape(B, 1, -1)
+    return compute_fape(pred_frames, tgt_frames, frames_mask, pred_pos, tgt_pos,
+                        pos_mask, pair_mask=pair_mask,
+                        l1_clamp_distance=clamp_distance,
+                        length_scale=length_scale, eps=eps)
+
+
 class DistillLoss(nn.Module):
     """L = λ_fape·FAPE + λ_plddt·CE(plddt, bin50) + λ_pae·CE(pae, bin64).
 
@@ -824,7 +902,8 @@ class DistillLoss(nn.Module):
                  lambda_sc_fape: float = 0.0, lambda_chi: float = 0.0,
                  chi_weight: float = 0.5, angle_norm_weight: float = 0.01,
                  sc_clamp_distance: float = 10.0, sc_length_scale: float = 10.0,
-                 fape_clamp_prob: float = 1.0):
+                 fape_clamp_prob: float = 1.0,
+                 weight_sidechain_losses: bool = True):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
@@ -866,6 +945,17 @@ class DistillLoss(nn.Module):
         self.angle_norm_weight = float(angle_norm_weight)
         self.sc_clamp_distance = float(sc_clamp_distance)
         self.sc_length_scale = float(sc_length_scale)
+        # BUGFIX. sc_fape and chi were plain .mean()s over EVERY residue of EVERY
+        # example, so they escaped all three weightings the rest of the loss applies:
+        #   peptide_weight -> the terms were ~95% MHC (181 residues vs a 9-mer), i.e.
+        #                     mostly copying the rotamers of an input we were handed;
+        #   sample_weight  -> --hasmig-weight never reached them;
+        #   struct_weight  -> Approach B's quality weighting never reached them either,
+        #                     and at the observed magnitudes 0.5*sc_fape + 1.0*chi is
+        #                     ~71% of the total loss, so low-confidence structures kept
+        #                     full influence over most of the objective.
+        # Setting this False restores the old (unweighted) behaviour for comparison.
+        self.weight_sidechain_losses = bool(weight_sidechain_losses)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -892,6 +982,11 @@ class DistillLoss(nn.Module):
             fape_pair = (1.0 + (w - 1.0) * pep)[:, None, :]               # weight pos j
         else:
             res_w, pair_w, fape_pair = seq_mask, pair_mask, None
+        # RELATIVE per-residue structural weight: peptide up-weighting ONLY, with no
+        # per-example factor. The side-chain terms normalise by their own mask sum, so
+        # a per-example factor would cancel there and must instead be applied to the
+        # reduced [B] vector (which is what `wfape` does for the backbone FAPE below).
+        struct_res_w = seq_mask * (1.0 + (w - 1.0) * pep)                  # [B,N]
 
         # per-example source weight [B] (e.g. down-weight low-diversity hasmig data);
         # folds into the CE weights (their ÷Σw normalization then down-weights the
@@ -952,6 +1047,13 @@ class DistillLoss(nn.Module):
             wfape, weighted = wfape * stw, True
         fape = ((wfape * fape_be).sum() / wfape.sum().clamp_min(1e-4)
                 if weighted else fape_be.mean())
+
+        def _wmean(be):
+            """Per-example [B] -> scalar under the SAME per-example weighting the
+            backbone FAPE uses (teacher pLDDT / sample_weight / struct_weight)."""
+            if not (weighted and self.weight_sidechain_losses):
+                return be.mean()
+            return (wfape * be).sum() / wfape.sum().clamp_min(1e-4)
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
         ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
         # PAE is skipped entirely when lambda_pae == 0 (or the model returns None): the
@@ -986,24 +1088,28 @@ class DistillLoss(nn.Module):
                 gt["rigidgroups_gt_exists"] = gt["rigidgroups_gt_exists"] * \
                     seq_mask[..., None]
                 ren = compute_renamed_ground_truth(gt, aux["atom14"])
-                sc_fape = sidechain_loss(
-                    aux["sidechain_frames"][None], aux["atom14"][None],
-                    rigidgroups_gt_frames=gt["rigidgroups_gt_frames"],
-                    rigidgroups_alt_gt_frames=gt["rigidgroups_alt_gt_frames"],
-                    rigidgroups_gt_exists=gt["rigidgroups_gt_exists"],
-                    renamed_atom14_gt_positions=ren["renamed_atom14_gt_positions"],
-                    renamed_atom14_gt_exists=ren["renamed_atom14_gt_exists"],
-                    alt_naming_is_better=ren["alt_naming_is_better"],
+                # per-example [B], peptide-weighted over atoms; the per-example
+                # weights are applied by _wmean below (see weight_sidechain_losses).
+                sc_fape_be = _sidechain_fape_per_example(
+                    aux["sidechain_frames"], aux["atom14"], gt, ren,
+                    pos_weight=(struct_res_w if self.weight_sidechain_losses
+                                else seq_mask),
                     clamp_distance=self.sc_clamp_distance,
-                    length_scale=self.sc_length_scale).mean()
+                    length_scale=self.sc_length_scale)
+                sc_fape = _wmean(sc_fape_be)
             if self.l_chi != 0.0:
-                chi_loss = supervised_chi_loss(
-                    aux["angles"][None], aux["unnormalized_angles"][None],
+                # chi_mask doubles as the weight inside supervised_chi_loss's
+                # masked_mean, so the peptide up-weighting rides along on it.
+                chi_mask = batch["teacher_chi_mask"] * (
+                    struct_res_w if self.weight_sidechain_losses else seq_mask
+                )[..., None]
+                chi_loss = _wmean(_supervised_chi_loss_per_example(
+                    aux["angles"], aux["unnormalized_angles"],
                     aatype=batch["aatype"], seq_mask=seq_mask,
-                    chi_mask=batch["teacher_chi_mask"] * seq_mask[..., None],
+                    chi_mask=chi_mask,
                     chi_angles_sin_cos=batch["teacher_chi"],
                     chi_weight=self.chi_weight,
-                    angle_norm_weight=self.angle_norm_weight).mean()
+                    angle_norm_weight=self.angle_norm_weight))
             total = total + self.l_sc_fape * sc_fape + self.l_chi * chi_loss
 
         # peptide-ONLY loss values, every step (observation; not in `total`).
@@ -1252,7 +1358,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     core: Optional[DistillModel] = None, is_main: bool = True,
                     amp_dtype=None, metrics_every: int = 0,
                     max_consec_skip: int = 50,
-                    divergence_factor: float = 8.0, best_save_fn=None
+                    divergence_factor: float = 8.0, best_save_fn=None,
+                    grad_spike_factor: float = 0.0, grad_spike_warmup: int = 200
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1283,6 +1390,19 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     best_win = float('inf')   # best window-mean loss (divergence reference)
     diverge_hits = 0
     gn_sum = 0.0; gn_max = 0.0; gn_n = 0    # gradient-norm telemetry
+    # GRADIENT-SPIKE REJECTION. clip_grad_norm_ bounds a gradient's MAGNITUDE but keeps
+    # its DIRECTION, so a numerically-garbage spike still takes a full-size step the
+    # wrong way -> the model drifts somewhere sharper -> bigger spikes -> runaway. Job
+    # 29377637 showed the signature exactly: max |g| sat at 1-2 through step 30.8k, hit
+    # 9.4 then 44 at 30.9-31k, and by 31.9k it was 186 and then 5.5e14. The non-finite
+    # guard below only fires once the weights are ALREADY collapsed (every gradient inf
+    # from then on), so it limits damage rather than preventing it. Rejecting steps whose
+    # norm is an outlier against the RUNNING MEDIAN catches the precursor ~1000 steps
+    # earlier. Median (not mean) so the statistic is not itself dragged up by the spikes.
+    from collections import deque as _deque
+    gn_hist = _deque(maxlen=1000)
+    spike_win = _deque(maxlen=400)      # rolling accept/reject record -> rejection RATE
+    n_spike = 0
     nsteps = len(loader)
     t0 = time.perf_counter()
     tw = t0
@@ -1337,10 +1457,52 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                 gnorm = torch.sqrt(sum((p.grad.detach() ** 2).sum()
                                        for p in core.trainable_parameters()
                                        if p.grad is not None))
-            if torch.isfinite(gnorm) and torch.isfinite(total.detach()):
+            finite = torch.isfinite(gnorm) and torch.isfinite(total.detach())
+            spike = False
+            if finite and grad_spike_factor > 0:
+                g = float(gnorm)
+                if len(gn_hist) >= grad_spike_warmup:
+                    med = sorted(gn_hist)[len(gn_hist) // 2]
+                    # DDP all-reduces grads before clipping, so every rank sees the same
+                    # norm and the same history -> identical decision, no rank desync.
+                    if g > grad_spike_factor * max(med, 1e-8):
+                        spike = True
+                        n_spike += 1
+                        if log and n_spike <= 10:
+                            log(f"[train]   ~~ gradient SPIKE rejected at gstep "
+                                f"{global_step+1}: |g|={g:.3g} > {grad_spike_factor:g}x "
+                                f"running median {med:.3g} — step dropped")
+                # Append EVERY finite norm, rejected or not. Appending only accepted
+                # ones makes the median a RATCHET: if the true gradient scale drifts up,
+                # every step trips the stale threshold, nothing new enters the history,
+                # and the guard strangles a healthy run (job 29383715 died exactly so —
+                # median frozen at 0.512 while normal gradients had grown to 5-6, loss
+                # flat at 0.24 throughout). The median is robust by construction: with a
+                # 1000-sample window even 100 spikes barely move it, so tracking the real
+                # distribution costs nothing and keeps the threshold meaningful.
+                gn_hist.append(g)
+            elif finite:
+                gn_hist.append(float(gnorm))
+            if finite and not spike:
                 optimizer.step()
                 stepped = True
+                spike_win.append(0)
                 gn_sum += float(gnorm); gn_max = max(gn_max, float(gnorm)); gn_n += 1
+            elif spike:
+                optimizer.zero_grad(set_to_none=True)
+                stepped = False
+                # Do NOT fold spikes into consec_skip (that counter is for non-finite
+                # steps, where 50 in a row really is unrecoverable). A burst of spikes is
+                # normal; what signals divergence is a sustained REJECTION RATE. Abort
+                # only if most of a long window is being rejected.
+                spike_win.append(1)
+                if (len(spike_win) == spike_win.maxlen
+                        and sum(spike_win) > 0.5 * spike_win.maxlen):
+                    raise RuntimeError(
+                        f"{sum(spike_win)}/{spike_win.maxlen} recent steps rejected as "
+                        f"gradient spikes at gstep {global_step+1}: the model is "
+                        f"diverging, not hitting an outlier batch. Aborting. Lower --lr "
+                        f"or enable --fape-clamp.")
             else:
                 optimizer.zero_grad(set_to_none=True)   # discard the poisoned grads
                 n_skipped += 1
@@ -1450,11 +1612,12 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
         if is_main and ckpt_every and save_fn is not None \
                 and global_step % ckpt_every == 0:
             save_fn(global_step, epoch)
-    if n_skipped and log:
-        log(f"[train]   epoch {epoch}: {n_skipped} non-finite step(s) skipped "
-            f"(weights protected)")
+    if (n_skipped or n_spike) and log:
+        log(f"[train]   epoch {epoch}: {n_skipped} non-finite step(s) skipped, "
+            f"{n_spike} gradient spike(s) rejected (weights protected)")
     out = {k: v / max(n, 1) for k, v in agg.items()}
     out["skipped"] = float(n_skipped)
+    out["spikes"] = float(n_spike)
     return out, global_step
 
 
@@ -1469,20 +1632,26 @@ def evaluate(model: DistillModel, loader: DataLoader, loss_mod: DistillLoss,
     model.eval()
     agg: Dict[str, float] = defaultdict(float)
     n = 0
-    for i, batch in enumerate(loader):
-        batch = move_batch(batch, device)
-        o = model(batch, return_frames=True, num_recycles=num_recycles)
-        ca, plddt, pae, frames = o[:4]
-        aux = o[4] if len(o) > 4 else None
-        _, terms = loss_mod(ca, plddt, pae, frames, batch, aux=aux)
-        mets = eval_metrics(ca, plddt, pae, batch, loss_mod)
-        bs = int(batch["aatype"].shape[0])
-        for d in (terms, mets):
-            for k, v in d.items():
-                agg[k] += float(v) * bs
-        n += bs
-        if max_batches is not None and i + 1 >= max_batches:
-            break
+    # no_grad: nothing here is backpropagated, but without it every validation batch
+    # builds and retains the full autograd graph through the frozen AF stack — the
+    # side-chain FAPE alone materialises [B, N*8, N*14] intermediates (~16 MB/example
+    # at N=190). That is pure waste, and it made validating the 30k-structure fold far
+    # more expensive than the training step it follows.
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            batch = move_batch(batch, device)
+            o = model(batch, return_frames=True, num_recycles=num_recycles)
+            ca, plddt, pae, frames = o[:4]
+            aux = o[4] if len(o) > 4 else None
+            _, terms = loss_mod(ca, plddt, pae, frames, batch, aux=aux)
+            mets = eval_metrics(ca, plddt, pae, batch, loss_mod)
+            bs = int(batch["aatype"].shape[0])
+            for d in (terms, mets):
+                for k, v in d.items():
+                    agg[k] += float(v) * bs
+            n += bs
+            if max_batches is not None and i + 1 >= max_batches:
+                break
     model.train()
     means = {k: v / max(n, 1) for k, v in agg.items()}
     return (means, n) if return_n else means
