@@ -232,10 +232,31 @@ class MultimerModel(nn.Module):
     """
 
     def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="identity",
-                 trunk_fp32=("tri",)):
+                 trunk_fp32=("tri",), angle_input="layernorm"):
         super().__init__()
         assert pep_frames in ("teacher", "identity")
+        assert angle_input in ("layernorm", "raw")
         self.pep_frames = pep_frames
+        # `angle_input` — what the trainable AngleResnet gets as its `s_initial`.
+        #
+        #   "layernorm" (DEFAULT, and what AlphaFold does): the POST-LayerNorm single.
+        #       openfold's StructureModule does `s = self.layer_norm_s(s)` and only THEN
+        #       `s_initial = s` (structure_module.py:1083-1096), so its angle resnet has
+        #       always seen a normalised vector.
+        #   "raw": the pre-LayerNorm projection — what this model did before, and a real
+        #       defect. The frozen SM LayerNorms its input internally, so the STRUCTURE
+        #       loss is completely scale-invariant w.r.t. sm_in and nothing penalises the
+        #       trunk for inflating it. The angle head was the ONLY consumer seeing the
+        #       raw scale, and AngleResnet adds it straight into its residual stream
+        #       (relu -> linear_initial -> s = s + s_initial).
+        #       MEASURED across checkpoints on a fixed batch: ||sm_in|| 2393 (stable,
+        #       g9000) -> 14695 (g29600) -> 16325 -> 22667 (g54000, dying); std 3.4 ->
+        #       29.1; cosine vs the stable direction fell to 0.40. Unbounded, monotonic,
+        #       with no restoring force — and its gradients flow back into the SHARED
+        #       trunk, which is why the MHC (an INPUT, normally reproduced to 0.16 A)
+        #       collapsed together with the peptide while loss, |g| and loss-landscape
+        #       sharpness all still looked healthy.
+        self.angle_input = angle_input
         # Ops inside the trunk to run in fp32 (see _fp32). MEASURED on a frozen model
         # over 120 structures (max |grad|, median unchanged at ~2.7 in every case):
         #     all bf16        967.0     <- what killed the 13_08 run
@@ -398,8 +419,14 @@ class MultimerModel(nn.Module):
         out = self.sm({"single": sm_in, "pair": self.sm_z(z)},
                       batch["aatype"], mask=mask)
         sm_single = out["single"]                                     # [B,N,384]
-        # torsions: (omega, phi, psi, chi1..chi4); unnormalized feeds the angle-norm reg
-        unnorm_angles, angles = self.angle_head(sm_single, sm_in)     # [B,N,7,2] each
+        # torsions: (omega, phi, psi, chi1..chi4); unnormalized feeds the angle-norm reg.
+        # s_initial must match AlphaFold's convention — the POST-LayerNorm single — or the
+        # angle head is the one module exposed to an unbounded input scale (see
+        # `angle_input` in __init__). layer_norm_s is part of the FROZEN SM, so this adds
+        # no parameters and changes nothing about what the SM itself receives.
+        s_init = (self.sm.layer_norm_s(sm_in) if self.angle_input == "layernorm"
+                  else sm_in)
+        unnorm_angles, angles = self.angle_head(sm_single, s_init)     # [B,N,7,2] each
         # rebuild all-atom from the SM's final backbone frames + OUR torsions. The
         # multimer SM emits `frames` as a Rigid3Array 4x4 array [layers,B,N,4,4],
         # already scale_translation'd into Å (same rigid it feeds its own angle path).

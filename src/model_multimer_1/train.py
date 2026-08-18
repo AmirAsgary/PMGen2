@@ -296,6 +296,11 @@ def parse_args(argv=None):
                         "model does not learn (measured). Lower = more long-range signal.")
     p.add_argument("--warmup-steps", type=int, default=1000,
                    help="linear LR warmup before the cosine decay (0 = none)")
+    p.add_argument("--angle-input", choices=["layernorm", "raw"], default="layernorm",
+                   help="what the AngleResnet gets as s_initial. 'layernorm' (default) is "
+                        "AlphaFold's own convention; 'raw' reproduces the pre-fix defect "
+                        "where the angle head was the only consumer of an unbounded "
+                        "sm_in (||sm_in|| inflated 2393 -> 22667 across training).")
     p.add_argument("--grad-spike-factor", type=float, default=10.0,
                    help="reject an optimizer step whose gradient norm exceeds this "
                         "multiple of the RUNNING MEDIAN norm (0 = off). grad_clip bounds "
@@ -396,7 +401,8 @@ def main(argv=None):
 
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
                              device=device, pep_frames=args.pep_frames,
-                             trunk_fp32=tuple(x for x in args.trunk_fp32.split(",") if x))
+                             trunk_fp32=tuple(x for x in args.trunk_fp32.split(",") if x),
+                             angle_input=args.angle_input)
     model.set_stage(args.stage)
     # stage 1: structure ONLY (lambda_plddt = 0); 2: structure + pLDDT(0.01);
     # 3: pLDDT ONLY (all structure terms off, model frozen except plddt_proj).
