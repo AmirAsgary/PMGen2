@@ -54,9 +54,17 @@ data/raw/
 data/processed/full_dataset.csv
 # 70 MB full pmgen-input (we push the slim base_ids_ordered.csv instead)
 data/processed/full_dataset_pmgeninput.csv
-# preprocessed HDF5 store (built on the cluster)
-data/processed/h5_store/
+# preprocessed HDF5 stores (built on the cluster by src/model/preprocess.py and
+# src/model_multimer_1/preprocess_hasmig.py).  The old rule was "h5_store/" alone,
+# which matched NONE of the real store names and left ~500 GB showing as untracked.
+data/processed/h5_store*/
+data/processed/flow_canonical/
+data/processed/flow_canonical_smoke/
+data/processed/post_structure_prediction/
 data/processed/retry_inputs
+data/processed/valid_base_ids.csv
+# AFDB pretraining corpus (19 GB) — retired with src/model4
+data/afdb/
 # Multiple_Anchors_input*.tsv (GBs) + pmgen outputs
 outputs/
 # exploration plots/csvs
@@ -69,11 +77,21 @@ analysis/
 !data/test/
 !params/alphafold/*.pt
 
-# --- training checkpoints ---
+# --- training checkpoints (all generations, incl. the flow-matching model) ---
 checkpoints/
 checkpoints_mm1/
+checkpoints_mm1_bk/
+checkpoints_flow/
+checkpoints_model*/
+tmp/
 
 # --- hasmig_mhcs dataset (5.2 GB: 40k per-id zips + the tarball + scores csv) ---
 # NB: the old rule said "data/hasmig_mhc" (missing the trailing 's'), so it matched
 # nothing and the whole 5.2 GB folder was showing up as untracked.
 data/hasmig_mhcs/
+# --- benchmark: keep the TSV, the scripts and the result CSVs; drop the bulk ---
+# reference_pdbs/ is 926 public crystal structures (243 MB) and converted_pdbs/ is
+# regenerated from it by benchmark/prepare_refs.py, so neither belongs in git.
+benchmark/reference_pdbs/
+benchmark/converted_pdbs/
+benchmark/predictions/
