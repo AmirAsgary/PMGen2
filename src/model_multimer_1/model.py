@@ -176,7 +176,7 @@ def _fp32(fn, *args, **kw):
 
 class TrunkBlock(nn.Module):
     def __init__(self, c_s=D, c_z=D, n_ipa=2, n_heads=IPA_HEADS, p_drop=DROPOUT,
-                 fp32_ops=()):
+                 fp32_ops=(), attn_norm=True):
         super().__init__()
         self.fp32_ops = set(fp32_ops)
         self.ipas = nn.ModuleList([
@@ -190,6 +190,19 @@ class TrunkBlock(nn.Module):
         self.tri_in = TriangleMultiplicationIncoming(c_z, c_hidden=c_z)
         self.pair_trans = PairTransition(c_z, n=2)
         self.s_norm = nn.LayerNorm(c_s)
+        # PRE-ATTENTION LayerNorm. nn.MultiheadAttention does NOT normalise its input,
+        # and neither did we — so `s` entered the attention raw. Every transformer, and
+        # every attention module in AlphaFold, applies a LayerNorm before attention
+        # (pre-LN) or after the residual (post-LN); this had neither. Attention logits
+        # scale as ||s||^2/sqrt(d), so as the residual stream grows the logits grow
+        # QUADRATICALLY and the softmax saturates, with nothing normalising the
+        # accumulation. Measured growth of the single stream across the 3 trunk blocks:
+        #     stable ckpt     107 -> 221 -> 287 ->  335
+        #     pre-collapse    311 -> 705 -> 1051 -> 1463
+        # Note the IPA branch above was already protected (`ipa(self.s_norm(s), ...)`),
+        # since openfold's IPA has no internal LayerNorm either — only the attention
+        # branch was left unguarded.
+        self.attn_norm = nn.LayerNorm(c_s) if attn_norm else nn.Identity()
         self.self_attn = nn.MultiheadAttention(c_s, n_heads, dropout=p_drop,
                                                batch_first=True)
         # dropout on each residual branch (single & pair) for regularization
@@ -216,7 +229,9 @@ class TrunkBlock(nn.Module):
             # Rigid3Array frames make a clean fp32 cast awkward).
             s = s + self.drop_s(ipa(self.s_norm(s), z, frames, mask))
         key_pad = ~mask.bool()
-        s = s + self.self_attn(s, s, s, key_padding_mask=key_pad, need_weights=False)[0]
+        sn = self.attn_norm(s)
+        s = s + self.self_attn(sn, sn, sn, key_padding_mask=key_pad,
+                               need_weights=False)[0]
         return s, z
 
 
@@ -232,7 +247,8 @@ class MultimerModel(nn.Module):
     """
 
     def __init__(self, n_trunk=1, mhc_noise=0.5, device="cpu", pep_frames="identity",
-                 trunk_fp32=("tri",), angle_input="layernorm"):
+                 trunk_fp32=("tri",), angle_input="layernorm",
+                 trunk_out_norm=False, attn_norm=True, plddt_adapter=False):
         super().__init__()
         assert pep_frames in ("teacher", "identity")
         assert angle_input in ("layernorm", "raw")
@@ -281,21 +297,51 @@ class MultimerModel(nn.Module):
         self.z_proj = nn.Linear(C_Z_EMB + 25 + 2, D)
         self.drop_s = nn.Dropout(DROPOUT)                  # on the trunk-input projections
         self.drop_z = nn.Dropout(DROPOUT)
-        self.trunk = nn.ModuleList([TrunkBlock(fp32_ops=self.trunk_fp32)
+        self.trunk = nn.ModuleList([TrunkBlock(fp32_ops=self.trunk_fp32,
+                                               attn_norm=attn_norm)
                                     for _ in range(n_trunk)])   # at D
         # ONLY here do we widen from D back to the frozen SM / pLDDT-head dims
+        # trunk_out_norm: bound the trunk's OUTPUT SCALE before widening.
+        #
+        # MEASURED cause of the collapses (locate_explosion.py + diagnose_collapse.py):
+        # the frozen SM LayerNorms its input, so the structure loss is completely
+        # SCALE-INVARIANT w.r.t. sm_s's input and NOTHING penalises the trunk for
+        # inflating it. Across training it inflates ~5.7x (||sm_s|| 674 -> 3818, per-elem
+        # std 3.40 -> 19.3, cosine vs the stable regime 1.00 -> 0.40), and the trunk's
+        # BACKWARD GAIN rises with it: grad from the SM's input back to the trunk's input
+        # is amplified x1.6 in a stable checkpoint but x119 in a pre-collapse one. Past a
+        # critical displacement that runs away in ~200 steps.
+        #
+        # Lowering the LR does NOT fix this — it only postpones it in proportion: the
+        # failure lands at a roughly FIXED lr*steps (3e-4 died at 4500 = 1.35;
+        # 1e-4 died at 11500 = 1.15). A hard bound on the scale is the direct remedy.
+        #
+        # NOTE this CHANGES the function (sm_s sees LN(s), not s), so a checkpoint
+        # trained without it must re-adapt — expect the loss to jump then settle, as with
+        # the angle_input fix.
+        self.trunk_out_norm = trunk_out_norm
+        self.s_out_norm = nn.LayerNorm(D) if trunk_out_norm else nn.Identity()
+        self.z_out_norm = nn.LayerNorm(D) if trunk_out_norm else nn.Identity()
         self.sm_s = nn.Linear(D, SM_C_S)
         self.sm_z = nn.Linear(D, SM_C_Z)
-        # The frozen pLDDT head was pretrained on the SM's OWN `single`; feeding it a
-        # trunk-derived vector is the same out-of-distribution mistake as the frozen
-        # angle_resnet. It now reads sm["single"] through a trainable adapter (which is
-        # also the only thing stage 3 trains).
-        self.plddt_proj = nn.Linear(SM_C_S, SM_C_S)
-        # identity init => the frozen pLDDT head sees sm["single"] verbatim, exactly as in
-        # AlphaFold. Stage 1 (adapter frozen) therefore reproduces AF's own confidence,
-        # and stage 2/3 fine-tune from that instead of from a random projection.
-        nn.init.eye_(self.plddt_proj.weight)
-        nn.init.zeros_(self.plddt_proj.bias)
+        # The frozen pLDDT head was pretrained on the SM's OWN `single`, and it reads it
+        # DIRECTLY in AlphaFold:  lddt_logits = self.plddt(outputs["sm"]["single"])
+        # (openfold heads.py:57). `out["single"]` is s after all 8 SM blocks, so the SM
+        # has already refined it — an extra trainable projection in between has nothing
+        # to add, and only risks pushing the input off the distribution the frozen head
+        # was trained on. DEFAULT is now the AlphaFold-exact wiring: no adapter.
+        #
+        # CONSEQUENCE: stage 3 ("confidence only") trained NOTHING BUT this adapter, so
+        # without it stage 3 has no parameters and is refused (see set_stage). Confidence
+        # is still learnable in stage 2, where lambda_plddt > 0 and the CE flows back
+        # through the frozen head into the SM single and the encoder — shaping the
+        # representation itself rather than a bolted-on projection.
+        self.plddt_adapter = plddt_adapter
+        self.plddt_proj = nn.Linear(SM_C_S, SM_C_S) if plddt_adapter else nn.Identity()
+        if plddt_adapter:
+            # identity init => the frozen head sees sm["single"] verbatim at step 0
+            nn.init.eye_(self.plddt_proj.weight)
+            nn.init.zeros_(self.plddt_proj.bias)
         # TRAINABLE torsion head (AF2's own AngleResnet, freshly initialised). The frozen
         # sm.angle_resnet is never used: it maps AF-Evoformer `single` -> torsions and is
         # garbage on our representation (chi1 was 10.8% correct vs a 22% random baseline).
@@ -343,8 +389,16 @@ class MultimerModel(nn.Module):
         self.requires_grad_(True)                        # reset, then re-freeze below
         self.detach_plddt = False
         if stage == 1:
-            self.plddt_proj.requires_grad_(False)        # no gradient at lambda_plddt=0
+            self.plddt_proj.requires_grad_(False)        # no-op when it is nn.Identity
         elif stage == 3:
+            if not self.plddt_adapter:
+                raise ValueError(
+                    "stage 3 trains ONLY plddt_proj, but the model was built without the "
+                    "adapter (the AlphaFold-exact default: the frozen pLDDT head reads "
+                    "the SM's `single` directly). With no adapter this stage has zero "
+                    "trainable parameters and would silently train nothing. Either run "
+                    "stage 2 (lambda_plddt > 0 shapes confidence through the encoder), "
+                    "or rebuild with plddt_adapter=True / --plddt-adapter.")
             self.requires_grad_(False)
             self.plddt_proj.requires_grad_(True)
             self.detach_plddt = True
@@ -415,8 +469,8 @@ class MultimerModel(nn.Module):
         so the StructureModule stays entirely frozen, exactly as AlphaFold's geometry.
         """
         s, z, mask = self._encode(batch)
-        sm_in = self.sm_s(s)
-        out = self.sm({"single": sm_in, "pair": self.sm_z(z)},
+        sm_in = self.sm_s(self.s_out_norm(s))
+        out = self.sm({"single": sm_in, "pair": self.sm_z(self.z_out_norm(z))},
                       batch["aatype"], mask=mask)
         sm_single = out["single"]                                     # [B,N,384]
         # torsions: (omega, phi, psi, chi1..chi4); unnormalized feeds the angle-norm reg.
@@ -544,15 +598,25 @@ def _leak_check(dev=None, ckpt=None, tol=1e-6):
 
     # --- the SIDE-CHAIN TARGETS are loss-only: they must never reach the model --------
     net = MultimerModel(device=dev, pep_frames="identity").eval()
-    base = net.predict(batch)["atom14"]
+    _b = net.predict(batch)
+    base, base_pl = _b["atom14"], _b["plddt_logits"]
     for key in ("teacher_atom14", "teacher_chi", "teacher_ca", "teacher_plddt",
                 "teacher_pae"):
         b3 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
         b3[key] = torch.randn_like(b3[key]) * 10.0          # destroy the target
-        d = (net.predict(b3)["atom14"] - base).abs().max().item()
+        out3 = net.predict(b3)
+        d = (out3["atom14"] - base).abs().max().item()
         assert d == 0.0, (f"TARGET LEAK: randomising batch['{key}'] moved the prediction "
                           f"by {d:.3e} A. It is a supervision target, not an input.")
+        # The CONFIDENCE output needs its own assertion. Checking only atom14 would pass
+        # even if teacher_plddt reached the pLDDT head — and then a high predicted-vs-true
+        # pLDDT correlation would be trivially fabricated rather than learned.
+        dp = (out3["plddt_logits"] - base_pl).abs().max().item()
+        assert dp == 0.0, (f"CONFIDENCE TARGET LEAK: randomising batch['{key}'] moved the "
+                           f"pLDDT logits by {dp:.3e}. The confidence head is reading a "
+                           f"supervision target.")
     print("OK leak-check: sidechain/confidence TARGETS never influence the prediction")
+    print("OK leak-check: pLDDT LOGITS are invariant to every teacher_* field")
     print("OK leak-check: peptide geometry is withheld under pep_frames='identity'")
 
 

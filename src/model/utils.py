@@ -903,7 +903,8 @@ class DistillLoss(nn.Module):
                  chi_weight: float = 0.5, angle_norm_weight: float = 0.01,
                  sc_clamp_distance: float = 10.0, sc_length_scale: float = 10.0,
                  fape_clamp_prob: float = 1.0,
-                 weight_sidechain_losses: bool = True):
+                 weight_sidechain_losses: bool = True,
+                 plddt_peptide_ratio: Optional[float] = None):
         # fape_clamp=None -> unclamped FAPE: needed to fold from a random init
         # (a 10 Å clamp zeroes the gradient when every error exceeds it). AF2's
         # clamped/clamp-schedule variant can be enabled once structures are close.
@@ -956,6 +957,16 @@ class DistillLoss(nn.Module):
         #                     full influence over most of the objective.
         # Setting this False restores the old (unweighted) behaviour for comparison.
         self.weight_sidechain_losses = bool(weight_sidechain_losses)
+        # PEPTIDE:MHC ratio inside the pLDDT cross-entropy ONLY, decoupled from
+        # `peptide_weight` (which governs the STRUCTURAL losses).
+        #
+        # Why it needs its own knob: at peptide_weight=5 a 9-mer against 181 MHC residues
+        # gets 5*9/(5*9+181) = 19.9% of the confidence loss, so 80% of the pLDDT gradient
+        # is spent on MHC confidence — which is easy, nearly constant, and not what a user
+        # needs a trust signal for. At 50:1 the peptide gets 71.3%.
+        # None -> fall back to peptide_weight, i.e. exactly the previous behaviour.
+        self.plddt_peptide_ratio = (float(plddt_peptide_ratio)
+                                    if plddt_peptide_ratio is not None else None)
         cfg = model_config(model_name)
         self.pae_no_bins = int(cfg["loss"]["tm"]["no_bins"])
         self.plddt_no_bins = int(cfg["model"]["heads"]["lddt"]["no_bins"])
@@ -1055,7 +1066,16 @@ class DistillLoss(nn.Module):
                 return be.mean()
             return (wfape * be).sum() / wfape.sum().clamp_min(1e-4)
         plddt_bins = bin_plddt(batch["teacher_plddt"], self.plddt_no_bins)
-        ce_plddt = _masked_ce(plddt_logits, plddt_bins, res_w)
+        # confidence CE uses its OWN peptide:MHC ratio when one is set; the per-example
+        # source weight (sw) still rides along so hasmig down-weighting keeps working.
+        if self.plddt_peptide_ratio is not None:
+            r = self.plddt_peptide_ratio
+            plddt_w = seq_mask * (1.0 + (r - 1.0) * pep)
+            if sw is not None:
+                plddt_w = plddt_w * sw[:, None]
+        else:
+            plddt_w = res_w
+        ce_plddt = _masked_ce(plddt_logits, plddt_bins, plddt_w)
         # PAE is skipped entirely when lambda_pae == 0 (or the model returns None): the
         # [B,N,N,64] bucketize + CE is the single most expensive term and was multiplied
         # by zero. `pae_logits=None` is the model saying "no PAE head".
@@ -1214,6 +1234,11 @@ def eval_metrics(ca: torch.Tensor, plddt_logits: torch.Tensor,
     rmsd = kabsch_rmsd(ca, batch["teacher_ca"], seq_mask)
     plddt_pred = plddt_from_logits(plddt_logits, loss_mod.plddt_no_bins)
     spearman = _spearman(plddt_pred[m], batch["teacher_plddt"][m])
+    # PEPTIDE-ONLY confidence correlation. The all-residue number above is ~95% MHC,
+    # whose confidence is easy and nearly constant, so it reads high almost for free and
+    # hides what the peptide is doing — the peptide is the part we actually predict and
+    # the part a user needs a trust signal for. Measured gap on a stage-2 checkpoint:
+    # all-residue +0.96 vs peptide-only +0.69. Report both; judge on the peptide one.
     if pae_logits is None:                       # model has no PAE head
         pae_mae = ca.new_zeros(())
     else:
@@ -1240,7 +1265,11 @@ def eval_metrics(ca: torch.Tensor, plddt_logits: torch.Tensor,
     pep_pae_mae = 0.0 if pae_logits is None else float(
         ((pae_pred - batch["teacher_pae"]).abs() * pep_pair).sum()
         / pep_pair.sum().clamp_min(1.0))
+    pep_b = pep.bool()
+    pep_sp = (_spearman(plddt_pred[pep_b], batch["teacher_plddt"][pep_b])
+              if int(pep_b.sum()) > 2 else float("nan"))
     return {"ca_rmsd": float(rmsd), "plddt_spearman": float(spearman),
+            "pep_plddt_spearman": float(pep_sp),
             "pae_mae": float(pae_mae), "pep_ca_rmsd": pep_ca_rmsd,
             "pep_plddt_mae": pep_plddt_mae, "pep_pae_mae": pep_pae_mae}
 
@@ -1359,7 +1388,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     amp_dtype=None, metrics_every: int = 0,
                     max_consec_skip: int = 50,
                     divergence_factor: float = 8.0, best_save_fn=None,
-                    grad_spike_factor: float = 0.0, grad_spike_warmup: int = 200
+                    grad_spike_factor: float = 0.0, grad_spike_warmup: int = 200,
+                    max_steps: int = 0
                     ) -> Tuple[Dict[str, float], int]:
     """One epoch of encoder-only training. Returns (epoch-mean of each loss term,
     updated global_step).
@@ -1407,6 +1437,11 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
     t0 = time.perf_counter()
     tw = t0
     for i, batch in enumerate(loader, 1):
+        # hard step cap for controlled experiments: stop mid-epoch after N optimizer
+        # steps WITHOUT changing the dataset or its order, so arms that differ in one
+        # hyper-parameter still see byte-identical data up to the cut.
+        if max_steps and i > max_steps:
+            break
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         # sample the recycle count per step. With recycle_probs=[p0,p1,...] draw
@@ -1570,7 +1605,8 @@ def train_one_epoch(model: DistillModel, loader: DataLoader,
                     f"plddt {means.get('pep_plddt_ce', 0):.3f} "
                     f"pae {means.get('pep_pae_ce', 0):.3f}"
                     + (f" | pep-RMSD {means['pep_ca_rmsd']:.3f} "
-                       f"pLDDT-corr {means.get('plddt_spearman', 0):.3f}"
+                       f"pLDDT-corr(all) {means.get('plddt_spearman', 0):.3f} "
+                       f"pLDDT-corr(PEP) {means.get('pep_plddt_spearman', 0):.3f}"
                        if 'pep_ca_rmsd' in means else "")
                     + (f" | contain {means.get('contain', 0):.3f} "
                        f"buried {means.get('buried_frac', 0):.2f}"

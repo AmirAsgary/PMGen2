@@ -67,6 +67,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-struct", type=int, default=6)
     p.add_argument("--seeds", type=int, default=3)
+    p.add_argument("--ckpts", nargs="+", default=None,
+                   help="label=path pairs to override the built-in list. The FIRST is "
+                        "the reference the cosine similarity is measured against, so put "
+                        "the known-stable checkpoint first.")
+    p.add_argument("--angle-input", choices=["layernorm", "raw"], default="layernorm")
     args = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     batch = load_batch(dev, args.n_struct)
@@ -77,8 +82,11 @@ def main():
            ("full  g29600 pre-collapse", "checkpoints_mm1/snapshots/s1_full_mid.pt"),
            ("full  g52818 degrading", "checkpoints_mm1/snapshots/s1_full_ep2_g52818.pt"),
            ("full  g54000 dying", "checkpoints_mm1/mm1_s1_full/last.pt")]
+    if args.ckpts:
+        cks = [tuple(x.split("=", 1)) for x in args.ckpts]
 
-    net = MM.MultimerModel(n_trunk=3, device=dev, pep_frames="identity")
+    net = MM.MultimerModel(n_trunk=3, device=dev, pep_frames="identity",
+                           angle_input=args.angle_input)
     net.set_stage(1)
     ref_dir = None
     print(f"batch: {args.n_struct} real structures, N={batch['aatype'].shape[1]}\n")

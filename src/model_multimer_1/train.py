@@ -301,14 +301,62 @@ def parse_args(argv=None):
                         "AlphaFold's own convention; 'raw' reproduces the pre-fix defect "
                         "where the angle head was the only consumer of an unbounded "
                         "sm_in (||sm_in|| inflated 2393 -> 22667 across training).")
-    p.add_argument("--grad-spike-factor", type=float, default=10.0,
+    p.add_argument("--grad-spike-factor", type=float, default=0.0,
                    help="reject an optimizer step whose gradient norm exceeds this "
-                        "multiple of the RUNNING MEDIAN norm (0 = off). grad_clip bounds "
-                        "a spike's magnitude but keeps its DIRECTION, so a garbage "
-                        "gradient still takes a full-size wrong step and compounds; job "
-                        "29377637 died that way (max |g| 1-2 -> 9 -> 44 -> 186 -> 5.5e14 "
-                        "over 1k steps). The non-finite guard only fires once the weights "
-                        "have ALREADY collapsed; this catches the precursor.")
+                        "multiple of the RUNNING MEDIAN norm. DEFAULT 0 = OFF, and it "
+                        "should stay off unless you recalibrate it first. It was added on "
+                        "the theory that gradient spikes CAUSED the collapses; they did "
+                        "not — the unbounded angle-head input did (see --angle-input and "
+                        "commit 7fa2fa4), and the spikes were a late symptom. Worse, the "
+                        "threshold is miscalibrated: healthy runs reach 10-12x the median "
+                        "routinely, so factor=10 rejects normal steps and the rate-based "
+                        "abort then fires on a PERFECTLY HEALTHY run — that is exactly "
+                        "how job 29386164 died at gstep 3844 (201/400 rejected) while its "
+                        "loss and geometry were fine. If you re-enable it, calibrate the "
+                        "factor against real |g| logs first (>=30 looked necessary).")
+    p.add_argument("--plddt-peptide-ratio", type=float, default=0.0,
+                   help="peptide:MHC weight ratio INSIDE the pLDDT cross-entropy only "
+                        "(0 = use --peptide-weight, the old behaviour). At the default "
+                        "peptide_weight=5 a 9-mer against 181 MHC residues receives just "
+                        "19.9%% of the confidence loss, so 80%% of the pLDDT gradient is "
+                        "spent on MHC confidence — easy, nearly constant, and not the "
+                        "signal a user needs. --plddt-peptide-ratio 50 gives the peptide "
+                        "71.3%%. Structural losses are unaffected.")
+    p.add_argument("--plddt-adapter", action="store_true",
+                   help="re-insert the trainable 384->384 projection before the FROZEN "
+                        "pLDDT head. OFF by default: AlphaFold feeds the head the SM's "
+                        "`single` directly (heads.py:57), which the SM has already "
+                        "refined over 8 blocks, so the adapter adds nothing and can only "
+                        "push the input off the head's training distribution. NOTE stage "
+                        "3 trains only this adapter, so stage 3 REQUIRES this flag.")
+    p.add_argument("--no-attn-norm", action="store_true",
+                   help="DISABLE the pre-attention LayerNorm in the trunk (for A/B "
+                        "against pre-fix runs). The trunk's self-attention received RAW "
+                        "`s`: nn.MultiheadAttention does not normalise its input and we "
+                        "added no LayerNorm, so attention logits grew as ||s||^2 while "
+                        "the residual stream grew unchecked. AlphaFold normalises before "
+                        "every attention. On by default because it is a defect fix.")
+    p.add_argument("--trunk-out-norm", action="store_true",
+                   help="LayerNorm the trunk output before sm_s/sm_z, bounding the scale "
+                        "the frozen StructureModule is fed. Targets the MEASURED cause of "
+                        "the collapses: the SM LayerNorms its input, so the loss is "
+                        "scale-invariant there and the trunk inflates unchecked (5.7x), "
+                        "raising its backward gain x1.6 -> x119. Lowering the LR only "
+                        "postpones the failure (it lands at a fixed lr*steps); this bounds "
+                        "it. CHANGES the function — a checkpoint trained without it must "
+                        "re-adapt.")
+    p.add_argument("--start-epoch", type=int, default=0,
+                   help="override the epoch to start at, AFTER any --resume (0 = use the "
+                        "resumed value). The per-epoch data shuffle is seeded as "
+                        "(seed+1)*1000003 + epoch, so the epoch number SELECTS THE DATA "
+                        "ORDER. A 'continue' resume starts at ckpt.epoch+1 and therefore "
+                        "sees a different permutation than a fresh-optim resume starting "
+                        "at 1 — a confound when comparing the two. This forces them onto "
+                        "identical data.")
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="stop each epoch after N optimizer steps (0 = full epoch). For "
+                        "controlled experiments: the dataset and its order are unchanged, "
+                        "so two arms differing in one hyper-parameter see identical data.")
     p.add_argument("--grad-spike-warmup", type=int, default=200,
                    help="steps of history before spike rejection activates")
     p.add_argument("--divergence-factor", type=float, default=8.0,
@@ -402,7 +450,10 @@ def main(argv=None):
     model = MM.MultimerModel(n_trunk=args.n_trunk, mhc_noise=args.mhc_noise,
                              device=device, pep_frames=args.pep_frames,
                              trunk_fp32=tuple(x for x in args.trunk_fp32.split(",") if x),
-                             angle_input=args.angle_input)
+                             angle_input=args.angle_input,
+                             trunk_out_norm=args.trunk_out_norm,
+                             attn_norm=not args.no_attn_norm,
+                             plddt_adapter=args.plddt_adapter)
     model.set_stage(args.stage)
     # stage 1: structure ONLY (lambda_plddt = 0); 2: structure + pLDDT(0.01);
     # 3: pLDDT ONLY (all structure terms off, model frozen except plddt_proj).
@@ -418,6 +469,8 @@ def main(argv=None):
         lambda_sc_fape=(args.sc_fape_w if (args.sidechains and struct_on) else 0.0),
         lambda_chi=(args.chi_w if (args.sidechains and struct_on) else 0.0),
         weight_sidechain_losses=not args.unweighted_sidechain_losses,
+        plddt_peptide_ratio=(args.plddt_peptide_ratio
+                             if args.plddt_peptide_ratio > 0 else None),
     ).to(device)
 
     def build_opt_sched(t_max):
@@ -478,6 +531,11 @@ def main(argv=None):
             args.fresh_optim or ck.get("stage") != args.stage) else "continue"
         log(f"[mm1] resumed {args.resume} (stage {ck.get('stage')} -> {args.stage}, "
             f"{mode}), start epoch {start_epoch}")
+    if args.start_epoch > 0 and args.start_epoch != start_epoch:
+        log(f"[mm1] --start-epoch OVERRIDE: {start_epoch} -> {args.start_epoch} "
+            f"(selects the data permutation; use to remove the data-order confound "
+            f"when comparing a 'continue' resume against a fresh one)")
+        start_epoch = args.start_epoch
 
     # ---- NO SILENT NO-OPS: fail at startup, not after a day of training ----------
     if args.sidechains:
@@ -567,6 +625,7 @@ def main(argv=None):
             ckpt_every=args.ckpt_every, core=model, is_main=is_main, amp_dtype=amp_dtype,
             metrics_every=args.train_metrics_every,
             divergence_factor=args.divergence_factor,
+            max_steps=args.max_steps,
             grad_spike_factor=args.grad_spike_factor,
             grad_spike_warmup=args.grad_spike_warmup,
             save_fn=((lambda gs, ep: save_ckpt(run_dir / "last.pt", gs, ep))
@@ -583,12 +642,15 @@ def main(argv=None):
             if ev:
                 mlog.log("val", epoch, global_step, None, ev)
                 log(f"[mm1]   val total {ev['total']:.3f} pep-pLDDT-MAE "
-                    f"{ev.get('pep_plddt_mae', 0):.2f} pep-RMSD {ev.get('pep_ca_rmsd', 0):.2f}")
+                    f"{ev.get('pep_plddt_mae', 0):.2f} pep-RMSD {ev.get('pep_ca_rmsd', 0):.2f}"
+                    f" pLDDT-corr(PEP) {ev.get('pep_plddt_spearman', float('nan')):.3f}")
             if ev_hi:                        # apples-to-apples with train (same filter)
                 mlog.log("val_matched", epoch, global_step, None, ev_hi)
                 log(f"[mm1]   val-matched total {ev_hi['total']:.3f} pep-pLDDT-MAE "
                     f"{ev_hi.get('pep_plddt_mae', 0):.2f} pep-RMSD "
-                    f"{ev_hi.get('pep_ca_rmsd', 0):.2f}  (confidence-filtered val)")
+                    f"{ev_hi.get('pep_ca_rmsd', 0):.2f}"
+                    f" pLDDT-corr(PEP) {ev_hi.get('pep_plddt_spearman', float('nan')):.3f}"
+                    f"  (confidence-filtered val)")
             save_ckpt(run_dir / "last.pt", global_step, epoch)
     mlog.close()
     if distributed:

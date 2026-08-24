@@ -16,8 +16,8 @@
 #SBATCH --nodes=1
 #SBATCH --constraint="gpu"
 #SBATCH --gres=gpu:a100:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=12000
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=24000
 #SBATCH --time=06:00:00
 #SBATCH --array=1-32          # <-- set to the N printed by make_retry_inputs.py
 

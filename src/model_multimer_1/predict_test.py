@@ -19,6 +19,7 @@ measured. The written PDB is in the reference frame, so it overlays directly.
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 from pathlib import Path
 
@@ -63,6 +64,14 @@ def main():
     p.add_argument("--out-dir", default="outputs/mm1_test")
     p.add_argument("--n-trunk", type=int, default=3)
     p.add_argument("--stage", type=int, default=1)
+    p.add_argument("--angle-input", choices=["layernorm", "raw"], default="layernorm",
+                   help="MUST match how the checkpoint was trained. Checkpoints from "
+                        "before commit 7fa2fa4 were trained with 'raw'; scoring them "
+                        "under 'layernorm' penalises them for a convention they never saw.")
+    p.add_argument("--warmup", type=int, default=3,
+                   help="untimed forward passes before timing (CUDA init, cuDNN autotune "
+                        "and lazy residue-constant buffers all land on the first call and "
+                        "would otherwise be charged to structure #1)")
     p.add_argument("--leak-test", action="store_true",
                    help="per example, ALSO predict with the peptide's teacher_bb shifted "
                         "+10 A and the side-chain/confidence targets randomised, and report "
@@ -74,7 +83,8 @@ def main():
     out_dir = Path(args.out_dir) / f"{args.tag}_{args.pep_frames}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    net = MM.MultimerModel(n_trunk=args.n_trunk, device=dev, pep_frames=args.pep_frames)
+    net = MM.MultimerModel(n_trunk=args.n_trunk, device=dev, pep_frames=args.pep_frames,
+                           angle_input=args.angle_input)
     net.set_stage(args.stage)
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     net.load_state_dict(ck["trainable"], strict=False)
@@ -83,6 +93,19 @@ def main():
     rows = m1.dummy_rows()
     ds = m1.DistillDataset(rows)
     recs = []
+
+    # ---- warm-up so structure #1 is not charged for one-off initialisation ----
+    if args.warmup > 0 and len(rows):
+        _b = m1.move_batch(m1.collate_with_teacher([ds[0]]), dev)
+        for _ in range(args.warmup):
+            net.predict(_b)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+
+    def _now():
+        if dev == "cuda":
+            torch.cuda.synchronize()      # CUDA is async; without this we time the
+        return time.perf_counter()        # launch, not the work
     for i, r in enumerate(rows):
         ex = ds[i]
         b = m1.move_batch(m1.collate_with_teacher([ex]), dev)
@@ -90,7 +113,9 @@ def main():
         mhc_t = b["seq_mask"].bool()[0] & ~pep_t
         pep, mhc = pep_t.cpu().numpy(), mhc_t.cpu().numpy()
 
+        _t0 = _now()
         out = net.predict(b)
+        _t_model = _now() - _t0
         aatype = b["aatype"]
         if args.leak_test:
             # `frames` is the only path from teacher_bb to the peptide; the targets must
@@ -154,7 +179,11 @@ def main():
         prot = ofp.Protein(atom_positions=pred_sup, aatype=aatype[0].cpu().numpy(),
                            atom_mask=pred_mask, residue_index=np.arange(1, len(pep) + 1),
                            b_factors=bf, chain_index=chain_index)
+        _t1 = time.perf_counter()
         (out_dir / f"{r['id']}_pred.pdb").write_text(ofp.to_pdb(prot))
+        _t_pdb = time.perf_counter() - _t1
+        rec["t_model_ms"] = _t_model * 1e3
+        rec["t_pdb_ms"] = _t_pdb * 1e3
 
     import pandas as pd
     df = pd.DataFrame(recs)
@@ -176,6 +205,15 @@ def main():
               if mx == 0.0 else
               f"  *** FAIL: the prediction moved {mx:.4f} A — ground-truth peptide "
               f"information is reaching the model. ***")
+    tm, tp = df["t_model_ms"], df["t_pdb_ms"]
+    print(f"\n=== TIMING per structure (N={len(df)}, batch=1, {dev}) ===")
+    print(f"  model predict()  : median {tm.median():7.1f} ms   mean {tm.mean():7.1f}   "
+          f"min {tm.min():7.1f}   max {tm.max():7.1f}")
+    print(f"  atom37 -> PDB    : median {tp.median():7.1f} ms   mean {tp.mean():7.1f}")
+    print(f"  TOTAL            : median {(tm + tp).median():7.1f} ms per structure")
+    print(f"  design target    : 10-50 ms  -> {'MET' if (tm+tp).median() <= 50 else 'NOT met at batch 1'}")
+    print("  (batch=1 is the worst case; the frozen AF decoder is ~74% of model time and")
+    print("   amortises across a batch — see bench_latency.py for the batch sweep.)")
     print(f"\nPDBs + {csv.name} -> {out_dir}")
 
 

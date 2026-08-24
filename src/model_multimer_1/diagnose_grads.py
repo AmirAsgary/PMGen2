@@ -53,6 +53,12 @@ def main():
     p.add_argument("--out", default="outputs/mm1_graddiag")
     p.add_argument("--dtype", choices=["bf16","fp32"], default="bf16")
     p.add_argument("--trunk-fp32", default="", help="comma list: tri,ipa,opm")
+    p.add_argument("--angle-input", choices=["layernorm", "raw"], default="layernorm",
+                   help="must match how the checkpoint was trained (pre-7fa2fa4 = raw)")
+    p.add_argument("--limit-ids", type=int, default=0,
+                   help="use only the first N ids of the store (same N -> same structures "
+                        "across invocations, so two checkpoints are compared on IDENTICAL "
+                        "data in identical order)")
     p.add_argument("--no-step", action="store_true",
                    help="FREEZE the model: measure gradients only, never update. "
                         "Makes precision variants exactly comparable (no drift).")
@@ -60,6 +66,8 @@ def main():
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     idx = pd.read_csv(Path(args.hasmig_dir) / "index.csv", dtype=str)
+    if args.limit_ids:
+        idx = idx.head(args.limit_ids)
     ds = m1.H5DistillDataset(idx["id"].tolist(), dict(zip(idx["id"], idx["shard"])),
                              args.hasmig_dir)
     torch.manual_seed(0)
@@ -67,7 +75,8 @@ def main():
 
     tf32 = tuple(x for x in args.trunk_fp32.split(",") if x)
     net = MM.MultimerModel(n_trunk=args.n_trunk, device=dev,
-                           pep_frames="identity", trunk_fp32=tf32)
+                           pep_frames="identity", trunk_fp32=tf32,
+                           angle_input=args.angle_input)
     net.set_stage(1)
     if args.resume:
         net.load_state_dict(torch.load(args.resume, map_location=dev,
